@@ -2901,9 +2901,11 @@ class CTk(QMainWindow, QtWidgetBase):
         if sys.platform.startswith("win") and any(getattr(self, "_win32_hicons", (0, 0))):
             try:
                 import ctypes
-                for h in self._win32_hicons:
-                    if h:
-                        ctypes.windll.user32.DestroyIcon(ctypes.c_void_p(h))
+                windll = getattr(ctypes, "windll", None)
+                if windll is not None:
+                    for h in self._win32_hicons:
+                        if h:
+                            windll.user32.DestroyIcon(ctypes.c_void_p(h))
             except Exception:
                 pass
             self._win32_hicons = (0, 0)

@@ -722,7 +722,9 @@ class GraphPreviewFrame(ctk.CTkFrame):
         if path and os.path.isfile(path):
             try:
                 if sys.platform.startswith("win"):
-                    os.startfile(path)
+                    startfile = getattr(os, "startfile", None)
+                    if startfile is not None:
+                        startfile(path)
                 elif sys.platform == "darwin":
                     subprocess.Popen(["open", path])
                 else:
@@ -738,7 +740,9 @@ class GraphPreviewFrame(ctk.CTkFrame):
             if os.path.isdir(folder):
                 try:
                     if sys.platform.startswith("win"):
-                        os.startfile(folder)
+                        startfile = getattr(os, "startfile", None)
+                        if startfile is not None:
+                            startfile(folder)
                     elif sys.platform == "darwin":
                         subprocess.Popen(["open", folder])
                     else:

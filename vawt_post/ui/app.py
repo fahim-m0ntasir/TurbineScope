@@ -96,9 +96,11 @@ class VAWTPostApp(ctk.CTk, TkinterDnD.DnDWrapper):  # type: ignore
         if sys.platform.startswith("win"):
             try:
                 import ctypes
-                ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
-                    f"TurbineScope.VAWT.CFDStudio.{APP_VERSION}"
-                )
+                windll = getattr(ctypes, "windll", None)
+                if windll is not None:
+                    windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+                        f"TurbineScope.VAWT.CFDStudio.{APP_VERSION}"
+                    )
             except Exception:
                 pass
 

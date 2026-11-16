@@ -238,7 +238,10 @@ def apply_native_win32_icon(
         import ctypes
         from ctypes import wintypes
 
-        user32 = ctypes.windll.user32
+        windll = getattr(ctypes, "windll", None)
+        if windll is None:
+            return (0, 0)
+        user32 = windll.user32
         user32.LoadImageW.restype = wintypes.HANDLE
         user32.LoadImageW.argtypes = [
             wintypes.HINSTANCE,
