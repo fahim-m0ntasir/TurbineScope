@@ -310,7 +310,7 @@ class LiveMonitorEngine:
         self.rev_history: List[Dict[str, Any]] = []
         self.completed_revs_count: int = 0
         self.last_rev_end_time: float = 0.0
-        self.last_step_processed: int = 0
+        self.last_step_processed: int = -1
 
         # Performance timing
         self.last_update_wall_time: float = time.time()
@@ -612,6 +612,25 @@ class LiveMonitorEngine:
 
         return new_data_found
 
+    @staticmethod
+    def _monotone_clean(
+        steps: np.ndarray,
+        times: np.ndarray,
+        vals: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Keep strictly increasing unique steps (preserving latest row on duplicates)."""
+        if len(steps) <= 1:
+            return steps, times, vals
+        diffs = np.diff(steps)
+        if np.all(diffs > 0):
+            return steps, times, vals
+        last_idx: Dict[int, int] = {}
+        for i, s in enumerate(steps.tolist()):
+            last_idx[int(s)] = i
+        keep = [last_idx[k] for k in sorted(last_idx.keys())]
+        idx_arr = np.asarray(keep, dtype=np.int64)
+        return steps[idx_arr], times[idx_arr], vals[idx_arr]
+
     def _resolve_role_arrays(
         self,
         valid_readers: Dict[str, IncrementalFileReader],
@@ -636,6 +655,12 @@ class LiveMonitorEngine:
                 self._prefix_by_role.clear()
                 self._prefix_cutoff_step.clear()
                 self._prefix_refined_for_gap = True
+                # Recompute revolutions cleanly over the refined gap-recovered prefix
+                self.last_step_processed = -1
+                self.completed_revs_count = 0
+                self.rev_history.clear()
+                self.stable_reached_notified = False
+                self._last_aitken_alert_rev = -1
                 need_summary_update = True
 
             for role, rd in valid_readers.items():
@@ -644,6 +669,7 @@ class LiveMonitorEngine:
                 if rd.time_col is None and self.p.dt and self.p.dt > 0:
                     c_times = c_times * float(self.p.dt)
                 c_vals = np.asarray(rd.raw_vals, dtype=float)
+                c_steps, c_times, c_vals = self._monotone_clean(c_steps, c_times, c_vals)
 
                 canon = normalize_role_key(role)
                 prior_s = self.prior_series_cache.get(canon) or self.prior_series_cache.get(role)
@@ -660,10 +686,12 @@ class LiveMonitorEngine:
                     m_val = stitched["value"]
                     m_rec = stitched["recovered_mask"]
 
-                    if cont_mode == "prefer_backup":
+                    if r_info.get("status") == "incompatible_backup":
+                        cutoff = int(c_steps[0]) if len(c_steps) > 0 else 0
+                    elif cont_mode == "prefer_backup":
                         cutoff = int(prior_s["step"][-1]) + 1 if len(prior_s["step"]) > 0 else int(c_steps[0])
                     else:
-                        cutoff = int(c_steps[0])
+                        cutoff = int(c_steps[0]) if len(c_steps) > 0 else 0
 
                     pref_mask = m_step < cutoff
                     self._prefix_by_role[role] = (
@@ -699,8 +727,26 @@ class LiveMonitorEngine:
                 nrmse_vals = [float(r["val_nrmse_pct"]) for r in self._role_continuity_info.values() if r.get("val_nrmse_pct") is not None]
                 mean_nrmse = float(np.mean(nrmse_vals)) if nrmse_vals else None
                 st_name = first_rep.get("status", "overlap_verified")
+                all_incompat = all(
+                    r.get("status") == "incompatible_backup"
+                    for r in self._role_continuity_info.values()
+                )
 
-                if rec_max > 0:
+                if all_incompat:
+                    b_rng = first_rep.get("backup_step_range")
+                    c_rng = first_rep.get("current_step_range")
+                    b_txt = f"{b_rng[0]}–{b_rng[1]}" if b_rng else "unknown"
+                    c_txt = f"{c_rng[0]}–{c_rng[1]}" if c_rng else "unknown"
+                    sum_txt = (
+                        f"Ignored incompatible prior source '{self.prior_source_label}': "
+                        f"backup steps {b_txt} do not precede current run ({c_txt}). Using live run only."
+                    )
+                    self.add_alert("WARNING", sum_txt, key="continuity_stitch")
+                    st_name = "incompatible_backup"
+                    ov_max = 0
+                    any_div = False
+                    rec_max = 0
+                elif rec_max > 0:
                     rngs = first_rep.get("recovered_step_ranges", [])
                     rng_txt = ", ".join(f"{a}–{b}" for a, b in rngs) if rngs else "gap"
                     acc = f" (est. NRMSE {mean_nrmse:.2f}%)" if mean_nrmse is not None else ""
@@ -732,7 +778,7 @@ class LiveMonitorEngine:
 
                 self.continuity_summary = {
                     "enabled": True,
-                    "status": "gap_recovered" if rec_max > 0 else ("overlap_divergent" if any_div else st_name),
+                    "status": "incompatible_backup" if all_incompat else ("gap_recovered" if rec_max > 0 else ("overlap_divergent" if any_div else st_name)),
                     "source_label": self.prior_source_label,
                     "mode": cont_mode,
                     "matched_roles": list(self._role_continuity_info.keys()),
@@ -755,6 +801,7 @@ class LiveMonitorEngine:
                 if rd.time_col is None and self.p.dt and self.p.dt > 0:
                     c_times = c_times * float(self.p.dt)
                 c_vals = np.asarray(rd.raw_vals, dtype=float)
+                c_steps, c_times, c_vals = self._monotone_clean(c_steps, c_times, c_vals)
                 out[role] = (c_steps, c_times, c_vals, np.zeros(len(c_steps), dtype=bool))
 
         return out

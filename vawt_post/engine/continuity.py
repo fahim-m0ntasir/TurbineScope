@@ -663,20 +663,41 @@ def stitch_series_pair(
             info["overlap_max_time_diff"] = max_t
             info["overlap_divergent"] = bool((max_v / sig_scale) > 1e-3 or max_t > 1e-6)
 
+            # Reject unrelated/stale backups when the current run starts at/before the backup start
+            # and either the backup runs beyond the current end or the overlapping run diverges
+            # strongly (e.g., an old simulation's backup left linked after switching folders).
+            if c_start <= int(b_step[0]) and (
+                b_end > int(c_step[-1])
+                or max_t > 1e-5
+                or (max_v / sig_scale) > 0.05
+            ):
+                out = dict(curr_s)
+                out["step"] = c_step
+                out["time"] = c_time
+                out["value"] = c_val
+                out["recovered_mask"] = np.zeros(len(c_step), dtype=bool)
+                info["status"] = "incompatible_backup"
+                info["method"] = "rejected_unrelated_backup"
+                return out, info
+
         prefer_backup = (mode == "prefer_backup")
-        if prefer_backup:
+        if prefer_backup and int(c_step[-1]) > b_end:
             keep_c = c_step > b_end
             m_step = np.concatenate([b_step, c_step[keep_c]])
             m_time = np.concatenate([b_time, c_time[keep_c]])
             m_val = np.concatenate([b_val, c_val[keep_c]])
             splice_idx = len(b_step) if np.any(keep_c) else len(b_step) - 1
+        elif prefer_backup:
+            m_step = b_step.copy()
+            m_time = b_time.copy()
+            m_val = b_val.copy()
+            splice_idx = len(b_step) - 1
         else:
             keep_b = b_step < c_start
-            # Also handle edge case where backup ends later than current (unlikely, preserve monotonic)
-            keep_b_tail = b_step > int(c_step[-1])
-            m_step = np.concatenate([b_step[keep_b], c_step, b_step[keep_b_tail]])
-            m_time = np.concatenate([b_time[keep_b], c_time, b_time[keep_b_tail]])
-            m_val = np.concatenate([b_val[keep_b], c_val, b_val[keep_b_tail]])
+            # Never append backup rows beyond c_step[-1]: a predecessor backup must not extend past current.
+            m_step = np.concatenate([b_step[keep_b], c_step])
+            m_time = np.concatenate([b_time[keep_b], c_time])
+            m_val = np.concatenate([b_val[keep_b], c_val])
             splice_idx = int(np.sum(keep_b))
 
         rec_mask = np.zeros(len(m_step), dtype=bool)
@@ -685,6 +706,17 @@ def stitch_series_pair(
             info["splice_times"] = [float(m_time[splice_idx])]
         info["status"] = "overlap_divergent" if info["overlap_divergent"] else "overlap_verified"
         info["method"] = "prefer_backup_dedup" if prefer_backup else "prefer_current_dedup"
+
+    # Non-monotonic flow-time across step boundary indicates unrelated/stale backup
+    elif c_time[0] <= b_time[-1] - 1e-6:
+        out = dict(curr_s)
+        out["step"] = c_step
+        out["time"] = c_time
+        out["value"] = c_val
+        out["recovered_mask"] = np.zeros(len(c_step), dtype=bool)
+        info["status"] = "incompatible_backup"
+        info["method"] = "rejected_nonmonotonic_time"
+        return out, info
 
     # Regime 2: Exact adjacent (c_start == b_end + stride)
     elif c_start == b_end + stride:
@@ -871,9 +903,26 @@ def stitch_and_recover_all(
     max_ov = max(all_overlap, default=0)
     max_rec = max(all_rec, default=0)
 
+    all_incompatible = bool(
+        matched_roles and all(
+            role_reports.get(k, {}).get("status") == "incompatible_backup"
+            for k in matched_roles
+        )
+    )
+
     if not matched_roles:
         overall_status = "no_match"
         summary_text = f"Prior source '{loaded['source_label']}' had 0 matching monitor roles."
+    elif all_incompatible:
+        overall_status = "incompatible_backup"
+        b_rng = primary_rep.get("backup_step_range")
+        c_rng = primary_rep.get("current_step_range")
+        b_txt = f"{b_rng[0]}–{b_rng[1]}" if b_rng else "unknown"
+        c_txt = f"{c_rng[0]}–{c_rng[1]}" if c_rng else "unknown"
+        summary_text = (
+            f"Ignored incompatible prior source '{loaded['source_label']}' "
+            f"(backup steps {b_txt} do not precede current run steps {c_txt}; using current run only)."
+        )
     elif max_rec > 0:
         overall_status = "gap_recovered"
         rng_txt = ", ".join(f"{a}–{b}" for a, b in rec_step_ranges) if rec_step_ranges else "gap"

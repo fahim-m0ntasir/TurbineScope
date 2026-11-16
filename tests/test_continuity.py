@@ -417,3 +417,58 @@ def test_headless_ui_prior_link_controls(tmp_path):
         except Exception:
             pass
 
+
+def test_incompatible_stale_backup_rejected_not_corrupted(tmp_path):
+    """Unrelated/longer backup from a different run is rejected cleanly instead of corrupting time series."""
+    dt_b = 0.0005
+    omega = 25.0
+    s_b = np.arange(0, 500, dtype=np.int64)
+    t_b = s_b * dt_b
+    v_b = _synth_vawt_signal(t_b, omega)
+
+    # New fresh run starting at step 0 with a different dt and shorter length
+    dt_c = 0.00025
+    s_c = np.arange(0, 60, dtype=np.int64)
+    t_c = s_c * dt_c
+    v_c = _synth_vawt_signal(t_c, omega) * 0.5
+
+    prior_s = {"step": s_b, "time": t_b, "value": v_b}
+    curr_s = {"step": s_c, "time": t_c, "value": v_c}
+    p = _make_vawt_params(dt=dt_c, omega=omega)
+
+    for mode in ("auto", "prefer_current", "prefer_backup"):
+        merged, info = stitch_series_pair(prior_s, curr_s, p=p, mode=mode)
+        assert info["status"] == "incompatible_backup"
+        assert len(merged["step"]) == len(s_c)
+        assert np.array_equal(merged["step"], s_c)
+        assert np.all(np.diff(merged["time"]) > 0)
+        assert not np.any(merged["recovered_mask"])
+
+    b_dir = tmp_path / "old_backup"
+    c_dir = tmp_path / "fresh_run"
+    b_dir.mkdir()
+    c_dir.mkdir()
+    write_fluent_report_file(str(b_dir / "moment-rfile.out"), s_b, v_b, t_b, "moment")
+    c_tot = c_dir / "moment-rfile.out"
+    write_fluent_report_file(str(c_tot), s_c, v_c, t_c, "moment")
+
+    _, summary = stitch_and_recover_all(
+        {"total": {"step": s_c, "time": t_c, "value": v_c}},
+        prior_source=str(b_dir),
+        p=p,
+        mode="auto",
+        current_files=InputFiles(total=str(c_tot)),
+    )
+    assert summary["status"] == "incompatible_backup"
+
+    # Also guard non-monotonic flow-time even if step numbers happen to increase
+    merged_nm, info_nm = stitch_series_pair(
+        {"step": np.arange(0, 50, dtype=np.int64), "time": np.arange(0, 50) * 0.01, "value": np.ones(50)},
+        {"step": np.arange(60, 80, dtype=np.int64), "time": np.arange(0, 20) * 0.001, "value": np.zeros(20)},
+        p=p,
+        mode="auto",
+    )
+    assert info_nm["status"] == "incompatible_backup"
+    assert len(merged_nm["step"]) == 20
+
+

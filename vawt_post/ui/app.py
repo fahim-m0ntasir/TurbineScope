@@ -814,7 +814,7 @@ class VAWTPostApp(ctk.CTk, TkinterDnD.DnDWrapper):  # type: ignore
         )
         self.entry_prior_source.grid(row=0, column=0, sticky="we", padx=(0, 6))
         self.entry_prior_source.bind("<Return>", lambda _: self._on_prior_changed(run_diag=True))
-        self.entry_prior_source.bind("<FocusOut>", lambda _: self._on_prior_changed(run_diag=False))
+        self.entry_prior_source.bind("<FocusOut>", lambda _: self._on_prior_focus_out())
 
         ctk.CTkButton(
             p_row, text="📂 Folder...", width=82, height=28,
@@ -1342,10 +1342,20 @@ class VAWTPostApp(ctk.CTk, TkinterDnD.DnDWrapper):  # type: ignore
             return self._cont_mode_to_code.get(self.v_continuity_mode.get(), "auto")
         return "auto"
 
+    def _on_prior_focus_out(self):
+        """Avoid redundant re-parsing when leaving the prior entry without changing it."""
+        src = self.v_prior_source.get().strip() if hasattr(self, "v_prior_source") else ""
+        mode = self._get_continuity_code()
+        sig = (src, mode)
+        if sig == getattr(self, "_last_prior_preview_sig", None):
+            return
+        self._on_prior_changed(run_diag=False)
+
     def _on_prior_changed(self, run_diag: bool = False):
         """Update continuity preview summary whenever backup path/mode or current files change."""
         src = self.v_prior_source.get().strip() if hasattr(self, "v_prior_source") else ""
         mode = self._get_continuity_code()
+        self._last_prior_preview_sig = (src, mode)
         if not src:
             if hasattr(self, "lbl_prior_status"):
                 self.lbl_prior_status.configure(
@@ -1609,8 +1619,31 @@ class VAWTPostApp(ctk.CTk, TkinterDnD.DnDWrapper):  # type: ignore
         if not folder:
             return
 
+        prev_folder = getattr(self, "_last_autodetect_folder", None)
+        abs_folder = os.path.abspath(folder)
+        folder_changed = bool(
+            prev_folder and os.path.normcase(os.path.abspath(prev_folder)) != os.path.normcase(abs_folder)
+        )
+        self._last_autodetect_folder = abs_folder
+
         # 1. Detect physical simulation parameters and case metadata from folder
         p_detected = detect_folder_simulation_parameters(folder)
+
+        # Clear stale prior_source if missing on disk or left over from a different simulation
+        if hasattr(self, "v_prior_source"):
+            cur_prior = self.v_prior_source.get().strip()
+            if cur_prior:
+                sys_ctx_chk = p_detected.get("system_context") or {}
+                new_sys_root = os.path.normcase(os.path.abspath(str(sys_ctx_chk.get("system_dir") or abs_folder)))
+                prior_abs = os.path.normcase(os.path.abspath(cur_prior))
+                under_new_sys = (prior_abs == new_sys_root) or prior_abs.startswith(new_sys_root + os.sep)
+                if (not os.path.exists(cur_prior)) or (folder_changed and not under_new_sys):
+                    self.v_prior_source.set("")
+                    self._on_prior_changed(run_diag=False)
+                    self._log(
+                        f"Cleared previous prior-run link ('{os.path.basename(cur_prior)}') after switching folders.",
+                        "info",
+                    )
 
         # 2. Determine blade count: prefer detected, fallback to existing entry or 3
         if "n_blades" in p_detected and p_detected["n_blades"]:
@@ -1758,14 +1791,26 @@ class VAWTPostApp(ctk.CTk, TkinterDnD.DnDWrapper):  # type: ignore
         for note in (p_detected.get("setup_notes") or []):
             self._log(f"Auto-Note: {note}", "info")
 
-        # Set sensible output dir next to system/data folder if still default
-        if "VAWT_results" in self.v_out.get():
+        # Set sensible output dir next to system/data folder unless user chose a custom directory
+        cur_out = self.v_out.get().strip()
+        cur_out_norm = os.path.normcase(os.path.abspath(cur_out)) if cur_out else ""
+        last_auto = getattr(self, "_last_auto_out_dir", None)
+        last_auto_norm = os.path.normcase(os.path.abspath(last_auto)) if last_auto else ""
+        if (
+            not cur_out
+            or "VAWT_results" in cur_out
+            or (last_auto_norm and cur_out_norm == last_auto_norm)
+            or os.path.basename(cur_out_norm) == "results"
+        ):
             sys_ctx = p_detected.get("system_context") or {}
             out_base = str(sys_ctx.get("system_dir") or folder)
-            self.v_out.set(os.path.join(out_base, "results"))
+            new_out = os.path.join(out_base, "results")
+            self.v_out.set(new_out)
+            self._last_auto_out_dir = new_out
 
         # Run file diagnostics immediately after loading files
         if hasattr(self, "_on_prior_changed") and self.v_prior_source.get().strip():
+            self._last_prior_preview_sig = None
             self._on_prior_changed(run_diag=False)
         if hasattr(self, "diagnostics_frame"):
             self.diagnostics_frame.run_diagnostics()

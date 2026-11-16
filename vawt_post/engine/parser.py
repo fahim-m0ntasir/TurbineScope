@@ -860,7 +860,7 @@ def _attach_workbench_mesh_and_setup(
         full_mesh = inspect_workbench_setup_and_mesh(
             str(wb_ctx.get("system_dir") or folder),
             rotor_params=r_params,
-            compute_cell_quality=True,
+            compute_cell_quality=False,
         )
         if full_mesh and (
             full_mesh.get("mesh", {}).get("available")
@@ -1038,8 +1038,14 @@ def detect_folder_simulation_parameters(
                     detected["turb_model"] = xml_data["turb_model"]
                 if xml_data.get("space") and "space" not in detected:
                     detected["space"] = xml_data["space"]
-                if xml_data.get("time_formulation") and "time_formulation" not in detected:
-                    detected["time_formulation"] = xml_data["time_formulation"]
+                if xml_data.get("time_formulation"):
+                    xml_tf = str(xml_data["time_formulation"])
+                    cur_tf = str(detected.get("time_formulation") or "")
+                    if not cur_tf or (
+                        cur_tf.lower().startswith("steady")
+                        and ("unsteady" in xml_tf.lower() or "transient" in xml_tf.lower())
+                    ):
+                        detected["time_formulation"] = xml_tf
                 break
     except Exception:
         pass

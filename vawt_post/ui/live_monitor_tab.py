@@ -442,7 +442,7 @@ class LiveMonitorFrame(ctk.CTkFrame):
 
         # Timer & display configurations
         self.refresh_interval_s: float = 120.0  # Default 2 minutes
-        self.file_check_interval_s: float = 120.0 # Synchronized to user refresh interval
+        self.file_check_interval_s: float = 2.0  # Fast lightweight file/telemetry poll
         self.window_mode: str = "All"
         self.grid_layout_mode: str = "2×2 Grid"
         self.focus_plot: str = PLOT_OPTIONS[0]
@@ -475,7 +475,7 @@ class LiveMonitorFrame(ctk.CTkFrame):
             try:
                 saved = self.app.config_mgr.get_live_settings()
                 self.refresh_interval_s = float(saved.get("refresh_interval_s", 120.0))
-                self.file_check_interval_s = self.refresh_interval_s
+                self.file_check_interval_s = min(2.0, max(1.0, self.refresh_interval_s))
                 self.window_mode = str(saved.get("window_mode", "All"))
                 self.grid_layout_mode = str(saved.get("grid_layout", "2×2 Grid"))
                 self.focus_plot = str(saved.get("focus_plot", PLOT_OPTIONS[0]))
@@ -1713,16 +1713,34 @@ class LiveMonitorFrame(ctk.CTkFrame):
 
         tol_sig = float(self.live_params.stable_tol) if (self.live_params and self.live_params.stable_tol is not None) else 5.0
         rev_hist_all = getattr(snap, "rev_history", None) or []
+        ts_meta = getattr(snap, "timeseries", None) or {}
+        cont_meta = getattr(snap, "continuity", None) or {}
+        lp_ref = self.live_params or getattr(snap, "params", None)
+        lp_sig = (
+            round(float(getattr(lp_ref, "U", 0.0) or 0.0), 6),
+            round(float(getattr(lp_ref, "omega", 0.0) or 0.0), 6),
+            round(float(getattr(lp_ref, "R", 0.0) or 0.0), 6),
+            round(float(getattr(lp_ref, "theta0", 0.0) or 0.0), 4),
+            str(getattr(lp_ref, "rotation_dir", "ccw") or "ccw"),
+        ) if lp_ref is not None else ()
+        t_arr = ts_meta.get("t")
+        mb_list = ts_meta.get("Mb")
         state_sig = (
             getattr(snap, "current_step", 0),
             round(float(getattr(snap, "current_time", 0.0) or 0.0), 6),
             len(rev_hist_all),
             int(rev_hist_all[-1].get("k", 0)) if rev_hist_all else 0,
+            int(len(t_arr)) if t_arr is not None else 0,
+            bool(ts_meta.get("ct") is not None),
+            int(len(mb_list)) if mb_list is not None else 0,
+            str(cont_meta.get("status", "")),
+            int(cont_meta.get("recovered_count", 0) or 0),
             self.grid_layout_mode,
             self.focus_plot,
             self.window_mode,
             bool(self.v_autoscale.get()),
             tol_sig,
+            lp_sig,
             self.prior_source or "",
             self.continuity_mode,
         )
@@ -2409,20 +2427,28 @@ class LiveMonitorFrame(ctk.CTkFrame):
     # Queue Polling & Telemetry Updates
     # -------------------------------------------------------------------------
     def _poll_snapshot_queue(self):
-        """Process snapshots arriving from background worker."""
+        """Process snapshots arriving from background worker, coalescing queued bursts."""
         if getattr(self, "_is_closing", False):
             return
-        while not self.snapshot_queue.empty():
-            try:
-                snap: LiveMonitorSnapshot = self.snapshot_queue.get_nowait()
-                self.latest_snapshot = snap
-                self._update_telemetry(snap)
+        try:
+            latest_snap: Optional[LiveMonitorSnapshot] = None
+            any_full = False
+            while True:
+                try:
+                    snap: LiveMonitorSnapshot = self.snapshot_queue.get_nowait()
+                    latest_snap = snap
+                    if snap.is_full_refresh:
+                        any_full = True
+                except queue.Empty:
+                    break
 
-                # Full graph refresh vs light telemetry refresh
-                if snap.is_full_refresh:
+            if latest_snap is not None:
+                self.latest_snapshot = latest_snap
+                self._update_telemetry(latest_snap)
+                if any_full:
                     try:
                         if not self.app or getattr(self.app, "current_page", "live") == "live":
-                            self._render_graphs(snap)
+                            self._render_graphs(latest_snap)
                     finally:
                         self._refresh_pending = False
                         self.time_until_refresh = self.refresh_interval_s
@@ -2431,19 +2457,17 @@ class LiveMonitorFrame(ctk.CTkFrame):
                         if not self.is_paused:
                             self.lbl_countdown.configure(text=f"⏱ Next: {mins}:{secs:02d}")
                         self.lbl_last_refresh.configure(text=f"Last Refresh: {_dt.datetime.now().strftime('%H:%M:%S')}")
-            except queue.Empty:
-                break
-            except Exception as exc:
-                print(f"[LiveMonitor] Snapshot handling error: {exc}")
-                traceback.print_exc()
-
-        if not getattr(self, "_is_closing", False):
-            self.after(200, self._poll_snapshot_queue)
+        except Exception as exc:
+            print(f"[LiveMonitor] Snapshot handling error: {exc}")
+            traceback.print_exc()
+        finally:
+            if not getattr(self, "_is_closing", False):
+                self.after(200, self._poll_snapshot_queue)
 
     def on_show(self):
         """Called when the Live Monitor page becomes visible."""
         if not self.is_monitoring and self.live_params is None:
-            self.after(20, self._get_or_detect_params)
+            self._get_or_detect_params()
         if self.latest_snapshot:
             self._render_graphs(self.latest_snapshot, force=False)
 
@@ -2451,40 +2475,44 @@ class LiveMonitorFrame(ctk.CTkFrame):
         """1 Hz timer decrementing countdown display and auto-refreshing at 0:00."""
         if getattr(self, "_is_closing", False):
             return
-        if self.is_monitoring:
-            if self.is_paused:
-                self.lbl_countdown.configure(text="⏱ Paused", text_color="#06B6D4")
-            else:
-                self.lbl_countdown.configure(text_color=("royal blue", "#60A5FA"))
-                self.time_until_refresh = max(0.0, self.time_until_refresh - 1.0)
-                if self.time_until_refresh <= 0.0:
-                    self.lbl_countdown.configure(text="⏱ Refreshing...")
-                    if not getattr(self, "_refresh_pending", False):
-                        self._refresh_pending = True
-                        self._refresh_now()
-                        self.time_until_refresh = self.refresh_interval_s
-                else:
-                    if not getattr(self, "_refresh_pending", False):
-                        mins = int(self.time_until_refresh // 60)
-                        secs = int(self.time_until_refresh % 60)
-                        self.lbl_countdown.configure(text=f"⏱ Next: {mins}:{secs:02d}")
-
-            # Badge pulsing / status indicators
-            if self.app and hasattr(self.app, "tab_btn_live"):
-                is_live_active = getattr(self.app, "current_page", "") == "live"
+        try:
+            if self.is_monitoring:
                 if self.is_paused:
-                    tc = "#BAE6FD" if is_live_active else "#06B6D4"
-                    self.app.tab_btn_live.configure(text="📡 Live Monitor  ⏸", text_color=tc)
-                elif self.latest_snapshot and "Stalled" in self.latest_snapshot.status:
-                    tc = "#FDE68A" if is_live_active else "#F59E0B"
-                    self.app.tab_btn_live.configure(text="📡 Live Monitor  ● Stalled", text_color=tc)
+                    self.lbl_countdown.configure(text="⏱ Paused", text_color="#06B6D4")
                 else:
-                    dot = "●" if int(self.time_until_refresh) % 2 == 0 else "○"
-                    tc = "#A7F3D0" if is_live_active else "#10B981"
-                    self.app.tab_btn_live.configure(text=f"📡 Live Monitor  {dot}", text_color=tc)
+                    self.lbl_countdown.configure(text_color=("royal blue", "#60A5FA"))
+                    self.time_until_refresh = max(0.0, self.time_until_refresh - 1.0)
+                    if self.time_until_refresh <= 0.0:
+                        self.lbl_countdown.configure(text="⏱ Refreshing...")
+                        if not getattr(self, "_refresh_pending", False):
+                            self._refresh_pending = True
+                            self._refresh_now()
+                            self.time_until_refresh = self.refresh_interval_s
+                    else:
+                        if not getattr(self, "_refresh_pending", False):
+                            mins = int(self.time_until_refresh // 60)
+                            secs = int(self.time_until_refresh % 60)
+                            self.lbl_countdown.configure(text=f"⏱ Next: {mins}:{secs:02d}")
 
-        if not getattr(self, "_is_closing", False):
-            self.after(1000, self._countdown_tick)
+                # Badge pulsing / status indicators
+                if self.app and hasattr(self.app, "tab_btn_live"):
+                    is_live_active = getattr(self.app, "current_page", "") == "live"
+                    if self.is_paused:
+                        tc = "#BAE6FD" if is_live_active else "#06B6D4"
+                        self.app.tab_btn_live.configure(text="📡 Live Monitor  ⏸", text_color=tc)
+                    elif self.latest_snapshot and "Stalled" in self.latest_snapshot.status:
+                        tc = "#FDE68A" if is_live_active else "#F59E0B"
+                        self.app.tab_btn_live.configure(text="📡 Live Monitor  ● Stalled", text_color=tc)
+                    else:
+                        dot = "●" if int(self.time_until_refresh) % 2 == 0 else "○"
+                        tc = "#A7F3D0" if is_live_active else "#10B981"
+                        self.app.tab_btn_live.configure(text=f"📡 Live Monitor  {dot}", text_color=tc)
+        except Exception as exc:
+            print(f"[LiveMonitor] Countdown tick error: {exc}")
+            traceback.print_exc()
+        finally:
+            if not getattr(self, "_is_closing", False):
+                self.after(1000, self._countdown_tick)
 
     def _update_telemetry(self, snap: LiveMonitorSnapshot):
         """Update status strip, side panels, and alerts without touching graphs."""
@@ -3088,6 +3116,10 @@ class LiveMonitorFrame(ctk.CTkFrame):
         self._last_alerts_signature = None
         self._recommended_theta0 = None
         self._rendered_alerts_count = 0
+        self._last_rendered_graph_state = None
+        self._refresh_pending = False
+        if hasattr(self, "_saved_axis_limits"):
+            self._saved_axis_limits.clear()
         if hasattr(self, "midspin_banner") and self.midspin_banner.winfo_manager():
             self.midspin_banner.pack_forget()
         if hasattr(self, "lbl_alerts_badge"):
@@ -3218,8 +3250,18 @@ class LiveMonitorFrame(ctk.CTkFrame):
             self._stop_monitoring()
 
         from vawt_post.engine.parser import resolve_fluent_directory, autodetect
+        prev_watch = self.custom_watch_folder
         rf = resolve_fluent_directory(watch_dir)
         self.custom_watch_folder = os.path.abspath(rf if rf and os.path.isdir(rf) else watch_dir)
+        folder_switched = bool(
+            prev_watch
+            and os.path.normcase(os.path.abspath(prev_watch))
+            != os.path.normcase(os.path.abspath(self.custom_watch_folder))
+        )
+        if folder_switched or (self.prior_source and not os.path.exists(self.prior_source)):
+            self.prior_source = None
+            if hasattr(self, "_update_prior_card"):
+                self._update_prior_card(None)
         if p is not None:
             self.live_params = p
             self._manual_params_override = True
@@ -3419,12 +3461,12 @@ class LiveMonitorFrame(ctk.CTkFrame):
             secs = val * 60.0 if "minute" in unit else val
             secs = max(2.0, min(secs, 3600.0))
             self.refresh_interval_s = secs
-            self.file_check_interval_s = secs
+            self.file_check_interval_s = min(2.0, max(1.0, secs))
             if self.time_until_refresh > secs:
                 self.time_until_refresh = secs
             if self.worker:
                 self.worker.set_refresh_interval(secs)
-                self.worker.set_file_check_interval(secs)
+                self.worker.set_file_check_interval(self.file_check_interval_s)
             self._save_settings()
         except ValueError:
             pass
@@ -3488,9 +3530,19 @@ class LiveMonitorFrame(ctk.CTkFrame):
                 self._stop_monitoring()
 
             from vawt_post.engine.parser import resolve_fluent_directory, autodetect
+            prev_watch = self.custom_watch_folder
             resolved = resolve_fluent_directory(f)
             target = resolved if resolved and os.path.isdir(resolved) else f
             self.custom_watch_folder = os.path.abspath(target)
+            folder_switched = bool(
+                prev_watch
+                and os.path.normcase(os.path.abspath(prev_watch))
+                != os.path.normcase(os.path.abspath(self.custom_watch_folder))
+            )
+            if folder_switched or (self.prior_source and not os.path.exists(self.prior_source)):
+                self.prior_source = None
+                if hasattr(self, "_update_prior_card"):
+                    self._update_prior_card(None)
             self._manual_params_override = False
             self.live_params = None
             self.detected_turb_model = None

@@ -934,6 +934,11 @@ def inspect_workbench_setup_and_mesh(
                     else:
                         yp_txt += " (wall-function / coarse BL)"
                 notes.append(f"Blade boundary layer: y1 mean = {y1_avg_um:.2f} µm ({float(np.mean(y1_vals)):.5f} mm){yp_txt}")
+    elif case_res and getattr(case_res, "is_valid", False) and getattr(case_res, "cell_count", None):
+        cc = int(case_res.cell_count or 0)
+        nc = int(getattr(case_res, "node_count", None) or 0)
+        dim = int(getattr(case_res, "dimension", None) or 2)
+        notes.append(f"Mesh topology ({dim}D): {cc:,} cells, {nc:,} nodes (detailed quality runs on full analysis)")
 
     setup_bits = []
     if xml_setup.get("fluent_release"):

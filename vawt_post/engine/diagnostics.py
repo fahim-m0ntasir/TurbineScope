@@ -512,6 +512,15 @@ def run_file_health_diagnostics(
                     explanation=c_sum,
                     suggested_fix="Recovered steps are highlighted in history charts; export stitched .out files to archive merged data.",
                 ))
+            elif c_stat == "incompatible_backup":
+                report.add(DiagnosticFinding(
+                    severity="WARNING",
+                    file="Backup link",
+                    check="Prior run linking",
+                    location="Continuity",
+                    explanation=c_sum or "Linked prior source does not match this simulation run and was ignored.",
+                    suggested_fix="Unlink the stale prior source or select the matching prior backup folder/.zip for this simulation.",
+                ))
             elif c_stat == "overlap_divergent":
                 report.add(DiagnosticFinding(
                     severity="WARNING",

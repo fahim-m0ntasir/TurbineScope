@@ -418,5 +418,145 @@ def test_live_monitor_multistage_fft_omega_no_false_mismatch(tmp_path):
     assert snap.parameter_checks["time_step"]["status"] == "PASS"
 
 
+def test_live_step_zero_gap_refinement_and_incompat_backup(tmp_path):
+    """Verify step-0 start processing, gap refinement rev reset, and incompatible backup protection."""
+    # 1. Step 0 alone is processed immediately (last_step_processed initialized to -1)
+    p0_file = tmp_path / "step0.out"
+    p0_file.write_text('("Time Step" "cm" "flow-time")\n0 0.123 0.0\n', encoding="utf-8")
+    p = Params(U=8.0, tsr=1.5, R=0.5, n_blades=3, omega=24.0, dt=0.001)
+    eng0 = LiveMonitorEngine(p=p, f=InputFiles(total=str(p0_file)), watch_dir=str(tmp_path))
+    snap0 = eng0.tick_full()
+    assert snap0.current_step == 0
+    assert len(eng0.steps) == 1
+
+    # 2. Incompatible backup (longer backup 0..200 vs fresh live 0..15) is ignored cleanly
+    b_dir = tmp_path / "stale_backup"
+    c_dir = tmp_path / "fresh_live"
+    b_dir.mkdir()
+    c_dir.mkdir()
+    from vawt_post.engine.continuity import write_fluent_report_file
+    import numpy as np
+    sb = np.arange(0, 200, dtype=np.int64)
+    tb = sb * 0.001
+    vb = np.sin(24.0 * tb)
+    write_fluent_report_file(str(b_dir / "moment-rfile.out"), sb, vb, tb, "moment")
+
+    sc = np.arange(0, 15, dtype=np.int64)
+    tc = sc * 0.0005
+    vc = 0.2 * np.cos(24.0 * tc)
+    write_fluent_report_file(str(c_dir / "moment-rfile.out"), sc, vc, tc, "moment")
+
+    eng_inc = LiveMonitorEngine(
+        p=Params(U=8.0, R=0.5, omega=24.0, n_blades=3, dt=0.0005),
+        f=InputFiles(total=str(c_dir / "moment-rfile.out"), prior_source=str(b_dir), continuity_mode="auto"),
+        watch_dir=str(c_dir),
+    )
+    snap_inc = eng_inc.tick_full()
+    assert snap_inc.current_step == 14
+    assert len(eng_inc.steps) == 15
+    assert snap_inc.continuity is not None
+    assert snap_inc.continuity["status"] == "incompatible_backup"
+
+    # 3. Gap refinement when post-gap rows cross 24 recomputes revolutions cleanly
+    g_b_dir = tmp_path / "gap_b"
+    g_c_dir = tmp_path / "gap_c"
+    g_b_dir.mkdir()
+    g_c_dir.mkdir()
+    omega_g = 20.0
+    dt_g = 0.001
+    s_all = np.arange(0, 420, dtype=np.int64)
+    t_all = s_all * dt_g
+    v_all = 1.0 + 0.5 * np.sin(omega_g * t_all)
+    write_fluent_report_file(str(g_b_dir / "moment-rfile.out"), s_all[:320], v_all[:320], t_all[:320], "moment")
+    # Initially write only 5 post-gap steps (330..334)
+    write_fluent_report_file(str(g_c_dir / "moment-rfile.out"), s_all[330:335], v_all[330:335], t_all[330:335], "moment")
+    eng_gap = LiveMonitorEngine(
+        p=Params(U=8.0, omega=omega_g, R=0.5, n_blades=3, dt=dt_g),
+        f=InputFiles(total=str(g_c_dir / "moment-rfile.out"), prior_source=str(g_b_dir), continuity_mode="auto"),
+        watch_dir=str(g_c_dir),
+    )
+    snap_g1 = eng_gap.tick_full()
+    assert eng_gap._prefix_refined_for_gap is False
+    assert snap_g1.continuity["recovered_count"] == 10
+
+    with open(g_c_dir / "moment-rfile.out", "a", encoding="utf-8") as fh:
+        for idx_s in range(335, 365):
+            fh.write(f"{int(s_all[idx_s])} {float(v_all[idx_s]):.12g} {float(t_all[idx_s]):.12g}\n")
+    snap_g2 = eng_gap.tick_full()
+    assert eng_gap._prefix_refined_for_gap is True
+    assert snap_g2.current_step == 364
+    assert len(eng_gap.steps) == 365
+    assert snap_g2.rev_history  # recomputed cleanly including the refined gap
+
+
+def test_ui_folder_switch_and_live_subpolling(tmp_path, monkeypatch):
+    """Switching Input/Live folders clears stale prior_source, updates output dir, and sub-polls at 2s."""
+    from vawt_post.engine.config import ConfigManager
+    from vawt_post.engine.continuity import write_fluent_report_file
+    from vawt_post.engine.parser import detect_folder_simulation_parameters
+    import numpy as np
+
+    cfg_path = tmp_path / "isolated_cfg.json"
+    monkeypatch.setattr(ConfigManager, "_default_config_path", staticmethod(lambda: str(cfg_path)), raising=False)
+    orig_init = ConfigManager.__init__
+
+    def _patched_init(self, config_path=None):
+        orig_init(self, config_path=str(cfg_path))
+
+    monkeypatch.setattr(ConfigManager, "__init__", _patched_init)
+
+    # Build two separate dp0 systems: FFF-1 (with backup) and FFF-2 (fresh run)
+    for name in ("FFF-1", "FFF-2"):
+        fl = tmp_path / "Proj_files" / "dp0" / name / "Fluent"
+        fl.mkdir(parents=True)
+        s = np.arange(0, 20, dtype=np.int64)
+        write_fluent_report_file(str(fl / "moment-rfile.out"), s, np.sin(s * 0.1), s * 0.001, "moment")
+    b1 = tmp_path / "Proj_files" / "dp0" / "FFF-1" / "backup"
+    b1.mkdir()
+    write_fluent_report_file(str(b1 / "moment-rfile.out"), np.arange(0, 10), np.zeros(10), np.arange(0, 10) * 0.001, "moment")
+
+    # Verify report.xml transient overrides setup-case Steady
+    fl2 = tmp_path / "Proj_files" / "dp0" / "FFF-2" / "Fluent"
+    prog2 = tmp_path / "Proj_files" / "progress_files" / "dp0" / "FFF-2" / "Fluent"
+    prog2.mkdir(parents=True)
+    (prog2 / "report.xml").write_text(
+        "<FluentXMLReport>\nFluent Version: 2d, dp, pbns, sstkw, transient\nTime     Unsteady, 2nd-Order Implicit\n</FluentXMLReport>",
+        encoding="utf-8",
+    )
+    from tests.test_mesh_inspector import _make_synthetic_2d_cas_h5
+    _make_synthetic_2d_cas_h5(str(fl2 / "FFF-2-Setup-Output.cas.h5"))
+    det2 = detect_folder_simulation_parameters(str(tmp_path / "Proj_files" / "dp0" / "FFF-2"))
+    assert "unsteady" in str(det2.get("time_formulation", "")).lower()
+
+    from vawt_post.ui.app import VAWTPostApp
+    app = VAWTPostApp()
+    try:
+        sys1 = str(tmp_path / "Proj_files" / "dp0" / "FFF-1")
+        sys2 = str(tmp_path / "Proj_files" / "dp0" / "FFF-2")
+
+        app._autodetect_folder(sys1)
+        assert os.path.normpath(app.v_out.get()) == os.path.normpath(os.path.join(sys1, "results"))
+
+        app.v_prior_source.set(str(b1))
+        app._autodetect_folder(sys2)
+        assert app.v_prior_source.get() == ""
+        assert os.path.normpath(app.v_out.get()) == os.path.normpath(os.path.join(sys2, "results"))
+
+        # LiveMonitorFrame decouples 2s light file check from 120s graph refresh
+        lm = app.live_monitor_frame
+        assert lm.refresh_interval_s == 120.0
+        assert lm.file_check_interval_s == 2.0
+
+        # Folder switch in Live Monitor clears old prior_source and resets graph state
+        lm.custom_watch_folder = str(tmp_path / "Proj_files" / "dp0" / "FFF-1" / "Fluent")
+        lm.prior_source = str(b1)
+        lm.monitor_fluent_run(sys2, auto_switch_tab=False)
+        assert lm.prior_source is None
+        lm._stop_monitoring()
+    finally:
+        app.destroy()
+
+
+
 
 
