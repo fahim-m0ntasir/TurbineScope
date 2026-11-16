@@ -697,6 +697,31 @@ def test_live_monitor_ui_alerts_clear_kinematics_probe_and_cy_plot(tmp_path, mon
         lm.v_autoscale.set(False)
         lm._on_autoscale_toggle()
         assert lm._last_rendered_graph_state != prev_state
+
+        # 6. Canvas schedules real Qt paintEvent after _render_graphs without tab switch
+        from vawt_post.ui.qt_tk import QApplication
+        app.show()
+        for _ in range(3):
+            QApplication.processEvents()
+        paint_calls = []
+        orig_pe = lm.canvas.paintEvent
+        lm.canvas.paintEvent = lambda ev: (paint_calls.append(True), orig_pe(ev))[-1]
+        snap_repaint = LiveMonitorSnapshot(
+            status="Monitoring",
+            is_full_refresh=True,
+            current_step=25,
+            current_time=0.025,
+            timeseries={"t": np.linspace(0.0, 0.25, 25), "cp": np.zeros(25), "cm": np.zeros(25), "ct": None, "cy": None, "Mrot": np.zeros(25), "Mb": []},
+        )
+        lm.grid_layout_mode = "2×2 Grid"
+        lm._rebuild_plot_axes()
+        for _ in range(3):
+            QApplication.processEvents()
+        paint_calls.clear()
+        lm._render_graphs(snap_repaint)
+        for _ in range(8):
+            QApplication.processEvents()
+        assert len(paint_calls) >= 1
     finally:
         app.destroy()
 

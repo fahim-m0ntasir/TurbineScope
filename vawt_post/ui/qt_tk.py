@@ -2775,6 +2775,13 @@ class QtMplCanvasWidget(FigureCanvasQTAgg, QtWidgetBase):
     def get_tk_widget(self) -> "QtMplCanvasWidget":
         return self
 
+    def update(self, *args: Any) -> None:  # type: ignore[override]
+        """Preserve QWidget.update() repaint scheduling instead of QtWidgetBase.update()."""
+        if args:
+            QWidget.update(self, *args)
+        else:
+            QWidget.update(self)
+
     def update_bbox_region(self, bbox: Any = None) -> None:
         """Schedule an async coalesced Qt repaint of a Matplotlib display bbox (or full canvas)."""
         if bbox is not None:
