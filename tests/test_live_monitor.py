@@ -557,6 +557,151 @@ def test_ui_folder_switch_and_live_subpolling(tmp_path, monkeypatch):
         app.destroy()
 
 
+def test_live_monitor_cm_formula_moment_sign_and_light_tip(tmp_path):
+    """Verify Cm = M / (Fref*R), moment_sign override, tick_light live tip, headerless recovery, late files, and stage glitch filter."""
+    # 1. Start with empty file -> header + data written later -> IncrementalFileReader recovers time_col & val_col
+    m_file = tmp_path / "moment-rfile.out"
+    m_file.write_text("", encoding="utf-8")
+    rd = IncrementalFileReader(str(m_file), "total")
+    assert rd._header_from_fallback is True
+    assert rd.read_new_chunk()[0] == 0
+
+    m_file.write_text(
+        '("Time Step" "flow-time" "moment")\n'
+        '1 0.001 2.0\n'
+        '2 0.002 nan\n'
+        '2 0.002 2.0\n'
+        '3 0.003\n'
+        '3 0.003 2.0\n',
+        encoding="utf-8",
+    )
+    cnt, steps, times, vals = rd.read_new_chunk()
+    assert rd._header_from_fallback is False
+    assert rd.time_col == 1 and rd.val_col == 2
+    assert rd.raw_steps == [1, 2, 3]
+    assert rd.raw_times == pytest.approx([0.001, 0.002, 0.003])
+    assert rd.raw_vals == pytest.approx([2.0, 2.0, 2.0])
+
+    # 2. LiveMonitorEngine Cm formula (Mref = Fref * R, NOT Pref / omega) + explicit moment_sign "-1"
+    p = Params(U=10.0, omega=30.0, R=0.5, depth=1.0, rho=1.225, n_blades=3, dt=0.001, moment_sign="-1")
+    tot_f = tmp_path / "moment_cm.out"
+    lines = ['("Time Step" "moment" "flow-time")\n']
+    for s in range(0, 300):
+        t = s * 0.001
+        lines.append(f"{s} 2.0 {t:.6f}\n")
+    tot_f.write_text("".join(lines), encoding="utf-8")
+
+    eng = LiveMonitorEngine(p=p, f=InputFiles(total=str(tot_f)), watch_dir=str(tmp_path))
+    snap = eng.tick_full()
+    A = 2.0 * 0.5 * 1.0
+    Pref = 0.5 * 1.225 * (10.0 ** 3) * A
+    Mref = 0.5 * 1.225 * (10.0 ** 2) * A * 0.5
+    assert eng.Mrot[-1] == pytest.approx(-2.0)  # moment_sign="-1" applied
+    assert eng.Cp[-1] == pytest.approx(-2.0 * 30.0 / Pref, rel=1e-6)
+    assert eng.Cm[-1] == pytest.approx(-2.0 / Mref, rel=1e-6)
+    assert abs(eng.Cm[-1] - eng.Cp[-1]) > 1e-3  # not degenerate Cm == Cp
+
+    # 3. tick_light() advances snapshot current_step/current_time between heavy ticks & ignores 1-step trailing glitch
+    with open(tot_f, "a", encoding="utf-8") as fh:
+        fh.write("300 2.0 0.300\n301 2.0 0.301\n")
+    assert eng.tick_light() is True
+    snap_light = eng.get_snapshot(is_full_refresh=False)
+    assert snap_light.current_step == 301
+    assert snap_light.current_time == pytest.approx(0.301)
+
+    # Append 1-step dt glitch at step 302 -> detect_stages should not emit a bogus 1-step Stage 2
+    with open(tot_f, "a", encoding="utf-8") as fh:
+        fh.write("302 2.0 0.310\n")
+    snap_glitch = eng.tick_full()
+    assert len(snap_glitch.stages) == 1
+
+    # 4. Late-arriving fy-only file forces re-processing even if lagging in step count
+    fy_f = tmp_path / "forcey-rfile.out"
+    fy_lines = ['("Time Step" "cy-force" "flow-time")\n'] + [f"{s} 5.0 {s*0.001:.6f}\n" for s in range(0, 290)]
+    fy_f.write_text("".join(fy_lines), encoding="utf-8")
+    eng._last_late_check_time = 0.0
+    snap_late = eng.tick_full()
+    assert eng.Cy is not None and eng.Ct is None
+    assert snap_late.timeseries["cy"] is not None
+
+
+def test_live_monitor_ui_alerts_clear_kinematics_probe_and_cy_plot(tmp_path, monkeypatch):
+    """Verify >100 alert clearing, Plot 11 twinx probe, Plot 05 Cy-only plot, Plot 07 1-pt probe, and Autoscale redraw."""
+    from vawt_post.engine.config import ConfigManager
+    cfg_path = tmp_path / "isolated_ui_cfg.json"
+    orig_init = ConfigManager.__init__
+    monkeypatch.setattr(ConfigManager, "__init__", lambda self, config_path=None: orig_init(self, config_path=str(cfg_path)))
+
+    from vawt_post.ui.app import VAWTPostApp
+    from vawt_post.engine.live_monitor import LiveMonitorSnapshot
+    app = VAWTPostApp()
+    try:
+        app._switch_page("live")
+        lm = app.live_monitor_frame
+        lm.live_params = Params(U=9.0, tsr=2.5, R=0.5, chord=0.06, n_blades=3, stable_tol=5.0)
+
+        # 1. Clear at 100 alerts -> newly added alert #101 still shows up!
+        alerts_100 = [{"seq": i + 1, "time": "12:00:00", "severity": "INFO", "message": f"msg {i+1}"} for i in range(100)]
+        snap100 = LiveMonitorSnapshot(status="Monitoring", is_full_refresh=True, alerts=alerts_100)
+        lm.latest_snapshot = snap100
+        lm._update_alerts_feed(snap100)
+        lm._clear_alerts()
+        assert lm.lbl_alerts_badge.cget("text") == "0"
+
+        alerts_101 = alerts_100[1:] + [{"seq": 101, "time": "12:00:05", "severity": "WARNING", "message": "alert 101"}]
+        snap101 = LiveMonitorSnapshot(status="Monitoring", is_full_refresh=False, alerts=alerts_101)
+        lm.latest_snapshot = snap101
+        lm._update_alerts_feed(snap101)
+        assert lm.lbl_alerts_badge.cget("text") == "1"
+
+        # 2. Plot 11 Kinematics twinx Hover Probe finds graph title + Azimuth coord + both AoA & W/U rows
+        theta = np.linspace(0.0, 360.0, 61)
+        snap_kin = LiveMonitorSnapshot(
+            status="Monitoring",
+            is_full_refresh=True,
+            current_step=10,
+            current_time=0.01,
+            timeseries={"t": np.linspace(0.0, 0.2, 20), "cp": np.zeros(20), "cm": np.zeros(20), "ct": None, "cy": np.ones(20) * 0.4, "Mrot": np.zeros(20), "Mb": []},
+            rev_history=[{"k": 1, "cp": 0.2, "dcp": None, "stable": False}, {"k": 2, "cp": 0.21, "dcp": 0.05, "stable": True}],
+            kinematics={"theta": theta, "aoa": 10.0 * np.sin(np.radians(theta)), "w_over_u": 2.5 + np.cos(np.radians(theta))},
+        )
+        lm.grid_layout_mode = "🔍 Focus Mode"
+        lm.focus_plot = "11. Kinematics (AoA, W/U, Re)"
+        lm._rebuild_plot_axes()
+        lm._render_graphs(snap_kin, force=True)
+        assert len(lm._twin_axes) == 1
+        twin_ax = next(iter(lm._twin_axes.keys()))
+        probe_k = lm._probe_axis_data(twin_ax, 90.0, 1.0)
+        assert probe_k is not None
+        assert "11. Kinematics" in probe_k["graph"]
+        assert "Azimuth" in probe_k["coord"]
+        labels_probed = [r[0] for r in probe_k["rows"]]
+        assert any("AoA" in l for l in labels_probed)
+        assert any("W/U" in l for l in labels_probed)
+
+        # 3. Plot 05 renders Cy even when Ct is None
+        lm.focus_plot = "05. Ct & Cy History"
+        lm._rebuild_plot_axes()
+        lm._render_graphs(snap_kin, force=True)
+        assert "Cy (Side)" in [ln.get_label() for ln in lm.axes[0].lines]
+
+        # 4. Plot 07 1-point curve at 2 completed revolutions is hover-probeable
+        lm.focus_plot = "07. Convergence & Spread"
+        lm._rebuild_plot_axes()
+        lm._render_graphs(snap_kin, force=True)
+        probe_conv = lm._probe_axis_data(lm.axes[0], 2.0, 5.0)
+        assert probe_conv is not None and "k = 2" in probe_conv["coord"]
+
+        # 5. Toggling Autoscale updates state & triggers graph redraw
+        prev_state = lm._last_rendered_graph_state
+        lm.v_autoscale.set(False)
+        lm._on_autoscale_toggle()
+        assert lm._last_rendered_graph_state != prev_state
+    finally:
+        app.destroy()
+
+
+
 
 
 

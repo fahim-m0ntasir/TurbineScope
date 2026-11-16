@@ -95,6 +95,8 @@ class IncrementalFileReader:
         self.has_missing_col_error: bool = False
         self.restart_detected: bool = False
         self.dt_fallback: Optional[float] = None
+        self._header_from_fallback: bool = False
+        self._header_bytes: bytes = b""
 
         # Accumulating raw parsed records
         self.raw_steps: List[int] = []
@@ -108,11 +110,23 @@ class IncrementalFileReader:
         if not os.path.isfile(self.path):
             return
         try:
+            with open(self.path, "rb") as fh_p:
+                self._header_bytes = fh_p.read(256)
             info = inspect_fluent_report(self.path)
-            self.columns = info.get("columns", [])
-            self.step_col = info.get("step_col", 0)
-            self.time_col = info.get("time_col")
+            cols = info.get("columns", [])
+            t_col = info.get("time_col")
             data_cols = info.get("data_columns", [])
+            # Treat empty/headerless files that fell back to generic ["Col_1", "Col_2"] as provisional
+            # so a real Fluent header written slightly later is re-inspected rather than locked to flow-time.
+            is_generic_fb = (
+                cols == ["Col_1", "Col_2"]
+                and t_col is None
+                and int(info.get("data_row_count", 0) or 0) == 0
+            )
+            self.columns = cols
+            self.step_col = info.get("step_col", 0)
+            self.time_col = t_col
+            self._header_from_fallback = is_generic_fb
             if data_cols:
                 self.val_col = data_cols[0][0]
                 self.has_missing_col_error = False
@@ -133,6 +147,8 @@ class IncrementalFileReader:
         self.raw_vals.clear()
         self.error_msg = None
         self.is_valid = True
+        self._header_from_fallback = False
+        self._header_bytes = b""
         self._inspect_file_header()
 
     def read_new_chunk(self) -> Tuple[int, List[int], List[float], List[float]]:
@@ -155,18 +171,33 @@ class IncrementalFileReader:
             self.error_msg = f"Cannot stat file: {e}"
             return 0, [], [], []
 
-        # Detect file truncation or restart
+        # Detect file truncation or skip idle reads when size is unchanged
         if curr_size < self.byte_offset:
             self.restart_detected = True
             self.reset()
-
-        if curr_size == self.byte_offset:
+        elif curr_size == self.byte_offset:
             return 0, [], [], []
 
-        # Read newly appended bytes
+        # Re-inspect header from start if previously locked on an empty/headerless fallback
+        if self._header_from_fallback and curr_size > 0:
+            prev_fb = self._header_from_fallback
+            self._inspect_file_header()
+            if prev_fb and not self._header_from_fallback and self.byte_offset > 0:
+                self.byte_offset = 0
+                self.buffer = ""
+                self.raw_steps.clear()
+                self.raw_times.clear()
+                self.raw_vals.clear()
+
+        # Check for overwritten file with changed header and read newly appended bytes in a single open()
         new_bytes = b""
         try:
             with open(self.path, "rb") as fh:
+                if self.byte_offset > 0 and self._header_bytes:
+                    head_now = fh.read(min(len(self._header_bytes), curr_size))
+                    if head_now and head_now != self._header_bytes[:len(head_now)]:
+                        self.restart_detected = True
+                        self.reset()
                 fh.seek(self.byte_offset)
                 new_bytes = fh.read()
                 self.byte_offset = fh.tell()
@@ -195,7 +226,7 @@ class IncrementalFileReader:
         if not completed_lines:
             return 0, [], [], []
 
-        if self.columns is None:
+        if self.columns is None or self._header_from_fallback:
             self._inspect_file_header()
 
         new_steps: List[int] = []
@@ -213,12 +244,19 @@ class IncrementalFileReader:
                 nums = [float(x) for x in toks]
             except ValueError:
                 # Non-numeric line: header or metadata
-                if (not inspected_on_non_numeric) and (self.columns is None or self.has_missing_col_error):
+                if (not inspected_on_non_numeric) and (
+                    self.columns is None or self.has_missing_col_error or self._header_from_fallback
+                ):
                     self._inspect_file_header()
                     inspected_on_non_numeric = True
                 continue
 
-            if len(nums) < 2:
+            req_cols = max(
+                2,
+                self.val_col + 1,
+                (self.time_col + 1) if self.time_col is not None else 0,
+            )
+            if len(nums) < req_cols or not all(math.isfinite(x) for x in nums):
                 continue
 
             # Fallback if no header was resolved
@@ -320,6 +358,7 @@ class LiveMonitorEngine:
         # Alerts feed
         self.alerts: List[Dict[str, Any]] = []
         self.logged_alert_keys: set = set()
+        self._alert_seq: int = 0
 
         # Azimuth & live health telemetry state
         self.start_azimuth_info: Optional[Dict[str, Any]] = None
@@ -340,6 +379,11 @@ class LiveMonitorEngine:
         self._last_late_check_time: float = 0.0
         self.last_stage_count: int = 1
         self.run_segment: int = 1
+        self._live_tip_step: Optional[int] = None
+        self._live_tip_time: Optional[float] = None
+        self._live_base_time: Optional[float] = None
+        self._force_reprocess: bool = False
+        self._just_received_data: bool = False
 
         # Prior run linking & missing-step continuity cache
         self.prior_series_cache: Dict[str, Dict[str, Any]] = {}
@@ -422,19 +466,41 @@ class LiveMonitorEngine:
         """Dynamically attach, change, or clear a prior/backup run link during monitoring."""
         self.f.prior_source = prior_source or None
         self.f.continuity_mode = continuity_mode or "auto"
-        for k_clear in ("prior_loaded", "continuity_stitch"):
+        for k_clear in (
+            "prior_loaded", "continuity_stitch", "conv_stable", "rotor_speed_mismatch",
+            "dt_mismatch", "midspin_detected", "midspin_flowtime", "theta0_verified",
+            "blade_phasing", "dt_res_initial", "coarse_az_res", "cp_physical_range",
+        ):
             self.logged_alert_keys.discard(k_clear)
+        self.steps = np.array([], dtype=np.int64)
+        self.times = np.array([], dtype=float)
+        self.Mrot = np.array([], dtype=float)
+        self.Mb = [np.array([], dtype=float) for _ in range(self.p.n_blades or 3)]
+        self.Fx = None
+        self.Fy = None
+        self.Cp = np.array([], dtype=float)
+        self.Cm = np.array([], dtype=float)
+        self.Ct = None
+        self.Cy = None
+        self.recovered_mask = np.array([], dtype=bool)
         self.last_step_processed = -1
         self.completed_revs_count = 0
+        self.last_rev_end_time = 0.0
         self.rev_history.clear()
         self.stable_reached_notified = False
         self.heat_map = None
         self.spectrum = {}
         self.blade_torques = {}
         self.forces_az = {}
+        self.last_stage_count = 1
+        self._last_aitken_alert_rev = -1
         self.start_azimuth_info = None
         self.blade_phasing_info = None
         self._az_checked_rev = -1
+        self._live_tip_step = None
+        self._live_tip_time = None
+        self._live_base_time = None
+        self._force_reprocess = True
         self._load_prior_if_needed()
         self.tick()
         return self.get_snapshot(target_revs=target_revs, is_full_refresh=True)
@@ -500,6 +566,7 @@ class LiveMonitorEngine:
                 except Exception:
                     pass
 
+        prev_roles = set(self.readers.keys())
         if self.f.total and "total" not in self.readers and os.path.isfile(self.f.total):
             self.readers["total"] = IncrementalFileReader(self.f.total, "total")
             self.add_alert("INFO", f"Attached late-appearing total moment file '{os.path.basename(self.f.total)}'")
@@ -510,14 +577,19 @@ class LiveMonitorEngine:
                 self.add_alert("INFO", f"Attached late-appearing blade {i+1} file '{os.path.basename(bp)}'")
         if self.f.shaft and "shaft" not in self.readers and os.path.isfile(self.f.shaft):
             self.readers["shaft"] = IncrementalFileReader(self.f.shaft, "shaft")
+            self.add_alert("INFO", f"Attached late-appearing shaft file '{os.path.basename(self.f.shaft)}'")
         if self.f.fx and "fx" not in self.readers and os.path.isfile(self.f.fx):
             self.readers["fx"] = IncrementalFileReader(self.f.fx, "fx")
+            self.add_alert("INFO", f"Attached late-appearing Fx file '{os.path.basename(self.f.fx)}'")
         if self.f.fy and "fy" not in self.readers and os.path.isfile(self.f.fy):
             self.readers["fy"] = IncrementalFileReader(self.f.fy, "fy")
+            self.add_alert("INFO", f"Attached late-appearing Fy file '{os.path.basename(self.f.fy)}'")
         if self.f.fx_shaft and "fx_shaft" not in self.readers and os.path.isfile(self.f.fx_shaft):
             self.readers["fx_shaft"] = IncrementalFileReader(self.f.fx_shaft, "fx_shaft")
         if self.f.fy_shaft and "fy_shaft" not in self.readers and os.path.isfile(self.f.fy_shaft):
             self.readers["fy_shaft"] = IncrementalFileReader(self.f.fy_shaft, "fy_shaft")
+        if set(self.readers.keys()) != prev_roles:
+            self._force_reprocess = True
 
     def add_alert(self, severity: str, message: str, key: Optional[str] = None) -> None:
         """Add timestamped notification to alerts feed."""
@@ -526,7 +598,9 @@ class LiveMonitorEngine:
         if key:
             self.logged_alert_keys.add(key)
         stamp_str = _dt.datetime.now().strftime("%H:%M:%S")
+        self._alert_seq += 1
         self.alerts.append({
+            "seq": self._alert_seq,
             "time": stamp_str,
             "severity": severity,  # "ERROR", "WARNING", "INFO", "SUCCESS"
             "message": message,
@@ -586,6 +660,10 @@ class LiveMonitorEngine:
                 self._role_continuity_info.clear()
                 self._prefix_refined_for_gap = False
                 self.recovered_mask = np.array([], dtype=bool)
+                self._live_tip_step = None
+                self._live_tip_time = None
+                self._live_base_time = None
+                self._force_reprocess = True
                 self.add_alert(
                     "WARNING",
                     f"Simulation restart or truncation detected in '{os.path.basename(reader.path)}': "
@@ -599,17 +677,49 @@ class LiveMonitorEngine:
                     key=f"missing_col_{role}"
                 )
 
-        # Continually compute speed metrics even during light ticks
+        # Continually compute speed metrics and lightweight live step/time tip during light ticks
         now = time.time()
         dt_wall = now - self.last_update_wall_time
+        valid_light = {r: rd for r, rd in self.readers.items() if rd.is_valid and rd.raw_steps}
+        if valid_light:
+            tip_step = min(int(rd.raw_steps[-1]) for rd in valid_light.values())
+            pref_rd = next((rd for rd in valid_light.values() if rd.time_col is not None), next(iter(valid_light.values())))
+            idx_tip = len(pref_rd.raw_steps) - 1
+            for j in range(len(pref_rd.raw_steps) - 1, -1, -1):
+                if int(pref_rd.raw_steps[j]) <= tip_step:
+                    idx_tip = j
+                    break
+            tip_t = float(pref_rd.raw_times[idx_tip])
+            base_t = float(pref_rd.raw_times[0])
+            if pref_rd.time_col is None and self.p.dt and self.p.dt > 0:
+                tip_t *= float(self.p.dt)
+                base_t *= float(self.p.dt)
+            if self.times is not None and len(self.times) > 0:
+                base_t = min(base_t, float(self.times[0]))
+            self._live_tip_step = tip_step
+            self._live_tip_time = tip_t
+            self._live_base_time = base_t
+        else:
+            self._live_tip_step = None
+            self._live_tip_time = None
+            self._live_base_time = None
+
         if dt_wall >= 1.0 and self.readers:
             total_raw = max((len(rd.raw_steps) for rd in self.readers.values() if rd.is_valid), default=0)
             if self.last_step_count > 0:
-                delta_steps = total_raw - self.last_step_count
-                self.steps_per_sec = max(0.0, delta_steps / dt_wall)
+                delta_steps = max(0, total_raw - self.last_step_count)
+                self.steps_per_sec = delta_steps / dt_wall
             self.last_update_wall_time = now
             self.last_step_count = total_raw
 
+        fresh_read = False
+        if new_data_found and valid_light:
+            max_read_age = max(
+                (max(0.0, now - rd.last_mtime) if rd.last_mtime > 0 else 0.0)
+                for rd in valid_light.values()
+            )
+            fresh_read = (max_read_age <= max(self.stalled_timeout, 1.0))
+        self._just_received_data = fresh_read
         return new_data_found
 
     @staticmethod
@@ -661,6 +771,13 @@ class LiveMonitorEngine:
                 self.rev_history.clear()
                 self.stable_reached_notified = False
                 self._last_aitken_alert_rev = -1
+                self._az_checked_rev = -1
+                self.heat_map = None
+                self.spectrum = {}
+                self.blade_torques = {}
+                self.forces_az = {}
+                for k_cl in ("continuity_stitch", "conv_stable", "midspin_detected", "theta0_verified", "blade_phasing", "cp_physical_range"):
+                    self.logged_alert_keys.discard(k_cl)
                 need_summary_update = True
 
             for role, rd in valid_readers.items():
@@ -689,7 +806,11 @@ class LiveMonitorEngine:
                     if r_info.get("status") == "incompatible_backup":
                         cutoff = int(c_steps[0]) if len(c_steps) > 0 else 0
                     elif cont_mode == "prefer_backup":
-                        cutoff = int(prior_s["step"][-1]) + 1 if len(prior_s["step"]) > 0 else int(c_steps[0])
+                        b_rng = r_info.get("backup_step_range")
+                        if b_rng and len(b_rng) == 2:
+                            cutoff = int(b_rng[1]) + 1
+                        else:
+                            cutoff = int(prior_s["step"][-1]) + 1 if len(prior_s["step"]) > 0 else int(c_steps[0])
                     else:
                         cutoff = int(c_steps[0]) if len(c_steps) > 0 else 0
 
@@ -724,6 +845,16 @@ class LiveMonitorEngine:
                 any_div = any(bool(r.get("overlap_divergent", False)) for r in self._role_continuity_info.values())
                 max_vd = max((float(r.get("overlap_max_val_diff", 0.0)) for r in self._role_continuity_info.values()), default=0.0)
                 first_rep = next(iter(self._role_continuity_info.values()))
+                if rec_max > 0:
+                    first_rep = next(
+                        (r for r in self._role_continuity_info.values() if int(r.get("recovered_count", 0)) > 0),
+                        first_rep,
+                    )
+                elif any_div:
+                    first_rep = next(
+                        (r for r in self._role_continuity_info.values() if r.get("overlap_divergent")),
+                        first_rep,
+                    )
                 nrmse_vals = [float(r["val_nrmse_pct"]) for r in self._role_continuity_info.values() if r.get("val_nrmse_pct") is not None]
                 mean_nrmse = float(np.mean(nrmse_vals)) if nrmse_vals else None
                 st_name = first_rep.get("status", "overlap_verified")
@@ -832,13 +963,30 @@ class LiveMonitorEngine:
         sorted_steps = sorted(common_steps_set)
         latest_common_step = sorted_steps[-1]
 
-        if latest_common_step <= self.last_step_processed:
+        force_reproc = self._force_reprocess
+        self._force_reprocess = False
+
+        if latest_common_step <= self.last_step_processed and not force_reproc:
             return
 
         # Align series up to latest common step
         common_arr = np.array(sorted_steps, dtype=np.int64)
+        if force_reproc or (len(self.steps) > 0 and (len(common_arr) < len(self.steps) or int(common_arr[0]) > int(self.steps[0]))):
+            self.completed_revs_count = 0
+            self.rev_history.clear()
+            self.stable_reached_notified = False
+            self._last_aitken_alert_rev = -1
+            self.blade_torques = {}
+            self.forces_az = {}
+            self.heat_map = None
+            self.spectrum = {}
+
         first_role = next(iter(eff_arrays.keys()))
-        ref_steps, ref_times, _, _ = eff_arrays[first_role]
+        ref_role = next(
+            (r for r in eff_arrays if valid_readers.get(r) is not None and valid_readers[r].time_col is not None),
+            first_role,
+        )
+        ref_steps, ref_times, _, _ = eff_arrays[ref_role]
 
         pos_ref = np.searchsorted(ref_steps, common_arr)
         aligned_t = ref_times[pos_ref]
@@ -860,9 +1008,13 @@ class LiveMonitorEngine:
         omega_val = self.p.omega_val() if (self.p.omega or (self.p.tsr and self.p.U and self.p.R)) else 1.0
         A = 2.0 * (self.p.R or 0.5) * self.p.depth
         Pref = 0.5 * self.p.rho * ((self.p.U or 8.0) ** 3) * A
-        Mref = Pref / omega_val
+        Fref = 0.5 * self.p.rho * ((self.p.U or 8.0) ** 2) * A
+        Mref = Fref * (self.p.R or 0.5)
 
-        sign_val = -1.0 if getattr(self.p, "rotation_dir", "ccw") == "cw" else 1.0
+        if getattr(self.p, "moment_sign", "auto") in ("+1", "-1"):
+            sign_val = float(self.p.moment_sign)
+        else:
+            sign_val = -1.0 if getattr(self.p, "rotation_dir", "ccw") == "cw" else 1.0
 
         nb_count = self.p.n_blades or 0
         have_blades = nb_count > 0 and all(f"blade {i + 1}" in aligned_vals for i in range(nb_count))
@@ -870,13 +1022,14 @@ class LiveMonitorEngine:
             self.Mb = [sign_val * aligned_vals[f"blade {i + 1}"] for i in range(nb_count)]
             self.Mrot = np.sum(self.Mb, axis=0)
         elif "total" in aligned_vals:
+            self.Mb = []
             self.Mrot = sign_val * aligned_vals["total"]
             if "shaft" in aligned_vals:
                 self.Mrot = self.Mrot - sign_val * aligned_vals["shaft"]
         else:
+            self.Mb = []
             self.Mrot = np.zeros_like(self.times)
 
-        Fref = 0.5 * self.p.rho * ((self.p.U or 8.0) ** 2) * A
         if "fx" in aligned_vals:
             fx_net = aligned_vals["fx"]
             if "fx_shaft" in aligned_vals:
@@ -899,16 +1052,7 @@ class LiveMonitorEngine:
         self.Cp = omega_val * self.Mrot / Pref
         self.Cm = self.Mrot / Mref
 
-        # Update speed metrics
-        now = time.time()
-        dt_wall = now - self.last_update_wall_time
-        if dt_wall >= 1.0:
-            delta_steps = len(self.steps) - self.last_step_count
-            self.steps_per_sec = max(0.0, delta_steps / dt_wall)
-            self.last_update_wall_time = now
-            self.last_step_count = len(self.steps)
-
-        # 3. Incremental revolution calculation
+        # 3. Incremental revolution calculation (speed already updated accurately in tick_light)
         Trev = 2.0 * math.pi / omega_val
         t_span = self.times[-1] - self.times[0]
         n_full_revs = int(math.floor(t_span / Trev + 1e-9))
@@ -964,7 +1108,7 @@ class LiveMonitorEngine:
 
             # Update heavy revolution items (heat map, spectrum, blade torques)
             self._update_heavy_revolution_metrics(omega_val, Trev)
-        elif not self.blade_torques and self.Mb and len(self.times) > 10:
+        elif not self.blade_torques and any(len(m) > 0 for m in self.Mb) and len(self.times) > 10:
             self._update_heavy_revolution_metrics(omega_val, Trev)
 
         if len(self.times) >= 5 and self._az_checked_rev < 0:
@@ -1077,8 +1221,16 @@ class LiveMonitorEngine:
         self.p = copy.deepcopy(new_p)
         for reader in self.readers.values():
             reader.dt_fallback = self.p.dt
+        self.steps = np.array([], dtype=np.int64)
+        self.times = np.array([], dtype=float)
+        self.Mrot = np.array([], dtype=float)
+        self.Mb = [np.array([], dtype=float) for _ in range(self.p.n_blades or 3)]
+        self.Cp = np.array([], dtype=float)
+        self.Cm = np.array([], dtype=float)
+        self.recovered_mask = np.array([], dtype=bool)
         self.last_step_processed = -1
         self.completed_revs_count = 0
+        self.last_rev_end_time = 0.0
         self.rev_history.clear()
         self.stable_reached_notified = False
         self.Ct = None
@@ -1089,6 +1241,7 @@ class LiveMonitorEngine:
         self.spectrum = {}
         self.blade_torques = {}
         self.forces_az = {}
+        self.last_stage_count = 1
         self.start_azimuth_info = None
         self.blade_phasing_info = None
         self._az_checked_rev = -1
@@ -1099,12 +1252,8 @@ class LiveMonitorEngine:
         self._prefix_refined_for_gap = False
         self.continuity_summary = None
         self.logged_alert_keys.clear()
-        if self.prior_series_cache and self.prior_source_label:
-            self.add_alert(
-                "INFO",
-                f"Backup linked from '{self.prior_source_label}' ({len(self.prior_series_cache)} prior series loaded).",
-                key="prior_loaded",
-            )
+        self._force_reprocess = True
+        self._load_prior_if_needed()
         self.tick()
         return self.get_snapshot(target_revs=target_revs, is_full_refresh=True)
 
@@ -1248,8 +1397,10 @@ class LiveMonitorEngine:
             for i in range(1, len(dts) + 1):
                 is_end = (i == len(dts))
                 is_jump = (not is_end) and (abs(dts[i] - dts[start]) / max(abs(dts[start]), 1e-12) > STAGE_DT_CHANGE_REL_TOL)
-                # Ignore isolated 1-step dt glitches that immediately revert on the next step
+                # Ignore isolated 1-step dt glitches (either mid-stream OR on trailing step)
                 if is_jump and (i + 1 < len(dts)) and (abs(dts[i + 1] - dts[start]) / max(abs(dts[start]), 1e-12) <= STAGE_DT_CHANGE_REL_TOL):
+                    continue
+                if is_jump and (i + 1 == len(dts)) and (i - start >= 2):
                     continue
                 if is_end or is_jump:
                     d = float(np.median(dts[start:i]))
@@ -1289,18 +1440,25 @@ class LiveMonitorEngine:
         az_base = compute_az_base(self.p)
         curr_step = int(self.steps[-1]) if len(self.steps) > 0 else 0
         curr_t = float(self.times[-1]) if len(self.times) > 0 else 0.0
-        tot_revs = float((self.times[-1] - self.times[0]) / Trev) if len(self.times) > 1 else 0.0
+        base_t = float(self.times[0]) if len(self.times) > 0 else 0.0
+        has_live_tip = self._live_tip_step is not None and self._live_tip_time is not None
+        if has_live_tip and (len(self.steps) == 0 or int(self._live_tip_step or 0) > curr_step):
+            curr_step = int(self._live_tip_step or 0)
+            curr_t = float(self._live_tip_time or 0.0)
+            if self._live_base_time is not None:
+                base_t = min(base_t, float(self._live_base_time)) if len(self.times) > 0 else float(self._live_base_time)
+        tot_revs = float((curr_t - base_t) / Trev) if (Trev > 0 and curr_t > base_t) else 0.0
 
         # Current azimuth (0 to 360) in continuous absolute flow-time
         curr_az = float(np.mod(az_base + np.degrees(omega_val * curr_t), 360.0))
 
         # Wall-clock ETA calculation: convert remaining revolutions -> remaining steps -> wall-clock seconds
         eta_s = None
-        if target_revs and target_revs > tot_revs and self.steps_per_sec > 0 and len(self.times) > 1:
-            revs_left = target_revs - tot_revs
-            recent_dts = np.diff(self.times[-min(len(self.times), 100):])
+        if target_revs and target_revs > tot_revs and self.steps_per_sec > 0:
+            recent_dts = np.diff(self.times[-min(len(self.times), 100):]) if len(self.times) > 1 else np.array([], dtype=float)
             dt_est = float(np.median(recent_dts)) if len(recent_dts) > 0 else (float(self.p.dt) if self.p.dt else 0.0)
             if dt_est > 0 and Trev > 0:
+                revs_left = target_revs - tot_revs
                 steps_left = revs_left * (Trev / dt_est)
                 eta_s = max(0.0, steps_left / self.steps_per_sec)
 
@@ -1329,9 +1487,11 @@ class LiveMonitorEngine:
             )
 
         # Status state & stall/resume alert transitions
-        if not self.readers or len(self.steps) == 0:
+        just_received = bool(getattr(self, "_just_received_data", False))
+        self._just_received_data = False
+        if not self.readers or (len(self.steps) == 0 and not has_live_tip):
             status_str = "Waiting for files"
-        elif max_age > self.stalled_timeout:
+        elif (not just_received) and (max_age > self.stalled_timeout):
             status_str = "Stalled / finished?"
             if not self._stall_alert_active:
                 self._stall_alert_active = True
@@ -1685,16 +1845,18 @@ class LiveMonitorWorker:
 
     def set_refresh_interval(self, interval_s: float) -> None:
         """Adjust refresh interval in seconds on the fly and synchronize file checking."""
-        self.graph_refresh_interval = max(1.0, float(interval_s))
-        self.file_check_interval = self.graph_refresh_interval
-        self.engine.stalled_timeout = max(60.0, 3.0 * self.graph_refresh_interval)
+        with self._lock:
+            self.graph_refresh_interval = max(1.0, float(interval_s))
+            self.file_check_interval = self.graph_refresh_interval
+            self.engine.stalled_timeout = max(60.0, 3.0 * self.graph_refresh_interval)
         self._wake_event.set()
 
     set_poll_interval = set_refresh_interval
 
     def set_file_check_interval(self, interval_s: float) -> None:
         """Adjust light polling interval if explicitly configured."""
-        self.file_check_interval = max(1.0, float(interval_s))
+        with self._lock:
+            self.file_check_interval = max(1.0, float(interval_s))
         self._wake_event.set()
 
     def set_target_revs(self, target: Optional[float]) -> None:
@@ -1743,12 +1905,14 @@ class LiveMonitorWorker:
             with self._lock:
                 self.engine.tick()
                 snap = self.engine.get_snapshot(self.target_revs, is_full_refresh=True)
-            self.queue.put(snap)
+                self.queue.put(snap)
             last_light_time = time.time()
             last_heavy_time = time.time()
         except Exception as e:
             with self._lock:
                 self.engine.add_alert("ERROR", f"Initial tick error: {e}")
+                err_snap = self.engine.get_snapshot(self.target_revs, is_full_refresh=True)
+                self.queue.put(err_snap)
 
         while not self._stop_event.is_set():
             now = time.time()
@@ -1772,10 +1936,12 @@ class LiveMonitorWorker:
                     with self._lock:
                         self.engine.tick()
                         snap = self.engine.get_snapshot(self.target_revs, is_full_refresh=True)
-                    self.queue.put(snap)
+                        self.queue.put(snap)
                 except Exception as e:
                     with self._lock:
                         self.engine.add_alert("ERROR", f"Refresh error: {e}")
+                        err_snap = self.engine.get_snapshot(self.target_revs, is_full_refresh=True)
+                        self.queue.put(err_snap)
                 finally:
                     last_heavy_time = time.time()
                     last_light_time = time.time()
@@ -1784,7 +1950,7 @@ class LiveMonitorWorker:
                     with self._lock:
                         self.engine.tick_light()
                         snap = self.engine.get_snapshot(self.target_revs, is_full_refresh=False)
-                    self.queue.put(snap)
+                        self.queue.put(snap)
                 except Exception as e:
                     with self._lock:
                         self.engine.add_alert("ERROR", f"Light check error: {e}")

@@ -21,6 +21,7 @@ import datetime as _dt
 import math
 import os
 import queue
+import threading
 import time
 import traceback
 from typing import Dict, List, Optional, Tuple, Any
@@ -69,6 +70,8 @@ class LiveParamsEditDialog(ctk.CTkToplevel):
         self.monitor_frame = parent
         self.watch_folder = watch_folder
         self.on_apply = on_apply
+        self.orig_params = copy.deepcopy(current_params)
+        self._detected_watch_folder: Optional[str] = None
 
         self.title("✏️ Edit Live Monitor Parameters")
         self.geometry("560x640")
@@ -280,12 +283,10 @@ class LiveParamsEditDialog(ctk.CTkToplevel):
         try:
             from vawt_post.engine.parser import detect_folder_simulation_parameters, resolve_fluent_directory
             rf = resolve_fluent_directory(folder)
-            if rf and os.path.isdir(rf):
-                folder = rf
-                self.watch_folder = rf
-                if hasattr(self, "monitor_frame") and self.monitor_frame:
-                    self.monitor_frame.custom_watch_folder = rf
-            det = detect_folder_simulation_parameters(rf)
+            detect_dir = rf if rf and os.path.isdir(rf) else folder
+            self.watch_folder = detect_dir
+            self._detected_watch_folder = detect_dir
+            det = detect_folder_simulation_parameters(detect_dir)
             if not det:
                 messagebox.showwarning(
                     "Auto-Detect Notice",
@@ -400,23 +401,22 @@ class LiveParamsEditDialog(ctk.CTkToplevel):
             if w_val is not None and w_val > 0 and u_val and r_val:
                 tsr_val = w_val * r_val / u_val
 
-            new_p = Params(
-                U=u_val,
-                tsr=tsr_val,
-                omega=w_val,
-                R=r_val,
-                chord=c_val,
-                n_blades=nb_val,
-                stable_tol=tol_val if tol_val is not None else 5.0,
-                n_stable=nstable_val if nstable_val is not None else 2,
-                dt=dt_val,
-                bin_deg=bin_val if bin_val is not None else 1.0,
-                rho=rho_val if rho_val is not None else 1.225,
-                mu=mu_val if mu_val is not None else 1.7894e-5,
-                depth=depth_val if depth_val is not None else 1.0,
-                rotation_dir=self.v_rot_dir.get() or "ccw",
-                theta0=float(theta0_val if theta0_val is not None else 0.0),
-            )
+            new_p = copy.deepcopy(self.orig_params) if hasattr(self, "orig_params") and self.orig_params is not None else Params()
+            new_p.U = u_val
+            new_p.tsr = tsr_val
+            new_p.omega = w_val
+            new_p.R = r_val
+            new_p.chord = c_val
+            new_p.n_blades = nb_val
+            new_p.stable_tol = tol_val if tol_val is not None else 5.0
+            new_p.n_stable = nstable_val if nstable_val is not None else 2
+            new_p.dt = dt_val
+            new_p.bin_deg = bin_val if bin_val is not None else 1.0
+            new_p.rho = rho_val if rho_val is not None else 1.225
+            new_p.mu = mu_val if mu_val is not None else 1.7894e-5
+            new_p.depth = depth_val if depth_val is not None else 1.0
+            new_p.rotation_dir = self.v_rot_dir.get() or "ccw"
+            new_p.theta0 = float(theta0_val if theta0_val is not None else 0.0)
             errs = new_p.validate()
             if errs:
                 raise ValueError("\n".join(errs))
@@ -424,6 +424,14 @@ class LiveParamsEditDialog(ctk.CTkToplevel):
             messagebox.showerror("Parameter Validation Error", str(exc), parent=self)
             return
 
+        if (
+            self._detected_watch_folder
+            and hasattr(self, "monitor_frame")
+            and self.monitor_frame
+            and not getattr(self.monitor_frame, "is_monitoring", False)
+            and not getattr(self.monitor_frame, "custom_watch_folder", None)
+        ):
+            self.monitor_frame.custom_watch_folder = self._detected_watch_folder
         self.on_apply(new_p)
         self.destroy()
 
@@ -457,10 +465,12 @@ class LiveMonitorFrame(ctk.CTkFrame):
         self._file_row_widgets: Dict[str, Dict[str, Any]] = {}
         self._rendered_alerts_count: int = 0
         self._cleared_alert_count: int = 0
+        self._cleared_alert_seq: int = 0
         self._last_alerts_signature: Any = None
         self._recommended_theta0: Optional[float] = None
         self._last_rendered_graph_state: Any = None
         self._probe_artists: Dict[Any, Dict[str, Any]] = {}
+        self._twin_axes: Dict[Any, Any] = {}
         self._active_probe_ax: Any = None
         self._probe_enabled: bool = True
         self._mpl_motion_cid: Optional[int] = None
@@ -470,6 +480,7 @@ class LiveMonitorFrame(ctk.CTkFrame):
         self._last_hover_ts: float = 0.0
         self._last_hover_sig: Any = None
         self._probe_ui_cache: Dict[str, Any] = {}
+        self._probe_visible_rows: int = 6
 
         if self.app and hasattr(self.app, "config_mgr"):
             try:
@@ -967,7 +978,7 @@ class LiveMonitorFrame(ctk.CTkFrame):
             checkbox_width=18,
             checkbox_height=18,
             font=ctk.CTkFont(size=11, weight="bold"),
-            command=self._save_settings
+            command=self._on_autoscale_toggle
         ).pack(side="left", padx=(6, 2))
 
         # Inline Stability Tolerance (%) Entry
@@ -1189,6 +1200,7 @@ class LiveMonitorFrame(ctk.CTkFrame):
 
         self._probe_row_labels: List[Tuple[ctk.CTkLabel, ctk.CTkLabel]] = []
         self._probe_row_frames: List[Any] = []
+        self._probe_dividers: List[Any] = []
         max_rows = 6
         for idx in range(max_rows):
             r_frame = ctk.CTkFrame(self.probe_rows_frame, fg_color="transparent")
@@ -1216,9 +1228,9 @@ class LiveMonitorFrame(ctk.CTkFrame):
             self._probe_row_labels.append((k_lbl, v_lbl))
             self._probe_row_frames.append(r_frame)
             if idx < max_rows - 1:
-                ctk.CTkFrame(self.probe_rows_frame, height=1, fg_color=("#E2E8F0", "#252B34")).pack(
-                    fill="x", padx=8
-                )
+                div = ctk.CTkFrame(self.probe_rows_frame, height=1, fg_color=("#E2E8F0", "#252B34"))
+                div.pack(fill="x", padx=8)
+                self._probe_dividers.append(div)
 
         # Lightweight text mirror for programmatic readout compatibility (no QTextEdit overhead)
         class _ProbeTextMirror:
@@ -1351,9 +1363,13 @@ class LiveMonitorFrame(ctk.CTkFrame):
         ).pack(fill="x", padx=8, pady=8)
 
     def _clear_alerts(self):
-        """Hide alerts received so far without stopping future incoming alerts."""
+        """Hide alerts received so far without stopping future incoming alerts (even at 100-alert cap)."""
         cur_alerts = list(self.latest_snapshot.alerts) if (self.latest_snapshot and self.latest_snapshot.alerts) else []
         self._cleared_alert_count = len(cur_alerts)
+        if cur_alerts:
+            seqs = [int(a.get("seq", 0)) for a in cur_alerts if a.get("seq") is not None]
+            if seqs:
+                self._cleared_alert_seq = max(self._cleared_alert_seq, max(seqs))
         self._last_alerts_signature = None
         if self.latest_snapshot is not None:
             self._update_alerts_feed(self.latest_snapshot)
@@ -1371,7 +1387,7 @@ class LiveMonitorFrame(ctk.CTkFrame):
         p.param_sources["theta0"] = "mid-spin detected (live)"
         self._apply_edited_params(p)
         if self.worker:
-            self.worker.add_alert("SUCCESS", f"Applied θ₀ = {p.theta0:.1f}° to Live Monitor.", key="theta0_applied")
+            self.worker.add_alert("SUCCESS", f"Applied θ₀ = {p.theta0:.1f}° to Live Monitor.")
 
     def _update_alerts_feed(self, snap: Optional[LiveMonitorSnapshot]):
         """Refresh the ALERTS & UPDATES card with caching to prevent widget churn on idle ticks."""
@@ -1379,9 +1395,13 @@ class LiveMonitorFrame(ctk.CTkFrame):
             return
 
         alerts_all = list(snap.alerts) if (snap and snap.alerts) else []
-        if len(alerts_all) < self._cleared_alert_count:
-            self._cleared_alert_count = 0
-        visible = alerts_all[self._cleared_alert_count:]
+        has_seq = any(a.get("seq") is not None for a in alerts_all)
+        if has_seq:
+            visible = [a for a in alerts_all if int(a.get("seq", 0)) > getattr(self, "_cleared_alert_seq", 0)]
+        else:
+            if len(alerts_all) < self._cleared_alert_count:
+                self._cleared_alert_count = 0
+            visible = alerts_all[self._cleared_alert_count:]
         recent = list(reversed(visible))[:12]
 
         saz = snap.start_azimuth if (snap and isinstance(snap.start_azimuth, dict)) else None
@@ -1487,19 +1507,29 @@ class LiveMonitorFrame(ctk.CTkFrame):
                 ctk.CTkFrame(self.alerts_feed_box, height=1, fg_color=("#E2E8F0", "#252B34")).pack(fill="x", padx=8)
 
     def _update_probe_rows(self, rows: List[Tuple[str, str, str]], summary_text: str = ""):
-        """Populate the structured key-value probe rows only when text/color changes."""
+        """Populate the structured key-value probe rows cleanly without divider orphaning."""
         if hasattr(self, "_probe_row_labels"):
+            max_rows = len(self._probe_row_frames)
+            show_cnt = max(min(len(rows), max_rows), 4)
+            if getattr(self, "_probe_visible_rows", max_rows) != show_cnt:
+                for rf in self._probe_row_frames:
+                    rf.pack_forget()
+                for dv in getattr(self, "_probe_dividers", []):
+                    dv.pack_forget()
+                for idx_p in range(show_cnt):
+                    self._probe_row_frames[idx_p].pack(
+                        fill="x", padx=8, pady=(4 if idx_p == 0 else 2, 4 if idx_p == show_cnt - 1 else 2)
+                    )
+                    if idx_p < show_cnt - 1 and idx_p < len(getattr(self, "_probe_dividers", [])):
+                        self._probe_dividers[idx_p].pack(fill="x", padx=8)
+                self._probe_visible_rows = show_cnt
+
             for idx, (k_lbl, v_lbl) in enumerate(self._probe_row_labels):
-                rf = self._probe_row_frames[idx] if idx < len(self._probe_row_frames) else None
                 if idx < len(rows):
-                    if rf is not None and not rf.winfo_manager():
-                        rf.pack(fill="x", padx=8, pady=2)
                     k_txt, v_txt, v_col = rows[idx]
                     target_k = (k_txt, ("gray35", "gray70"))
                     target_v = (v_txt, v_col)
                 else:
-                    if idx >= 4 and rf is not None and rf.winfo_manager():
-                        rf.pack_forget()
                     target_k = ("", "gray")
                     target_v = ("", "gray")
                 if self._probe_ui_cache.get(f"k_{idx}") != target_k:
@@ -1623,6 +1653,8 @@ class LiveMonitorFrame(ctk.CTkFrame):
                 pass
 
         self.axes: List[matplotlib.axes.Axes] = []
+        if hasattr(self, "_twin_axes"):
+            self._twin_axes.clear()
 
         if self.grid_layout_mode == "2×2 Grid":
             for i in range(1, 5):
@@ -1648,7 +1680,8 @@ class LiveMonitorFrame(ctk.CTkFrame):
         elif self.grid_layout_mode == "🔍 Focus Mode":
             self.axes = [self.fig.add_subplot(1, 1, 1)]
             self.plot_names = [self.focus_plot]
-            self.fig.subplots_adjust(left=0.110, right=0.975, top=0.91, bottom=0.11)
+            r_marg = 0.915 if "Kinematics" in (self.focus_plot or "") else 0.975
+            self.fig.subplots_adjust(left=0.110, right=r_marg, top=0.91, bottom=0.11)
 
         title_fs = 7.5 if len(self.axes) >= 6 else (8.0 if len(self.axes) >= 4 else 9.0)
         for ax, p_name in zip(self.axes, self.plot_names):
@@ -1718,8 +1751,13 @@ class LiveMonitorFrame(ctk.CTkFrame):
         lp_ref = self.live_params or getattr(snap, "params", None)
         lp_sig = (
             round(float(getattr(lp_ref, "U", 0.0) or 0.0), 6),
+            round(float(getattr(lp_ref, "tsr", 0.0) or 0.0), 6),
             round(float(getattr(lp_ref, "omega", 0.0) or 0.0), 6),
             round(float(getattr(lp_ref, "R", 0.0) or 0.0), 6),
+            round(float(getattr(lp_ref, "chord", 0.0) or 0.0), 6),
+            round(float(getattr(lp_ref, "rho", 0.0) or 0.0), 6),
+            round(float(getattr(lp_ref, "mu", 0.0) or 0.0), 8),
+            round(float(getattr(lp_ref, "static_stall_deg", 12.0) or 12.0), 2),
             round(float(getattr(lp_ref, "theta0", 0.0) or 0.0), 4),
             str(getattr(lp_ref, "rotation_dir", "ccw") or "ccw"),
         ) if lp_ref is not None else ()
@@ -1732,6 +1770,7 @@ class LiveMonitorFrame(ctk.CTkFrame):
             int(rev_hist_all[-1].get("k", 0)) if rev_hist_all else 0,
             int(len(t_arr)) if t_arr is not None else 0,
             bool(ts_meta.get("ct") is not None),
+            bool(ts_meta.get("cy") is not None),
             int(len(mb_list)) if mb_list is not None else 0,
             str(cont_meta.get("status", "")),
             int(cont_meta.get("recovered_count", 0) or 0),
@@ -1748,6 +1787,7 @@ class LiveMonitorFrame(ctk.CTkFrame):
             return
         self._last_rendered_graph_state = state_sig
         self._probe_artists.clear()
+        self._twin_axes.clear()
         self._active_probe_ax = None
         self._blit_bg = None
         self._last_hover_sig = None
@@ -1794,10 +1834,11 @@ class LiveMonitorFrame(ctk.CTkFrame):
 
         for ax, p_name in zip(self.axes, self.plot_names):
             had_lines_before = bool(ax.lines or ax.patches or ax.images)
-            if had_lines_before and not self.v_autoscale.get():
+            lim_key = f"{p_name}||{self.window_mode}"
+            if had_lines_before and not self.v_autoscale.get() and "Heatmap" not in p_name:
                 xl, yl = ax.get_xlim(), ax.get_ylim()
                 if xl != (0.0, 1.0) or yl != (0.0, 1.0):
-                    self._saved_axis_limits[p_name] = (xl, yl)
+                    self._saved_axis_limits[lim_key] = (xl, yl)
             ax.clear()
             ax.set_facecolor("#1A1A1A")
             ax.grid(True, linestyle="--", alpha=0.3, color=grid_col)
@@ -1891,16 +1932,24 @@ class LiveMonitorFrame(ctk.CTkFrame):
                 ax.set_xlabel("Rotor Azimuth θ (deg)", color=text_col, fontsize=8, labelpad=2)
 
             elif "05. Ct & Cy" in p_name:
-                if ts and ts.get("ct") is not None and len(t_arr) > 0:
+                has_ct = bool(ts and ts.get("ct") is not None)
+                has_cy = bool(ts and ts.get("cy") is not None)
+                if ts and (has_ct or has_cy) and len(t_arr) > 0:
                     t_plot = np.asarray(ts["t"])[mask] if mask is not None else ts["t"]
-                    ct_plot = np.asarray(ts["ct"])[mask] if mask is not None else ts["ct"]
-                    if len(t_plot) > 0 and len(ct_plot) > 0:
-                        ax.plot(t_plot, ct_plot, color="#6366F1", lw=1.2, label="Ct (Thrust)")
-                        if ts.get("cy") is not None:
-                            cy_plot = np.asarray(ts["cy"])[mask] if mask is not None else ts["cy"]
-                            if len(cy_plot) > 0:
-                                ax.plot(t_plot, cy_plot, color="#EC4899", lw=1.2, label="Cy (Side)")
-                        self._overlay_continuity_cues(ax, ts, t_plot, mask=mask, y_plot=ct_plot)
+                    y_cue = None
+                    if has_ct:
+                        ct_plot = np.asarray(ts["ct"])[mask] if mask is not None else ts["ct"]
+                        if len(t_plot) > 0 and len(ct_plot) > 0:
+                            ax.plot(t_plot, ct_plot, color="#6366F1", lw=1.2, label="Ct (Thrust)")
+                            y_cue = ct_plot
+                    if has_cy:
+                        cy_plot = np.asarray(ts["cy"])[mask] if mask is not None else ts["cy"]
+                        if len(t_plot) > 0 and len(cy_plot) > 0:
+                            ax.plot(t_plot, cy_plot, color="#EC4899", lw=1.2, label="Cy (Side)")
+                            if y_cue is None:
+                                y_cue = cy_plot
+                    if y_cue is not None and len(t_plot) > 0:
+                        self._overlay_continuity_cues(ax, ts, t_plot, mask=mask, y_plot=y_cue)
                         ax.legend(fontsize=7, loc="upper right")
                         ax.set_title("05. Aerodynamic Force History", color=text_col, fontsize=title_fs, weight="bold", pad=4)
                     else:
@@ -2003,6 +2052,7 @@ class LiveMonitorFrame(ctk.CTkFrame):
                     handles = list(l1) + [l2]
                     if "w_over_u" in kin and len(kin["w_over_u"]) == len(kin["theta"]):
                         ax2 = ax.twinx()
+                        self._twin_axes[ax2] = ax
                         l3 = ax2.plot(kin["theta"], kin["w_over_u"], color="#F59E0B", lw=1.1, linestyle="-.", label="W/U ratio")
                         ax2.set_ylabel("W / U", color="#F59E0B", fontsize=8, labelpad=4)
                         ax2.tick_params(axis="y", colors="#F59E0B", labelsize=7.5)
@@ -2020,8 +2070,8 @@ class LiveMonitorFrame(ctk.CTkFrame):
                 ax.set_xlabel("Azimuth θ (deg)", color=text_col, fontsize=8, labelpad=2)
 
             is_azimuth_plot = any(k in p_name for k in ["Azimuth", "Blade Torque", "Heatmap", "Kinematics"])
-            if not self.v_autoscale.get() and p_name in self._saved_axis_limits:
-                saved_xl, saved_yl = self._saved_axis_limits[p_name]
+            if not self.v_autoscale.get() and "Heatmap" not in p_name and lim_key in self._saved_axis_limits:
+                saved_xl, saved_yl = self._saved_axis_limits[lim_key]
                 ax.set_xlim(saved_xl)
                 ax.set_ylim(saved_yl)
             else:
@@ -2156,13 +2206,14 @@ class LiveMonitorFrame(ctk.CTkFrame):
 
     def _probe_axis_data(self, ax: matplotlib.axes.Axes, x_mouse: float, y_mouse: float) -> Optional[Dict[str, Any]]:
         """Extract nearest data coordinate, compact tooltip, and detailed right-panel probe report."""
+        primary_ax = self._twin_axes.get(ax, ax)
         p_name = ""
-        if hasattr(self, "axes") and hasattr(self, "plot_names") and ax in self.axes:
-            idx = self.axes.index(ax)
+        if hasattr(self, "axes") and hasattr(self, "plot_names") and primary_ax in self.axes:
+            idx = self.axes.index(primary_ax)
             if idx < len(self.plot_names):
                 p_name = self.plot_names[idx]
         if not p_name:
-            p_name = ax.get_title() or "Graph"
+            p_name = primary_ax.get_title() or "Graph"
 
         # 1. Heatmap (2D AxesImage)
         if ax.images:
@@ -2248,23 +2299,25 @@ class LiveMonitorFrame(ctk.CTkFrame):
                     "tooltip": tooltip,
                 }
 
-        # 3. Line Curves (single or multi-curve)
-        probe_arts = self._probe_artists.get(ax, {})
-        excluded = {probe_arts.get("vline"), probe_arts.get("hline"), probe_arts.get("dot")}
+        # 3. Line Curves (single or multi-curve, including paired twinx axes)
+        search_axes = [primary_ax] + [twin for twin, p_ax in self._twin_axes.items() if p_ax is primary_ax]
         data_lines = []
-        for ln in ax.lines:
-            if ln in excluded or not ln.get_visible():
-                continue
-            xd = np.asarray(ln.get_xdata(), dtype=float)
-            yd = np.asarray(ln.get_ydata(), dtype=float)
-            if xd.size < 2 or yd.size < 2 or xd.size != yd.size:
-                continue
-            lbl = str(ln.get_label() or "")
-            if lbl.startswith("_") and len(ax.lines) > 1:
-                continue
-            if "tol" in lbl.lower() or "stall" in lbl.lower() or "bpf" in lbl.lower():
-                continue
-            data_lines.append((ln, xd, yd, lbl))
+        for s_ax in search_axes:
+            p_arts = self._probe_artists.get(s_ax, {})
+            excl = {p_arts.get("vline"), p_arts.get("hline"), p_arts.get("dot")}
+            for ln in s_ax.lines:
+                if ln in excl or not ln.get_visible():
+                    continue
+                xd = np.asarray(ln.get_xdata(), dtype=float)
+                yd = np.asarray(ln.get_ydata(), dtype=float)
+                if xd.size < 1 or yd.size < 1 or xd.size != yd.size:
+                    continue
+                lbl = str(ln.get_label() or "")
+                if lbl.startswith("_") and len(s_ax.lines) > 1:
+                    continue
+                if "tol" in lbl.lower() or "stall" in lbl.lower() or "bpf" in lbl.lower():
+                    continue
+                data_lines.append((s_ax, ln, xd, yd, lbl))
 
         if not data_lines:
             return None
@@ -2272,6 +2325,8 @@ class LiveMonitorFrame(ctk.CTkFrame):
         # Find nearest x index on primary curve (O(log N) when sorted ascending)
         def _nearest_x_idx(arr: np.ndarray, val: float) -> int:
             n_pts = len(arr)
+            if n_pts <= 1:
+                return 0
             if n_pts > 256 and bool(arr[0] <= arr[-1] and np.all(arr[:-1] <= arr[1:])):
                 pos = int(np.searchsorted(arr, val))
                 if pos <= 0:
@@ -2281,13 +2336,13 @@ class LiveMonitorFrame(ctk.CTkFrame):
                 return pos - 1 if abs(val - arr[pos - 1]) <= abs(arr[pos] - val) else pos
             return int(np.argmin(np.abs(arr - val)))
 
-        primary_ln, px, py, p_lbl = data_lines[0]
+        _, primary_ln, px, py, p_lbl = data_lines[0]
         idx_near = _nearest_x_idx(px, x_mouse)
         x_snap = float(px[idx_near])
 
-        # Determine x label formatting based on plot type
-        xlab = ax.get_xlabel() or "x"
-        ylab = ax.get_ylabel() or "y"
+        # Determine x label formatting based on plot type (always read primary axis labels!)
+        xlab = primary_ax.get_xlabel() or "x"
+        ylab = primary_ax.get_ylabel() or "y"
         rows = []
         detail_lines = []
         if "Azimuth" in xlab or "θ" in xlab:
@@ -2307,22 +2362,23 @@ class LiveMonitorFrame(ctk.CTkFrame):
             coord_hdr = f"Flow Time t = {x_snap:.4f} s"
             rows.append(("Flow Time t", f"{x_snap:.4f} s", "#38BDF8"))
 
-        # Pick closest curve in y at x_snap for the highlight dot
+        # Pick closest primary-axis curve in y at x_snap for the highlight dot
         best_x = x_snap
         best_y = float(py[idx_near])
-        best_dy = abs(best_y - y_mouse)
+        best_dy = float("inf")
         val_lines = []
 
-        for ln, xd, yd, lbl in data_lines:
+        for s_ax, ln, xd, yd, lbl in data_lines:
             i_c = _nearest_x_idx(xd, x_mouse)
             xc = float(xd[i_c])
             yc = float(yd[i_c])
-            dy = abs(yc - y_mouse)
-            if dy <= best_dy:
-                best_dy = dy
-                best_x = xc
-                best_y = yc
-            clean_lbl = lbl if (lbl and not lbl.startswith("_")) else ylab
+            if s_ax is primary_ax:
+                dy = abs(yc - y_mouse)
+                if dy <= best_dy:
+                    best_dy = dy
+                    best_x = xc
+                    best_y = yc
+            clean_lbl = lbl if (lbl and not lbl.startswith("_")) else (s_ax.get_ylabel() or ylab)
             if "ΔCp" in clean_lbl or "%" in ylab:
                 v_str = f"{yc:+.2f}%"
             elif abs(yc) >= 100.0 or (0.0 < abs(yc) < 1e-3):
@@ -2373,16 +2429,26 @@ class LiveMonitorFrame(ctk.CTkFrame):
                 self._hide_all_probes(redraw=True)
             return
 
-        ax = event.inaxes
+        raw_inaxes = event.inaxes
+        ax = self._twin_axes.get(raw_inaxes, raw_inaxes)
         if event.xdata is None or event.ydata is None:
             return
+        x_mouse = float(event.xdata)
+        if raw_inaxes is not ax and event.x is not None and event.y is not None:
+            try:
+                _, y_mouse_tr = ax.transData.inverted().transform((event.x, event.y))
+                y_mouse = float(y_mouse_tr)
+            except Exception:
+                y_mouse = float(event.ydata)
+        else:
+            y_mouse = float(event.ydata)
 
         now = time.monotonic()
         if self._active_probe_ax is ax and (now - self._last_hover_ts < 0.016):
             return
         self._last_hover_ts = now
 
-        info = self._probe_axis_data(ax, float(event.xdata), float(event.ydata))
+        info = self._probe_axis_data(ax, x_mouse, y_mouse)
         if info is None:
             if self._active_probe_ax is not None:
                 self._hide_all_probes(redraw=True)
@@ -2442,7 +2508,7 @@ class LiveMonitorFrame(ctk.CTkFrame):
                 except queue.Empty:
                     break
 
-            if latest_snap is not None:
+            if latest_snap is not None and self.is_monitoring:
                 self.latest_snapshot = latest_snap
                 self._update_telemetry(latest_snap)
                 if any_full:
@@ -2612,6 +2678,8 @@ class LiveMonitorFrame(ctk.CTkFrame):
             self.lbl_stages_content.configure(text=stages_text)
             if hasattr(self, "dt_tooltip") and self.dt_tooltip:
                 self.dt_tooltip.text = stages_text
+            if hasattr(self.lbl_dt, "setToolTip"):
+                self.lbl_dt.setToolTip(stages_text)
 
             # 3. Derived Physics Card
             st_sfx = f" (Stage {curr_stage['stage_index']}/{n_stages})" if n_stages > 1 else ""
@@ -2632,20 +2700,35 @@ class LiveMonitorFrame(ctk.CTkFrame):
             dt_s = snap.dt_seconds
             dt_fmt = f"{dt_s:.3e} s" if (dt_s < 1e-3 or dt_s >= 10) else f"{dt_s:.5f} s"
             self.lbl_dt.configure(text=f"Δt: {dt_fmt}")
+            self.lbl_stages_badge.configure(text="Uniform Δt", text_color="#10B981")
             dtheta = (omega_val * dt_s * 180.0 / math.pi) if omega_val > 0 else 0.0
             steps_rev = round(Trev / dt_s) if (Trev > 0 and dt_s > 0) else 0
+            if hasattr(self, "lbl_current_phase"):
+                self.lbl_current_phase.configure(text=f"P1: {dtheta:.1f}°", text_color="#38BDF8")
             self.lbl_derived_echo.configure(
                 text=f"ω: {omega_val:.2f} rad/s ({rpm_val:.1f} rpm)\nT_rev: {Trev:.4f} s\nΔt: {dt_fmt}\nDeg/step: {dtheta:.2f}° | Steps/rev: {steps_rev:,}"
             )
-            self.lbl_stages_content.configure(
-                text=f"Current: Δt = {dt_fmt}\nResolution: {dtheta:.2f}°/step ({steps_rev:,} steps/rev)"
-            )
+            st_single_txt = f"Current: Δt = {dt_fmt}\nResolution: {dtheta:.2f}°/step ({steps_rev:,} steps/rev)"
+            self.lbl_stages_content.configure(text=st_single_txt)
+            if hasattr(self, "dt_tooltip") and self.dt_tooltip:
+                self.dt_tooltip.text = st_single_txt
+            if hasattr(self.lbl_dt, "setToolTip"):
+                self.lbl_dt.setToolTip(st_single_txt)
             if snap.parameter_checks and hasattr(self, "lbl_checks_echo"):
                 self.lbl_checks_echo.configure(
                     text=self._format_checks_summary(snap.parameter_checks, dt_fmt)
                 )
         else:
             self.lbl_dt.configure(text="Δt: -")
+            self.lbl_stages_badge.configure(text="Uniform Δt", text_color="gray")
+            if hasattr(self, "lbl_current_phase"):
+                self.lbl_current_phase.configure(text="P1: -", text_color="gray")
+            if hasattr(self.lbl_dt, "setToolTip"):
+                self.lbl_dt.setToolTip("Time Step Size (Δt)")
+            if snap.parameter_checks and hasattr(self, "lbl_checks_echo"):
+                self.lbl_checks_echo.configure(
+                    text=self._format_checks_summary(snap.parameter_checks, "auto")
+                )
 
         # Update KPI chips
         kpi = snap.kpi
@@ -2888,7 +2971,6 @@ class LiveMonitorFrame(ctk.CTkFrame):
         """Interactive detection triggered by 'Detect' button in the left panel."""
         folder = self.custom_watch_folder
         if not folder or not os.path.isdir(folder):
-            from tkinter import filedialog
             chosen = filedialog.askdirectory(title="Select Simulation Folder to Detect From")
             if chosen and os.path.isdir(chosen):
                 from vawt_post.engine.parser import resolve_fluent_directory
@@ -3113,19 +3195,48 @@ class LiveMonitorFrame(ctk.CTkFrame):
         if hasattr(self, "lbl_files_badge"):
             self.lbl_files_badge.configure(text="0 files", text_color="gray")
         self._cleared_alert_count = 0
+        self._cleared_alert_seq = 0
         self._last_alerts_signature = None
         self._recommended_theta0 = None
         self._rendered_alerts_count = 0
         self._last_rendered_graph_state = None
         self._refresh_pending = False
+        self.latest_snapshot = None
+        if hasattr(self, "_probe_ui_cache"):
+            self._probe_ui_cache.clear()
         if hasattr(self, "_saved_axis_limits"):
             self._saved_axis_limits.clear()
         if hasattr(self, "midspin_banner") and self.midspin_banner.winfo_manager():
             self.midspin_banner.pack_forget()
         if hasattr(self, "lbl_alerts_badge"):
             self.lbl_alerts_badge.configure(text="0", fg_color=("gray82", "#252B34"), text_color=("#64748B", "#9CA3AF"))
+        if hasattr(self, "lbl_step"):
+            self.lbl_step.configure(text="Step: -")
+            self.lbl_time.configure(text="Time: -")
+            self.lbl_revs.configure(text="Revs: 0.00")
+            self.lbl_azimuth.configure(text="θ: -")
+            self.lbl_speed.configure(text="Speed: - steps/s")
+            self.lbl_eta.configure(text="ETA: -")
+            self.lbl_fresh.configure(text="Freshness: -")
+            self.lbl_dt.configure(text="Δt: -")
+        if hasattr(self, "lbl_stages_badge"):
+            self.lbl_stages_badge.configure(text="Uniform Δt", text_color="gray")
+        if hasattr(self, "lbl_current_phase"):
+            self.lbl_current_phase.configure(text="P1: -", text_color="gray")
+        if hasattr(self, "lbl_dt") and hasattr(self.lbl_dt, "setToolTip"):
+            self.lbl_dt.setToolTip("Time Step Size (Δt)")
+        if hasattr(self, "kpi_cp"):
+            self.kpi_cp.configure(text="-")
+            self.kpi_dcp.configure(text="-")
+            self.kpi_stable.configure(text="0 revs")
+            self.kpi_peak.configure(text="-")
+            self.kpi_ct.configure(text="-")
+            self.kpi_ripple.configure(text="-")
+            self.kpi_verdict.configure(text="STATUS: WAITING", text_color="gray")
         self._render_empty_alerts_placeholder()
         self._hide_all_probes(redraw=False)
+        if hasattr(self, "fig") and hasattr(self, "_rebuild_plot_axes"):
+            self._rebuild_plot_axes()
 
     def _toggle_monitoring(self):
         if not self.is_monitoring:
@@ -3196,14 +3307,15 @@ class LiveMonitorFrame(ctk.CTkFrame):
                 f"Live monitoring started ({len(assigned_files)} file(s), Δt={dt_txt}, θ₀={getattr(p, 'theta0', 0.0) or 0.0:g}°).",
                 key="monitor_started",
             )
+            self.is_monitoring = True
+            self.is_paused = False
+            self.time_until_refresh = self.refresh_interval_s
             self.worker.start()
         except Exception as exc:
+            self.is_monitoring = False
+            self.worker = None
             messagebox.showerror("Live Monitor Error", f"Failed to start live monitor worker:\n{exc}")
             return
-
-        self.is_monitoring = True
-        self.is_paused = False
-        self.time_until_refresh = self.refresh_interval_s
 
         self.btn_toggle.configure(text="⏹ Stop Monitoring", fg_color=("#DC2626", "#B91C1C"), hover_color=("#B91C1C", "#991B1B"))
         self.btn_refresh_now.configure(state="normal")
@@ -3213,22 +3325,25 @@ class LiveMonitorFrame(ctk.CTkFrame):
         self.state_badge.configure(text="● Monitoring", text_color="#10B981")
 
     def _stop_monitoring(self):
+        self.is_monitoring = False
+        self.is_paused = False
+        self._refresh_pending = False
+
         if self.worker:
             self.worker.stop()
             self.worker = None
 
+        # Swap snapshot_queue so any in-flight late push from a terminating worker cannot bleed into future sessions
         while not self.snapshot_queue.empty():
             try:
                 self.snapshot_queue.get_nowait()
             except Exception:
                 break
+        self.snapshot_queue = queue.Queue()
 
-        self.is_monitoring = False
-        self.is_paused = False
-        self._refresh_pending = False
         self.btn_toggle.configure(text="▶ Start Monitoring", fg_color=("#16A34A", "#15803D"), hover_color=("#15803D", "#166534"))
         self.btn_refresh_now.configure(state="disabled")
-        self.btn_pause.configure(state="disabled")
+        self.btn_pause.configure(state="disabled", text="⏸ Pause")
         self.btn_snapshot.configure(state="disabled")
         self.btn_finalize.configure(state="disabled")
         self.state_badge.configure(text="⏹ Stopped", text_color="gray")
@@ -3292,10 +3407,10 @@ class LiveMonitorFrame(ctk.CTkFrame):
                 f"Auto-attached to Fluent run in '{os.path.basename(self.custom_watch_folder or '')}' (θ₀={getattr(p, 'theta0', 0.0) or 0.0:g}°).",
                 key="monitor_started",
             )
-            self.worker.start()
             self.is_monitoring = True
             self.is_paused = False
             self.time_until_refresh = self.refresh_interval_s
+            self.worker.start()
 
             self.btn_toggle.configure(text="⏹ Stop Monitoring", fg_color=("#DC2626", "#B91C1C"), hover_color=("#B91C1C", "#991B1B"))
             self.btn_refresh_now.configure(state="normal")
@@ -3307,8 +3422,11 @@ class LiveMonitorFrame(ctk.CTkFrame):
             if self.app and hasattr(self.app, "tab_btn_live"):
                 self.app.tab_btn_live.configure(text="📡 Live Monitor  ●", text_color="#10B981")
 
-            if auto_switch_tab and self.app and hasattr(self.app, "select_page"):
-                self.app.select_page("live")
+            if auto_switch_tab and self.app:
+                if hasattr(self.app, "_switch_page"):
+                    self.app._switch_page("live")
+                elif hasattr(self.app, "select_page"):
+                    self.app.select_page("live")
         except Exception as e:
             print(f"[LiveMonitor] Auto-monitor start notice: {e}")
 
@@ -3598,29 +3716,72 @@ class LiveMonitorFrame(ctk.CTkFrame):
             return os.path.join(base, "live_post_output")
         return os.path.expanduser("~/VAWT_live_results")
 
+    def _on_autoscale_toggle(self):
+        """Persist Autoscale toggle and immediately redraw axes."""
+        self._save_settings()
+        if self.latest_snapshot:
+            self._render_graphs(self.latest_snapshot, force=True)
+
     def _take_snapshot(self):
         if not self.worker:
             return
+        w_ref = self.worker
         out_dir = self._get_live_output_dir()
-        try:
-            p = self.worker.save_snapshot(out_dir, prefix="interim_live_snapshot")
-            self.worker.add_alert("SUCCESS", f"Interim snapshot saved: {os.path.basename(p)}", key="snapshot_saved")
-            messagebox.showinfo("Snapshot Saved", f"Interim workbook & figures saved:\n{p}")
-        except Exception as e:
-            messagebox.showerror("Snapshot Error", f"Could not create snapshot: {e}")
+        self.btn_snapshot.configure(state="disabled")
+
+        def _bg():
+            try:
+                p = w_ref.save_snapshot(out_dir, prefix="interim_live_snapshot")
+                w_ref.add_alert("SUCCESS", f"Interim snapshot saved: {os.path.basename(p)}")
+                def _done():
+                    if not getattr(self, "_is_closing", False):
+                        if self.is_monitoring:
+                            self.btn_snapshot.configure(state="normal")
+                        messagebox.showinfo("Snapshot Saved", f"Interim workbook & figures saved:\n{p}")
+                self.after(0, _done)
+            except Exception as e:
+                err_msg = str(e)
+                def _err():
+                    if not getattr(self, "_is_closing", False):
+                        if self.is_monitoring:
+                            self.btn_snapshot.configure(state="normal")
+                        messagebox.showerror("Snapshot Error", f"Could not create snapshot: {err_msg}")
+                self.after(0, _err)
+
+        threading.Thread(target=_bg, daemon=True, name="LiveSnapshotWorker").start()
 
     def _finalize_run(self):
         if not self.worker:
             return
+        w_ref = self.worker
         out_dir = self._get_live_output_dir()
-        try:
-            res = self.worker.finalize(out_dir)
-            self.worker.add_alert("SUCCESS", f"Finalized offline pipeline in '{os.path.basename(out_dir)}'.", key="finalize_done")
-            if self.app and hasattr(self.app, "results_frame"):
-                self.app.results_frame.set_results(res)
-            messagebox.showinfo("Finalize Run", f"Offline analysis pipeline completed on accumulated live data!\nSaved to: {out_dir}")
-        except Exception as e:
-            messagebox.showerror("Finalize Error", f"Could not finalize run: {e}")
+        self.btn_finalize.configure(state="disabled")
+
+        def _bg():
+            try:
+                res = w_ref.finalize(out_dir)
+                w_ref.add_alert("SUCCESS", f"Finalized offline pipeline in '{os.path.basename(out_dir)}'.")
+                def _done():
+                    if not getattr(self, "_is_closing", False):
+                        if self.is_monitoring:
+                            self.btn_finalize.configure(state="normal")
+                        if self.app and hasattr(self.app, "results_frame"):
+                            self.app.results_frame.set_results(res)
+                        messagebox.showinfo(
+                            "Finalize Run",
+                            f"Offline analysis pipeline completed on accumulated live data!\nSaved to: {out_dir}",
+                        )
+                self.after(0, _done)
+            except Exception as e:
+                err_msg = str(e)
+                def _err():
+                    if not getattr(self, "_is_closing", False):
+                        if self.is_monitoring:
+                            self.btn_finalize.configure(state="normal")
+                        messagebox.showerror("Finalize Error", f"Could not finalize run: {err_msg}")
+                self.after(0, _err)
+
+        threading.Thread(target=_bg, daemon=True, name="LiveFinalizeWorker").start()
 
     # -------------------------------------------------------------------------
     # Panel Collapse Toggles
