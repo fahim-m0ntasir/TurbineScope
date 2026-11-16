@@ -1,0 +1,62 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "turbinescope"
+version = "4.1.1"
+description = "Cross-platform PySide6 post-processor, live monitor, and ASME V&V 20 Workbench studio for ANSYS Fluent vertical-axis wind turbine (VAWT) CFD simulations."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+authors = [
+    { name = "Fahim Montasir" }
+]
+keywords = ["CFD", "ANSYS Fluent", "VAWT", "wind turbine", "post-processing", "PySide6", "GCI"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Physics",
+]
+dependencies = [
+    "numpy>=1.24.0",
+    "matplotlib>=3.7.0",
+    "openpyxl>=3.1.0",
+    "pillow>=10.0.0",
+    "h5py>=3.8.0",
+    "pandas>=2.0.0",
+    "seaborn>=0.12.0",
+    "PySide6>=6.6.0",
+    "scipy>=1.10.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pyflakes>=3.2.0",
+    "pyright>=1.1.380",
+    "pyinstaller>=6.0.0",
+]
+
+[project.scripts]
+turbinescope = "vawt_post.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["vawt_post*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.pyright]
+include = ["vawt_post"]
+pythonVersion = "3.13"
+typeCheckingMode = "basic"

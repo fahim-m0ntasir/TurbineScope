@@ -1,0 +1,69 @@
+# Python bytecode & caches
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Testing & type-checking caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# PyInstaller build outputs (distribute via GitHub Releases, not git)
+build/
+dist/
+*.exe
+*.spec.bak
+
+# Runtime & user session files
+turbinescope_config.json
+vawt_config.json
+live_monitor_settings.json
+*.log
+
+# Large simulation data & generated analysis artifacts
+VAWT_results/
+live_post_output/
+results/
+sample_output/
+*.cas
+*.cas.h5
+*.dat
+*.dat.h5
+*.msh
+*.msh.h5
+*.mshdb
+*.agdb
+*.scdoc
+*.ip
+*.wbpj
+*.wbpz
+*_files/
+*.xlsx
+!tests/data/**
+
+# Ignore monitor dumps outside tracked test fixtures
+*.out
+!tests/data/**/*.out
+
+# OS & IDE metadata
+.DS_Store
+Thumbs.db
+desktop.ini
+Desktop.ini
+.vscode/
+.idea/
+*.swp
+*.swo

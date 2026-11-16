@@ -1,0 +1,26 @@
+# ==============================================================================
+# TurbineScope v4.1.1 (VAWT CFD Post-Processor & Studio) - Python Dependencies
+# ==============================================================================
+# Install all dependencies with:
+#     pip install -r requirements.txt
+# ==============================================================================
+
+# Core Numerical & Aerodynamic Engine
+numpy>=1.24.0
+matplotlib>=3.7.0
+openpyxl>=3.1.0
+pillow>=10.0.0
+h5py>=3.8.0
+pandas>=2.0.0
+seaborn>=0.12.0
+
+# Desktop Modern GUI & Hardware-Accelerated Qt 6 Engine
+PySide6>=6.6.0
+
+# Optional Scientific Smoothing & Windows Clipboard Integration
+scipy>=1.10.0
+pywin32>=306; sys_platform == 'win32'
+
+# Testing, Verification & Standalone Binary Packaging
+pytest>=8.0.0
+pyinstaller>=6.0.0
