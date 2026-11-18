@@ -1102,7 +1102,21 @@ class QtWidgetBase:
             return "normal" if self.isEnabled() else "disabled"
         return self._props.get(key, "")
 
+    _QSS_STYLE_KEYS = frozenset((
+        "fg_color", "hover_color", "text_color", "border_color",
+        "border_width", "corner_radius", "width", "height",
+    ))
+    _LAYOUT_AFFECTING_KEYS = frozenset((
+        "text", "textvariable", "wraplength", "width", "height",
+        "font", "image", "anchor", "justify", "values", "from_",
+        "to", "number_of_steps", "show", "placeholder_text",
+        "orientation", "border_width", "padx", "pady",
+    ))
+
     def configure(self, **kwargs: Any) -> None:
+        if not kwargs:
+            return
+        old_text = self.text() if isinstance(self, (QLabel, QPushButton)) else None
         self._props.update(kwargs)
         if "width" in kwargs and kwargs["width"] is not None:
             self._req_width = int(kwargs["width"])
@@ -1115,11 +1129,18 @@ class QtWidgetBase:
             self.setEnabled(st != "disabled")
         if hasattr(self, "_apply_props"):
             getattr(self, "_apply_props")(kwargs)
-        lay = self._parent_dual_layout()
-        if lay is not None:
-            lay.invalidate()
-        if any(k in kwargs for k in ("text", "textvariable", "wraplength", "width", "height", "font", "image")):
-            self._notify_ancestor_scrollbars()
+        # Skip layout invalidation when only styling props (e.g. text_color) or unchanged text arrived
+        non_text_layout = any(k in self._LAYOUT_AFFECTING_KEYS and k != "text" for k in kwargs)
+        text_changed = (
+            "text" in kwargs
+            and (old_text is None or not isinstance(self, (QLabel, QPushButton)) or self.text() != old_text)
+        )
+        if non_text_layout or text_changed:
+            lay = self._parent_dual_layout()
+            if lay is not None:
+                lay.invalidate()
+            if text_changed or any(k in kwargs for k in ("textvariable", "wraplength", "width", "height", "font", "image")):
+                self._notify_ancestor_scrollbars()
 
     config = configure
 
@@ -1218,6 +1239,11 @@ class QtWidgetBase:
                 func(*args)
             except Exception:
                 pass
+            finally:
+                try:
+                    timer.deleteLater()
+                except Exception:
+                    pass
 
         timer.timeout.connect(_fire)
         self._after_timers[tid] = timer
@@ -1575,7 +1601,9 @@ class CTkLabel(QLabel, QtWidgetBase):
 
     def _apply_props(self, kwargs: Dict[str, Any]) -> None:
         if "text" in kwargs and self._textvar is None:
-            self.setText(_force_text_icons(str(kwargs["text"])))
+            new_t = _force_text_icons(str(kwargs["text"]))
+            if new_t != self.text():
+                self.setText(new_t)
         if "textvariable" in kwargs and kwargs["textvariable"] is not None:
             tvar = kwargs["textvariable"]
             self._textvar = tvar
@@ -1607,7 +1635,8 @@ class CTkLabel(QLabel, QtWidgetBase):
         if "image" in kwargs:
             self._ctk_image = kwargs["image"]
             self._update_image_pixmap()
-        self._apply_qss()
+        if any(k in kwargs for k in self._QSS_STYLE_KEYS):
+            self._apply_qss()
 
     def _update_image_pixmap(self) -> None:
         img = self._ctk_image
@@ -1673,7 +1702,9 @@ class CTkButton(QPushButton, QtWidgetBase):
 
     def _apply_props(self, kwargs: Dict[str, Any]) -> None:
         if "text" in kwargs:
-            self.setText(_force_text_icons(_escape_qt_ampersand(str(kwargs["text"]))))
+            new_t = _force_text_icons(_escape_qt_ampersand(str(kwargs["text"])))
+            if new_t != self.text():
+                self.setText(new_t)
         if "command" in kwargs:
             self._command = kwargs["command"]
         if "state" in kwargs:
@@ -1681,7 +1712,8 @@ class CTkButton(QPushButton, QtWidgetBase):
             self.setCursor(Qt.CursorShape.PointingHandCursor if enabled else Qt.CursorShape.ArrowCursor)
         if self._props.get("fg_color") == "transparent" and "text_color" not in self._props:
             self._props["text_color"] = ("#111827", "#DCE4EE")
-        self._apply_qss()
+        if any(k in kwargs for k in self._QSS_STYLE_KEYS):
+            self._apply_qss()
 
     def _on_clicked(self) -> None:
         if self._command is not None:

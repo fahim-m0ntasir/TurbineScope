@@ -14,15 +14,17 @@ running. Features:
 """
 from __future__ import annotations
 
+import array
 import copy
 import datetime as _dt
+from functools import reduce
 import math
 import os
 import queue
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, List, Optional, Tuple, Any, Sequence
 
 import numpy as np
 
@@ -98,12 +100,55 @@ class IncrementalFileReader:
         self._header_from_fallback: bool = False
         self._header_bytes: bytes = b""
 
-        # Accumulating raw parsed records
-        self.raw_steps: List[int] = []
-        self.raw_times: List[float] = []
-        self.raw_vals: List[float] = []
+        # Compact C-backed buffers (4x lower RAM than boxed Python lists, fast zero-copy NumPy export)
+        self._steps_buf: array.array = array.array("q")
+        self._times_buf: array.array = array.array("d")
+        self._vals_buf: array.array = array.array("d")
 
         self._inspect_file_header()
+
+    @property
+    def raw_steps(self) -> List[int]:
+        return list(self._steps_buf)
+
+    @raw_steps.setter
+    def raw_steps(self, values: Sequence[int]) -> None:
+        self._steps_buf = array.array("q", (int(v) for v in values))
+
+    @property
+    def raw_times(self) -> List[float]:
+        return list(self._times_buf)
+
+    @raw_times.setter
+    def raw_times(self, values: Sequence[float]) -> None:
+        self._times_buf = array.array("d", (float(v) for v in values))
+
+    @property
+    def raw_vals(self) -> List[float]:
+        return list(self._vals_buf)
+
+    @raw_vals.setter
+    def raw_vals(self, values: Sequence[float]) -> None:
+        self._vals_buf = array.array("d", (float(v) for v in values))
+
+    @property
+    def n_rows(self) -> int:
+        return len(self._steps_buf)
+
+    def steps_np(self) -> np.ndarray:
+        if not self._steps_buf:
+            return np.empty(0, dtype=np.int64)
+        return np.frombuffer(self._steps_buf, dtype=np.int64).copy()
+
+    def times_np(self) -> np.ndarray:
+        if not self._times_buf:
+            return np.empty(0, dtype=np.float64)
+        return np.frombuffer(self._times_buf, dtype=np.float64).copy()
+
+    def vals_np(self) -> np.ndarray:
+        if not self._vals_buf:
+            return np.empty(0, dtype=np.float64)
+        return np.frombuffer(self._vals_buf, dtype=np.float64).copy()
 
     def _inspect_file_header(self) -> None:
         """Inspect file header using inspect_fluent_report to properly map column indices."""
@@ -142,9 +187,9 @@ class IncrementalFileReader:
         """Reset state on file truncation or restart."""
         self.byte_offset = 0
         self.buffer = ""
-        self.raw_steps.clear()
-        self.raw_times.clear()
-        self.raw_vals.clear()
+        self._steps_buf = array.array("q")
+        self._times_buf = array.array("d")
+        self._vals_buf = array.array("d")
         self.error_msg = None
         self.is_valid = True
         self._header_from_fallback = False
@@ -185,9 +230,9 @@ class IncrementalFileReader:
             if prev_fb and not self._header_from_fallback and self.byte_offset > 0:
                 self.byte_offset = 0
                 self.buffer = ""
-                self.raw_steps.clear()
-                self.raw_times.clear()
-                self.raw_vals.clear()
+                self._steps_buf = array.array("q")
+                self._times_buf = array.array("d")
+                self._vals_buf = array.array("d")
 
         # Check for overwritten file with changed header and read newly appended bytes in a single open()
         new_bytes = b""
@@ -275,12 +320,12 @@ class IncrementalFileReader:
             time_num = nums[self.time_col] if (self.time_col is not None and self.time_col < len(nums)) else None
 
             # Detect step backward jump (appended restart without truncation)
-            prev_step = new_steps[-1] if new_steps else (self.raw_steps[-1] if self.raw_steps else None)
+            prev_step = new_steps[-1] if new_steps else (self._steps_buf[-1] if self._steps_buf else None)
             if prev_step is not None and step_idx < prev_step:
                 self.restart_detected = True
-                self.raw_steps.clear()
-                self.raw_times.clear()
-                self.raw_vals.clear()
+                self._steps_buf = array.array("q")
+                self._times_buf = array.array("d")
+                self._vals_buf = array.array("d")
                 new_steps.clear()
                 new_times.clear()
                 new_vals.clear()
@@ -293,10 +338,10 @@ class IncrementalFileReader:
                 if time_num is not None:
                     new_times[-1] = time_num
                 continue
-            elif not new_steps and self.raw_steps and step_idx == self.raw_steps[-1]:
-                self.raw_vals[-1] = val_num
+            elif not new_steps and self._steps_buf and step_idx == self._steps_buf[-1]:
+                self._vals_buf[-1] = val_num
                 if time_num is not None:
-                    self.raw_times[-1] = time_num
+                    self._times_buf[-1] = time_num
                 continue
 
             new_steps.append(step_idx)
@@ -304,9 +349,9 @@ class IncrementalFileReader:
             new_times.append(time_num if time_num is not None else float(step_idx))
 
         if new_steps:
-            self.raw_steps.extend(new_steps)
-            self.raw_vals.extend(new_vals)
-            self.raw_times.extend(new_times)
+            self._steps_buf.extend(new_steps)
+            self._vals_buf.extend(new_vals)
+            self._times_buf.extend(new_times)
 
         return len(new_steps), new_steps, new_times, new_vals
 
@@ -384,6 +429,10 @@ class LiveMonitorEngine:
         self._live_base_time: Optional[float] = None
         self._force_reprocess: bool = False
         self._just_received_data: bool = False
+        self._stages_cache_key: Any = None
+        self._stages_cache_val: List[Dict[str, Any]] = []
+        self._kin_cache_key: Any = None
+        self._kin_cache_val: Dict[str, Any] = {}
 
         # Prior run linking & missing-step continuity cache
         self.prior_series_cache: Dict[str, Dict[str, Any]] = {}
@@ -680,17 +729,18 @@ class LiveMonitorEngine:
         # Continually compute speed metrics and lightweight live step/time tip during light ticks
         now = time.time()
         dt_wall = now - self.last_update_wall_time
-        valid_light = {r: rd for r, rd in self.readers.items() if rd.is_valid and rd.raw_steps}
+        valid_light = {r: rd for r, rd in self.readers.items() if rd.is_valid and rd.n_rows > 0}
         if valid_light:
-            tip_step = min(int(rd.raw_steps[-1]) for rd in valid_light.values())
+            tip_step = min(int(rd._steps_buf[-1]) for rd in valid_light.values())
             pref_rd = next((rd for rd in valid_light.values() if rd.time_col is not None), next(iter(valid_light.values())))
-            idx_tip = len(pref_rd.raw_steps) - 1
-            for j in range(len(pref_rd.raw_steps) - 1, -1, -1):
-                if int(pref_rd.raw_steps[j]) <= tip_step:
+            s_buf = pref_rd._steps_buf
+            idx_tip = len(s_buf) - 1
+            for j in range(len(s_buf) - 1, -1, -1):
+                if int(s_buf[j]) <= tip_step:
                     idx_tip = j
                     break
-            tip_t = float(pref_rd.raw_times[idx_tip])
-            base_t = float(pref_rd.raw_times[0])
+            tip_t = float(pref_rd._times_buf[idx_tip])
+            base_t = float(pref_rd._times_buf[0])
             if pref_rd.time_col is None and self.p.dt and self.p.dt > 0:
                 tip_t *= float(self.p.dt)
                 base_t *= float(self.p.dt)
@@ -705,7 +755,7 @@ class LiveMonitorEngine:
             self._live_base_time = None
 
         if dt_wall >= 1.0 and self.readers:
-            total_raw = max((len(rd.raw_steps) for rd in self.readers.values() if rd.is_valid), default=0)
+            total_raw = max((rd.n_rows for rd in self.readers.values() if rd.is_valid), default=0)
             if self.last_step_count > 0:
                 delta_steps = max(0, total_raw - self.last_step_count)
                 self.steps_per_sec = delta_steps / dt_wall
@@ -755,7 +805,7 @@ class LiveMonitorEngine:
         if has_prior:
             from vawt_post.engine.continuity import normalize_role_key, stitch_series_pair
 
-            min_curr_len = min((len(rd.raw_steps) for rd in valid_readers.values()), default=0)
+            min_curr_len = min((rd.n_rows for rd in valid_readers.values()), default=0)
             should_refine = (
                 not self._prefix_refined_for_gap
                 and min_curr_len >= 24
@@ -781,11 +831,11 @@ class LiveMonitorEngine:
                 need_summary_update = True
 
             for role, rd in valid_readers.items():
-                c_steps = np.asarray(rd.raw_steps, dtype=np.int64)
-                c_times = np.asarray(rd.raw_times, dtype=float)
+                c_steps = rd.steps_np()
+                c_times = rd.times_np()
                 if rd.time_col is None and self.p.dt and self.p.dt > 0:
                     c_times = c_times * float(self.p.dt)
-                c_vals = np.asarray(rd.raw_vals, dtype=float)
+                c_vals = rd.vals_np()
                 c_steps, c_times, c_vals = self._monotone_clean(c_steps, c_times, c_vals)
 
                 canon = normalize_role_key(role)
@@ -927,11 +977,11 @@ class LiveMonitorEngine:
                 }
         else:
             for role, rd in valid_readers.items():
-                c_steps = np.asarray(rd.raw_steps, dtype=np.int64)
-                c_times = np.asarray(rd.raw_times, dtype=float)
+                c_steps = rd.steps_np()
+                c_times = rd.times_np()
                 if rd.time_col is None and self.p.dt and self.p.dt > 0:
                     c_times = c_times * float(self.p.dt)
-                c_vals = np.asarray(rd.raw_vals, dtype=float)
+                c_vals = rd.vals_np()
                 c_steps, c_times, c_vals = self._monotone_clean(c_steps, c_times, c_vals)
                 out[role] = (c_steps, c_times, c_vals, np.zeros(len(c_steps), dtype=bool))
 
@@ -945,23 +995,28 @@ class LiveMonitorEngine:
             return
 
         # 2. Synchronize files on common time steps
-        valid_readers = {r: rd for r, rd in self.readers.items() if rd.is_valid and rd.raw_steps}
+        valid_readers = {r: rd for r, rd in self.readers.items() if rd.is_valid and rd.n_rows > 0}
         if not valid_readers:
             return
 
         eff_arrays = self._resolve_role_arrays(valid_readers)
-
-        # Common step numbers
-        common_steps_set = None
-        for s_arr, _, _, _ in eff_arrays.values():
-            s_set = set(s_arr.tolist())
-            common_steps_set = s_set if common_steps_set is None else common_steps_set & s_set
-
-        if not common_steps_set:
+        step_arrays = [s_arr for s_arr, _, _, _ in eff_arrays.values() if len(s_arr) > 0]
+        if len(step_arrays) != len(eff_arrays) or not step_arrays:
             return
 
-        sorted_steps = sorted(common_steps_set)
-        latest_common_step = sorted_steps[-1]
+        first_s = step_arrays[0]
+        all_identical = all(
+            len(s) == len(first_s) and np.array_equal(s, first_s)
+            for s in step_arrays[1:]
+        )
+        if all_identical:
+            common_arr = first_s
+        else:
+            common_arr = reduce(lambda a, b: np.intersect1d(a, b, assume_unique=True), step_arrays)
+            if len(common_arr) == 0:
+                return
+
+        latest_common_step = int(common_arr[-1])
 
         force_reproc = self._force_reprocess
         self._force_reprocess = False
@@ -970,7 +1025,6 @@ class LiveMonitorEngine:
             return
 
         # Align series up to latest common step
-        common_arr = np.array(sorted_steps, dtype=np.int64)
         if force_reproc or (len(self.steps) > 0 and (len(common_arr) < len(self.steps) or int(common_arr[0]) > int(self.steps[0]))):
             self.completed_revs_count = 0
             self.rev_history.clear()
@@ -987,18 +1041,25 @@ class LiveMonitorEngine:
             first_role,
         )
         ref_steps, ref_times, _, _ = eff_arrays[ref_role]
-
-        pos_ref = np.searchsorted(ref_steps, common_arr)
-        aligned_t = ref_times[pos_ref]
+        if all_identical:
+            aligned_t = ref_times
+        else:
+            pos_ref = np.searchsorted(ref_steps, common_arr)
+            aligned_t = ref_times[pos_ref]
 
         # Extract values & recovered mask
         aligned_vals: Dict[str, np.ndarray] = {}
         aligned_rec = np.zeros(len(common_arr), dtype=bool)
         for role, (s_arr, _, v_arr, r_arr) in eff_arrays.items():
-            pos_v = np.searchsorted(s_arr, common_arr)
-            aligned_vals[role] = v_arr[pos_v]
-            if len(r_arr) == len(s_arr) and np.any(r_arr):
-                aligned_rec |= r_arr[pos_v]
+            if all_identical:
+                aligned_vals[role] = v_arr
+                if len(r_arr) == len(s_arr) and np.any(r_arr):
+                    aligned_rec |= r_arr
+            else:
+                pos_v = np.searchsorted(s_arr, common_arr)
+                aligned_vals[role] = v_arr[pos_v]
+                if len(r_arr) == len(s_arr) and np.any(r_arr):
+                    aligned_rec |= r_arr[pos_v]
 
         self.steps = common_arr
         self.times = aligned_t
@@ -1351,26 +1412,32 @@ class LiveMonitorEngine:
         self._evaluate_start_azimuth_and_health(omega_val, Trev)
 
     def get_kinematics(self) -> Dict[str, Any]:
-        """Compute theoretical AoA, W/U, and Re vs azimuth for current parameters."""
+        """Compute theoretical AoA, W/U, and Re vs azimuth for current parameters (memoized)."""
         U = self.p.U or 8.0
         c = self.p.chord or 0.06
         tsr = self.p.tsr_val() if (self.p.tsr or (self.p.omega and self.p.U and self.p.R)) else 3.5
         rho = self.p.rho or 1.225
         mu = self.p.mu or 1.7894e-5
+        ck = (U, c, tsr, rho, mu)
+        if self._kin_cache_key == ck and self._kin_cache_val:
+            return self._kin_cache_val
         theta = np.linspace(0, 360, 361)
         gamma = np.radians(theta)
         w_over_u = np.sqrt(np.sin(gamma)**2 + (np.cos(gamma) + tsr)**2)
         aoa = np.degrees(np.arctan2(np.sin(gamma), np.cos(gamma) + tsr))
         re_c = (rho * (w_over_u * U) * c) / mu
-        return {
+        res = {
             "theta": theta,
             "aoa": aoa,
             "w_over_u": w_over_u,
             "re_c": re_c,
         }
+        self._kin_cache_key = ck
+        self._kin_cache_val = res
+        return res
 
     def detect_stages(self, omega_val: float, Trev: float) -> List[Dict[str, Any]]:
-        """Detect simulation stages (time step size phases) from accumulated steps and times."""
+        """Detect simulation stages using vectorized NumPy scans & memoization."""
         if len(self.times) < 2:
             dt_single = float(self.p.dt) if self.p.dt else None
             if dt_single:
@@ -1390,43 +1457,70 @@ class LiveMonitorEngine:
                 }]
             return []
 
+        ck = (len(self.times), float(self.times[0]), float(self.times[-1]), float(omega_val), float(Trev))
+        if self._stages_cache_key == ck:
+            return self._stages_cache_val
+
         dts = np.diff(self.times)
-        stages = []
-        if len(dts):
+        n_dts = len(dts)
+        stages: List[Dict[str, Any]] = []
+        if n_dts:
             start = 0
-            for i in range(1, len(dts) + 1):
-                is_end = (i == len(dts))
-                is_jump = (not is_end) and (abs(dts[i] - dts[start]) / max(abs(dts[start]), 1e-12) > STAGE_DT_CHANGE_REL_TOL)
-                # Ignore isolated 1-step dt glitches (either mid-stream OR on trailing step)
-                if is_jump and (i + 1 < len(dts)) and (abs(dts[i + 1] - dts[start]) / max(abs(dts[start]), 1e-12) <= STAGE_DT_CHANGE_REL_TOL):
-                    continue
-                if is_jump and (i + 1 == len(dts)) and (i - start >= 2):
-                    continue
-                if is_end or is_jump:
-                    d = float(np.median(dts[start:i]))
-                    t_f = float(self.times[start]) if len(self.times) > start else 0.0
-                    t_t = float(self.times[i]) if len(self.times) > i else float(self.times[-1])
-                    dur = max(0.0, t_t - t_f)
-                    step_f = int(self.steps[start]) if len(self.steps) > start else start
-                    step_t = int(self.steps[i]) if len(self.steps) > i else (int(self.steps[-1]) if len(self.steps) else i)
-                    n_st = max(1, step_t - step_f if step_t > step_f else (i - start))
-                    stages.append({
-                        "stage_index": len(stages) + 1,
-                        "step_from": step_f,
-                        "step_to": step_t,
-                        "t_from": t_f,
-                        "t_to": t_t,
-                        "t_start": t_f,
-                        "t_end": t_t,
-                        "n_steps": n_st,
-                        "duration_s": dur,
-                        "revolutions": dur / Trev if Trev > 0 else 0.0,
-                        "dt": d,
-                        "deg_per_step": math.degrees(omega_val * d) if omega_val > 0 else 0.0,
-                        "steps_per_rev": Trev / d if (d > 0 and Trev > 0) else 0.0,
-                        "is_current": is_end,
-                    })
-                    start = i
+            while start < n_dts:
+                ref_dt = float(dts[start])
+                denom = max(abs(ref_dt), 1e-12)
+                if start + 1 < n_dts:
+                    # Find first index > start exceeding tolerance (vectorized C scan)
+                    rel_mask = (np.abs(dts[start + 1:] - ref_dt) / denom) > STAGE_DT_CHANGE_REL_TOL
+                    # Walk past any isolated 1-step dt glitches
+                    scan_pos = 0
+                    jump_idx = n_dts
+                    while scan_pos < len(rel_mask):
+                        if not np.any(rel_mask[scan_pos:]):
+                            jump_idx = n_dts
+                            break
+                        rel_hit = scan_pos + int(np.argmax(rel_mask[scan_pos:]))
+                        abs_i = start + 1 + rel_hit
+                        is_mid_glitch = (abs_i + 1 < n_dts) and (not rel_mask[rel_hit + 1])
+                        is_trail_glitch = (abs_i + 1 == n_dts) and (abs_i - start >= 2)
+                        if is_mid_glitch or is_trail_glitch:
+                            scan_pos = rel_hit + 1
+                            continue
+                        jump_idx = abs_i
+                        break
+                else:
+                    jump_idx = n_dts
+
+                is_end = (jump_idx >= n_dts)
+                d = float(np.median(dts[start:jump_idx]))
+                t_f = float(self.times[start])
+                t_t = float(self.times[jump_idx]) if jump_idx < len(self.times) else float(self.times[-1])
+                dur = max(0.0, t_t - t_f)
+                step_f = int(self.steps[start]) if len(self.steps) > start else start
+                step_t = int(self.steps[jump_idx]) if len(self.steps) > jump_idx else (int(self.steps[-1]) if len(self.steps) else jump_idx)
+                n_st = max(1, step_t - step_f if step_t > step_f else (jump_idx - start))
+                stages.append({
+                    "stage_index": len(stages) + 1,
+                    "step_from": step_f,
+                    "step_to": step_t,
+                    "t_from": t_f,
+                    "t_to": t_t,
+                    "t_start": t_f,
+                    "t_end": t_t,
+                    "n_steps": n_st,
+                    "duration_s": dur,
+                    "revolutions": dur / Trev if Trev > 0 else 0.0,
+                    "dt": d,
+                    "deg_per_step": math.degrees(omega_val * d) if omega_val > 0 else 0.0,
+                    "steps_per_rev": Trev / d if (d > 0 and Trev > 0) else 0.0,
+                    "is_current": is_end,
+                })
+                start = jump_idx
+                if is_end:
+                    break
+
+        self._stages_cache_key = ck
+        self._stages_cache_val = stages
         return stages
 
     def get_snapshot(self, target_revs: Optional[float] = None, is_full_refresh: bool = True) -> LiveMonitorSnapshot:
@@ -1478,9 +1572,9 @@ class LiveMonitorEngine:
                 role=role,
                 filename=os.path.basename(reader.path),
                 status_color=color,
-                row_count=len(reader.raw_steps),
-                last_step=reader.raw_steps[-1] if reader.raw_steps else 0,
-                last_flow_time=reader.raw_times[-1] if reader.raw_times else 0.0,
+                row_count=reader.n_rows,
+                last_step=int(reader._steps_buf[-1]) if reader.n_rows > 0 else 0,
+                last_flow_time=float(reader._times_buf[-1]) if reader.n_rows > 0 else 0.0,
                 age_seconds=age,
                 open_diagnostics=1 if reader.has_missing_col_error else 0,
                 error_message=reader.error_msg
@@ -1569,48 +1663,47 @@ class LiveMonitorEngine:
             "extra_revs": extra_revs,
         }
 
-        # Decimated timeseries (max 5000 points to keep UI responsive)
-        step_len = len(self.steps)
-        deci = max(1, step_len // 5000)
-        ts_dict = {
-            "step": self.steps[::deci],
-            "t": self.times[::deci],
-            "cp": self.Cp[::deci],
-            "cm": self.Cm[::deci],
-            "ct": self.Ct[::deci] if self.Ct is not None else None,
-            "cy": self.Cy[::deci] if self.Cy is not None else None,
-            "Mrot": self.Mrot[::deci],
-            "Mb": [m[::deci] for m in self.Mb],
-            "recovered_mask": self.recovered_mask[::deci] if len(self.recovered_mask) == step_len else None,
-            "splice_times": (self.continuity_summary.get("splice_times", []) if self.continuity_summary else []),
-            "recovered_time_ranges": (self.continuity_summary.get("recovered_time_ranges", []) if self.continuity_summary else []),
-        }
-
-        # Azimuth curve (current partial revolution + completed revs)
-        az_dict = {}
-        if len(self.times) > 10:
-            bw = self.p.bin_deg or 1.0
-            nb_bins = round(360.0 / bw)
-            centers = (np.arange(nb_bins) + 0.5) * bw
-            th_curr = np.mod(az_base + np.degrees(omega_val * self.times), 360.0)
-
-            # Bin latest 1 revolution
-            win_tail = self.times >= max(self.times[0], self.times[-1] - Trev)
-            b_counts = np.zeros(nb_bins, dtype=int)
-            b_sums = np.zeros(nb_bins, dtype=float)
-            idx_bins = np.clip(np.floor(th_curr[win_tail] / bw).astype(int), 0, nb_bins - 1)
-            np.add.at(b_sums, idx_bins, self.Cp[win_tail])
-            np.add.at(b_counts, idx_bins, 1)
-            valid_b = b_counts > 0
-            cp_az = np.zeros(nb_bins, dtype=float)
-            cp_az[valid_b] = b_sums[valid_b] / b_counts[valid_b]
-            if not np.all(valid_b) and np.any(valid_b):
-                cp_az[~valid_b] = np.interp(centers[~valid_b], centers[valid_b], cp_az[valid_b], period=360.0)
-
-            az_dict = {
-                "theta": centers,
-                "cp_latest": cp_az,
+        # Build heavy chart payloads ONLY for full refreshes; light ticks update telemetry without churning arrays
+        ts_dict: Dict[str, Any] = {}
+        az_dict: Dict[str, Any] = {}
+        if is_full_refresh:
+            step_len = len(self.steps)
+            deci = max(1, step_len // 5000)
+            ts_dict = {
+                "step": self.steps[::deci],
+                "t": self.times[::deci],
+                "cp": self.Cp[::deci],
+                "cm": self.Cm[::deci],
+                "ct": self.Ct[::deci] if self.Ct is not None else None,
+                "cy": self.Cy[::deci] if self.Cy is not None else None,
+                "Mrot": self.Mrot[::deci],
+                "Mb": [m[::deci] for m in self.Mb],
+                "recovered_mask": self.recovered_mask[::deci] if len(self.recovered_mask) == step_len else None,
+                "splice_times": (self.continuity_summary.get("splice_times", []) if self.continuity_summary else []),
+                "recovered_time_ranges": (self.continuity_summary.get("recovered_time_ranges", []) if self.continuity_summary else []),
             }
+
+            if len(self.times) > 10:
+                bw = self.p.bin_deg or 1.0
+                nb_bins = round(360.0 / bw)
+                centers = (np.arange(nb_bins) + 0.5) * bw
+                win_tail = self.times >= max(self.times[0], self.times[-1] - Trev)
+                th_tail = np.mod(az_base + np.degrees(omega_val * self.times[win_tail]), 360.0)
+                b_counts = np.zeros(nb_bins, dtype=int)
+                b_sums = np.zeros(nb_bins, dtype=float)
+                idx_bins = np.clip(np.floor(th_tail / bw).astype(int), 0, nb_bins - 1)
+                np.add.at(b_sums, idx_bins, self.Cp[win_tail])
+                np.add.at(b_counts, idx_bins, 1)
+                valid_b = b_counts > 0
+                cp_az = np.zeros(nb_bins, dtype=float)
+                cp_az[valid_b] = b_sums[valid_b] / b_counts[valid_b]
+                if not np.all(valid_b) and np.any(valid_b):
+                    cp_az[~valid_b] = np.interp(centers[~valid_b], centers[valid_b], cp_az[valid_b], period=360.0)
+
+                az_dict = {
+                    "theta": centers,
+                    "cp_latest": cp_az,
+                }
 
         # Multi-stage detection & time step analysis
         stages = self.detect_stages(omega_val, Trev)
@@ -1745,11 +1838,11 @@ class LiveMonitorEngine:
             timeseries=ts_dict,
             rev_history=list(self.rev_history),
             azimuth_curve=az_dict,
-            heat_map=self.heat_map,
-            spectrum=self.spectrum,
-            kinematics=self.get_kinematics(),
-            blade_torques=self.blade_torques,
-            forces_az=self.forces_az,
+            heat_map=self.heat_map if is_full_refresh else None,
+            spectrum=self.spectrum if is_full_refresh else {},
+            kinematics=self.get_kinematics() if is_full_refresh else {},
+            blade_torques=self.blade_torques if is_full_refresh else {},
+            forces_az=self.forces_az if is_full_refresh else {},
             parameter_checks=param_checks,
             diagnostics_summary=diag_sum,
             stages=stages,
@@ -1899,6 +1992,7 @@ class LiveMonitorWorker:
         """Worker loop running file polling and graph updates synchronized to user timer."""
         last_light_time = 0.0
         last_heavy_time = 0.0
+        last_snap_sent_time = 0.0
 
         # Do initial tick immediately
         try:
@@ -1906,8 +2000,10 @@ class LiveMonitorWorker:
                 self.engine.tick()
                 snap = self.engine.get_snapshot(self.target_revs, is_full_refresh=True)
                 self.queue.put(snap)
-            last_light_time = time.time()
-            last_heavy_time = time.time()
+            now_init = time.time()
+            last_light_time = now_init
+            last_heavy_time = now_init
+            last_snap_sent_time = now_init
         except Exception as e:
             with self._lock:
                 self.engine.add_alert("ERROR", f"Initial tick error: {e}")
@@ -1943,21 +2039,41 @@ class LiveMonitorWorker:
                         err_snap = self.engine.get_snapshot(self.target_revs, is_full_refresh=True)
                         self.queue.put(err_snap)
                 finally:
-                    last_heavy_time = time.time()
-                    last_light_time = time.time()
+                    t_done = time.time()
+                    last_heavy_time = t_done
+                    last_light_time = t_done
+                    last_snap_sent_time = t_done
             elif trigger_light:
                 try:
                     with self._lock:
-                        self.engine.tick_light()
-                        snap = self.engine.get_snapshot(self.target_revs, is_full_refresh=False)
-                        self.queue.put(snap)
+                        prev_stall = self.engine._stall_alert_active
+                        new_data = self.engine.tick_light()
+                        max_age = max(
+                            (max(0.0, now - rd.last_mtime) if rd.last_mtime > 0 else 0.0)
+                            for rd in self.engine.readers.values()
+                        ) if self.engine.readers else 0.0
+                        stall_due = (not prev_stall) and (max_age > self.engine.stalled_timeout) and len(self.engine.readers) > 0
+                        if new_data or stall_due or (now - last_snap_sent_time >= 10.0):
+                            snap = self.engine.get_snapshot(self.target_revs, is_full_refresh=False)
+                            self.queue.put(snap)
+                            last_snap_sent_time = time.time()
                 except Exception as e:
                     with self._lock:
                         self.engine.add_alert("ERROR", f"Light check error: {e}")
                 finally:
                     last_light_time = time.time()
 
-            self._wake_event.wait(timeout=0.25)
+            now2 = time.time()
+            if self._pause_graph_refresh.is_set():
+                wait_s = 1.0
+            else:
+                next_h = max(0.05, self.graph_refresh_interval - (now2 - last_heavy_time))
+                if self.file_check_interval < self.graph_refresh_interval:
+                    next_l = max(0.05, self.file_check_interval - (now2 - last_light_time))
+                    wait_s = min(1.0, next_h, next_l)
+                else:
+                    wait_s = min(1.0, next_h)
+            self._wake_event.wait(timeout=wait_s)
             self._wake_event.clear()
 
     def save_snapshot(self, out_dir: str, prefix: str = "interim_live") -> str:

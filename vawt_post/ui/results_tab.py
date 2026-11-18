@@ -983,7 +983,7 @@ class ResultsFrame(ctk.CTkFrame):
     _on_view_mode_change = _on_preview_mode_change
 
     def _get_cached_pil_image(self, path: str) -> Image.Image:
-        """Load and LRU-cache PIL Image in memory (bounded to 24 images)."""
+        """Load and LRU-cache PIL Image in memory (bounded to 4 images to curb RAM)."""
         mtime = os.path.getmtime(path) if os.path.isfile(path) else 0.0
         cache_key = f"{path}|{mtime}"
         if cache_key in self._img_cache:
@@ -993,7 +993,7 @@ class ResultsFrame(ctk.CTkFrame):
         with Image.open(path) as im:
             copied = im.copy()
         self._img_cache[cache_key] = copied
-        while len(self._img_cache) > 24:
+        while len(self._img_cache) > 4:
             self._img_cache.pop(next(iter(self._img_cache)))
         return copied
 

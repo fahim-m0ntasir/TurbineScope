@@ -726,6 +726,100 @@ def test_live_monitor_ui_alerts_clear_kinematics_probe_and_cy_plot(tmp_path, mon
         app.destroy()
 
 
+def test_incremental_reader_compact_buffer_compat(tmp_path):
+    """IncrementalFileReader compact array buffers preserve list properties & fast NumPy views."""
+    p_file = tmp_path / "compact.out"
+    p_file.write_text(
+        '("Time Step" "cm" "flow-time")\n'
+        "1 0.125 0.001\n"
+        "2 0.250 0.002\n",
+        encoding="utf-8",
+    )
+    reader = IncrementalFileReader(str(p_file), "total")
+    reader.read_new_chunk()
+    assert reader.n_rows == 2
+    assert reader.raw_steps == [1, 2]
+    assert np.allclose(reader.steps_np(), [1, 2])
+    assert np.allclose(reader.times_np(), [0.001, 0.002])
+    assert np.allclose(reader.vals_np(), [0.125, 0.250])
+
+    # Setter backward compatibility
+    reader.raw_steps = [10, 20, 30]
+    reader.raw_times = [0.01, 0.02, 0.03]
+    reader.raw_vals = [1.5, 2.5, 3.5]
+    assert reader.n_rows == 3
+    assert reader.raw_steps == [10, 20, 30]
+    assert np.allclose(reader.vals_np(), [1.5, 2.5, 3.5])
+
+
+def test_detect_stages_vectorized_and_cached(tmp_path):
+    """Vectorized detect_stages handles multi-stage dt jumps and memoizes until data grows."""
+    p_file = tmp_path / "stages.out"
+    lines = ['("Time Step" "cm" "flow-time")\n']
+    t = 0.0
+    for s in range(1, 31):
+        t += 0.002
+        lines.append(f"{s} 0.1 {t:.6f}\n")
+    for s in range(31, 61):
+        t += 0.001
+        lines.append(f"{s} 0.1 {t:.6f}\n")
+    p_file.write_text("".join(lines), encoding="utf-8")
+
+    params = Params(U=8.0, tsr=2.5, R=0.5, chord=0.06, n_blades=3, dt=0.001, stable_tol=5.0)
+    omega = params.omega_val()
+    trev = 2.0 * math.pi / omega
+    eng = LiveMonitorEngine(params, InputFiles(total=str(p_file)), watch_dir=str(tmp_path))
+    eng.tick()
+
+    stages1 = eng.detect_stages(omega, trev)
+    assert len(stages1) == 2
+    assert stages1[0]["step_from"] == 1 and stages1[0]["step_to"] == 30
+    assert abs(stages1[0]["dt"] - 0.002) < 1e-6
+    assert stages1[1]["step_from"] == 30 and stages1[1]["step_to"] == 60
+    assert abs(stages1[1]["dt"] - 0.001) < 1e-6
+
+    # Cached object returned when array tail/len unchanged
+    stages2 = eng.detect_stages(omega, trev)
+    assert stages2 is stages1
+
+    # Appending data invalidates cache
+    with open(p_file, "a", encoding="utf-8") as f:
+        t += 0.001
+        f.write(f"61 0.1 {t:.6f}\n")
+    eng.tick()
+    stages3 = eng.detect_stages(omega, trev)
+    assert stages3 is not stages1
+    assert stages3[-1]["step_to"] == 61
+
+
+def test_qtimer_after_cleanup_and_idle_live_monitor(tmp_path):
+    """QTimers self-clean after firing and idle LiveMonitorFrame runs zero background loops."""
+    from vawt_post.ui.qt_tk import QApplication
+    from vawt_post.ui.app import VAWTPostApp
+
+    app = VAWTPostApp()
+    try:
+        lm = app.live_monitor_frame
+        assert not lm.is_monitoring
+        assert lm._snap_poll_after_id is None
+        assert lm._countdown_after_id is None
+        assert getattr(app, "_poll_queue_after_id", None) is None
+
+        # Verify single-shot after() removes timer ref once fired
+        fired = []
+        app.after(5, lambda: fired.append(True))
+        assert len(app._after_timers) >= 1
+        t_end = time.time() + 1.0
+        while not fired and time.time() < t_end:
+            QApplication.processEvents()
+            time.sleep(0.01)
+        assert fired == [True]
+        assert len(app._after_timers) == 0
+    finally:
+        app.destroy()
+
+
+
 
 
 

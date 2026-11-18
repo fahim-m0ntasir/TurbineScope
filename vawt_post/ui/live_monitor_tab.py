@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import copy
 import datetime as _dt
+import gc
 import math
 import os
 import queue
@@ -447,6 +448,9 @@ class LiveMonitorFrame(ctk.CTkFrame):
         self.is_monitoring: bool = False
         self.is_paused: bool = False
         self.latest_snapshot: Optional[LiveMonitorSnapshot] = None
+        self._last_chart_snapshot: Optional[LiveMonitorSnapshot] = None
+        self._snap_poll_after_id: Optional[str] = None
+        self._countdown_after_id: Optional[str] = None
 
         # Timer & display configurations
         self.refresh_interval_s: float = 120.0  # Default 2 minutes
@@ -530,10 +534,7 @@ class LiveMonitorFrame(ctk.CTkFrame):
         self._build_ui()
         self._init_plots()
 
-        # Start background timer ticks and initial parameter detection
-        self.after(200, self._poll_snapshot_queue)
-        if not getattr(self, "_is_closing", False):
-            self.after(1000, self._countdown_tick)
+        # Defer periodic 200ms/1000ms timers until monitoring actually starts (zero idle CPU when stopped)
         if self.custom_watch_folder and os.path.isdir(self.custom_watch_folder):
             self.after(500, self._get_or_detect_params)
 
@@ -2492,8 +2493,29 @@ class LiveMonitorFrame(ctk.CTkFrame):
     # -------------------------------------------------------------------------
     # Queue Polling & Telemetry Updates
     # -------------------------------------------------------------------------
+    def _ensure_monitor_timers(self) -> None:
+        """Start UI snapshot-queue and countdown timers when active monitoring begins."""
+        if getattr(self, "_is_closing", False):
+            return
+        if not getattr(self, "_snap_poll_after_id", None):
+            self._snap_poll_after_id = self.after(200, self._poll_snapshot_queue)
+        if not getattr(self, "_countdown_after_id", None):
+            self._countdown_after_id = self.after(1000, self._countdown_tick)
+
+    def _stop_monitor_timers(self) -> None:
+        """Cancel active UI polling and countdown timers when stopped."""
+        for attr in ("_snap_poll_after_id", "_countdown_after_id"):
+            tid = getattr(self, attr, None)
+            if tid:
+                try:
+                    self.after_cancel(tid)
+                except Exception:
+                    pass
+                setattr(self, attr, None)
+
     def _poll_snapshot_queue(self):
         """Process snapshots arriving from background worker, coalescing queued bursts."""
+        self._snap_poll_after_id = None
         if getattr(self, "_is_closing", False):
             return
         try:
@@ -2509,12 +2531,25 @@ class LiveMonitorFrame(ctk.CTkFrame):
                     break
 
             if latest_snap is not None and self.is_monitoring:
+                if any_full:
+                    self._last_chart_snapshot = latest_snap
+                elif self._last_chart_snapshot is not None and not latest_snap.timeseries:
+                    prev_c = self._last_chart_snapshot
+                    latest_snap.timeseries = prev_c.timeseries
+                    latest_snap.azimuth_curve = prev_c.azimuth_curve
+                    latest_snap.heat_map = prev_c.heat_map
+                    latest_snap.spectrum = prev_c.spectrum
+                    latest_snap.kinematics = prev_c.kinematics
+                    latest_snap.blade_torques = prev_c.blade_torques
+                    latest_snap.forces_az = prev_c.forces_az
+
                 self.latest_snapshot = latest_snap
                 self._update_telemetry(latest_snap)
                 if any_full:
                     try:
                         if not self.app or getattr(self.app, "current_page", "live") == "live":
                             self._render_graphs(latest_snap)
+                            gc.collect()
                     finally:
                         self._refresh_pending = False
                         self.time_until_refresh = self.refresh_interval_s
@@ -2527,29 +2562,45 @@ class LiveMonitorFrame(ctk.CTkFrame):
             print(f"[LiveMonitor] Snapshot handling error: {exc}")
             traceback.print_exc()
         finally:
-            if not getattr(self, "_is_closing", False):
-                self.after(200, self._poll_snapshot_queue)
+            if not getattr(self, "_is_closing", False) and (self.is_monitoring or not self.snapshot_queue.empty()):
+                self._snap_poll_after_id = self.after(200, self._poll_snapshot_queue)
 
     def on_show(self):
         """Called when the Live Monitor page becomes visible."""
         if not self.is_monitoring and self.live_params is None:
             self._get_or_detect_params()
-        if self.latest_snapshot:
-            self._render_graphs(self.latest_snapshot, force=False)
+        render_snap = self._last_chart_snapshot or self.latest_snapshot
+        if render_snap:
+            self._render_graphs(render_snap, force=False)
+
+    @staticmethod
+    def _cfg_if_changed(widget: Any, **kwargs: Any) -> bool:
+        """Configure widget only with properties whose values changed since last call."""
+        cache = getattr(widget, "_lm_cfg_cache", None)
+        if cache is None:
+            cache = {}
+            setattr(widget, "_lm_cfg_cache", cache)
+        diff = {k: v for k, v in kwargs.items() if k not in cache or cache[k] != v}
+        if not diff:
+            return False
+        cache.update(diff)
+        widget.configure(**diff)
+        return True
 
     def _countdown_tick(self):
         """1 Hz timer decrementing countdown display and auto-refreshing at 0:00."""
+        self._countdown_after_id = None
         if getattr(self, "_is_closing", False):
             return
         try:
             if self.is_monitoring:
                 if self.is_paused:
-                    self.lbl_countdown.configure(text="⏱ Paused", text_color="#06B6D4")
+                    self._cfg_if_changed(self.lbl_countdown, text="⏱ Paused", text_color="#06B6D4")
                 else:
-                    self.lbl_countdown.configure(text_color=("royal blue", "#60A5FA"))
                     self.time_until_refresh = max(0.0, self.time_until_refresh - 1.0)
+                    cd_col = ("royal blue", "#60A5FA")
                     if self.time_until_refresh <= 0.0:
-                        self.lbl_countdown.configure(text="⏱ Refreshing...")
+                        self._cfg_if_changed(self.lbl_countdown, text="⏱ Refreshing...", text_color=cd_col)
                         if not getattr(self, "_refresh_pending", False):
                             self._refresh_pending = True
                             self._refresh_now()
@@ -2558,56 +2609,59 @@ class LiveMonitorFrame(ctk.CTkFrame):
                         if not getattr(self, "_refresh_pending", False):
                             mins = int(self.time_until_refresh // 60)
                             secs = int(self.time_until_refresh % 60)
-                            self.lbl_countdown.configure(text=f"⏱ Next: {mins}:{secs:02d}")
+                            self._cfg_if_changed(self.lbl_countdown, text=f"⏱ Next: {mins}:{secs:02d}", text_color=cd_col)
+                        else:
+                            self._cfg_if_changed(self.lbl_countdown, text_color=cd_col)
 
                 # Badge pulsing / status indicators
                 if self.app and hasattr(self.app, "tab_btn_live"):
                     is_live_active = getattr(self.app, "current_page", "") == "live"
                     if self.is_paused:
                         tc = "#BAE6FD" if is_live_active else "#06B6D4"
-                        self.app.tab_btn_live.configure(text="📡 Live Monitor  ⏸", text_color=tc)
+                        self._cfg_if_changed(self.app.tab_btn_live, text="📡 Live Monitor  ⏸", text_color=tc)
                     elif self.latest_snapshot and "Stalled" in self.latest_snapshot.status:
                         tc = "#FDE68A" if is_live_active else "#F59E0B"
-                        self.app.tab_btn_live.configure(text="📡 Live Monitor  ● Stalled", text_color=tc)
+                        self._cfg_if_changed(self.app.tab_btn_live, text="📡 Live Monitor  ● Stalled", text_color=tc)
                     else:
                         dot = "●" if int(self.time_until_refresh) % 2 == 0 else "○"
                         tc = "#A7F3D0" if is_live_active else "#10B981"
-                        self.app.tab_btn_live.configure(text=f"📡 Live Monitor  {dot}", text_color=tc)
+                        self._cfg_if_changed(self.app.tab_btn_live, text=f"📡 Live Monitor  {dot}", text_color=tc)
         except Exception as exc:
             print(f"[LiveMonitor] Countdown tick error: {exc}")
             traceback.print_exc()
         finally:
-            if not getattr(self, "_is_closing", False):
-                self.after(1000, self._countdown_tick)
+            if not getattr(self, "_is_closing", False) and self.is_monitoring:
+                self._countdown_after_id = self.after(1000, self._countdown_tick)
 
     def _update_telemetry(self, snap: LiveMonitorSnapshot):
         """Update status strip, side panels, and alerts without touching graphs."""
+        cfg = self._cfg_if_changed
         # Status Badge
         if snap.status == "Monitoring":
-            self.state_badge.configure(text="● Monitoring", text_color="#10B981")
+            cfg(self.state_badge, text="● Monitoring", text_color="#10B981")
         elif "Stalled" in snap.status:
-            self.state_badge.configure(text="⚠ Stalled?", text_color="#F59E0B")
+            cfg(self.state_badge, text="⚠ Stalled?", text_color="#F59E0B")
         elif "Waiting" in snap.status:
-            self.state_badge.configure(text="⏳ Waiting Files", text_color="#3B82F6")
+            cfg(self.state_badge, text="⏳ Waiting Files", text_color="#3B82F6")
         elif snap.status == "Paused":
-            self.state_badge.configure(text="⏸ Paused", text_color="#06B6D4")
+            cfg(self.state_badge, text="⏸ Paused", text_color="#06B6D4")
         else:
-            self.state_badge.configure(text=f"● {snap.status}", text_color="gray")
+            cfg(self.state_badge, text=f"● {snap.status}", text_color="gray")
 
         # Telemetry Labels
-        self.lbl_step.configure(text=f"Step: {snap.current_step:,}")
-        self.lbl_time.configure(text=f"Time: {snap.current_time:.4f} s")
-        self.lbl_revs.configure(text=f"Revs: {snap.total_revs:.2f}")
-        self.lbl_azimuth.configure(text=f"θ: {snap.current_azimuth:.1f}°")
-        self.lbl_speed.configure(text=f"Speed: {snap.steps_per_sec:.1f} steps/s")
+        cfg(self.lbl_step, text=f"Step: {snap.current_step:,}")
+        cfg(self.lbl_time, text=f"Time: {snap.current_time:.4f} s")
+        cfg(self.lbl_revs, text=f"Revs: {snap.total_revs:.2f}")
+        cfg(self.lbl_azimuth, text=f"θ: {snap.current_azimuth:.1f}°")
+        cfg(self.lbl_speed, text=f"Speed: {snap.steps_per_sec:.1f} steps/s")
         if snap.eta_seconds is not None and snap.eta_seconds >= 0:
             eta_m = int(snap.eta_seconds // 60)
             eta_s = int(snap.eta_seconds % 60)
-            self.lbl_eta.configure(text=f"ETA: {eta_m}m {eta_s}s")
+            cfg(self.lbl_eta, text=f"ETA: {eta_m}m {eta_s}s")
         else:
-            self.lbl_eta.configure(text="ETA: -")
+            cfg(self.lbl_eta, text="ETA: -")
 
-        self.lbl_fresh.configure(text=f"Freshness: {snap.last_data_age_s:.1f}s ago")
+        cfg(self.lbl_fresh, text=f"Freshness: {snap.last_data_age_s:.1f}s ago")
 
         # Multi-stage and time step telemetry handling
         stages = getattr(snap, "stages", [])
@@ -2635,17 +2689,16 @@ class LiveMonitorFrame(ctk.CTkFrame):
 
             # 1. Status strip label & badge
             if n_stages > 1:
-                self.lbl_dt.configure(text=f"Δt: {dt_curr_str} (Stage {curr_stage['stage_index']}/{n_stages})")
-                self.lbl_stages_badge.configure(text=f"{n_stages} Stages", text_color="#3B82F6")
+                cfg(self.lbl_dt, text=f"Δt: {dt_curr_str} (Stage {curr_stage['stage_index']}/{n_stages})")
+                cfg(self.lbl_stages_badge, text=f"{n_stages} Stages", text_color="#3B82F6")
             else:
-                self.lbl_dt.configure(text=f"Δt: {dt_curr_str}")
-                self.lbl_stages_badge.configure(text="Uniform Δt", text_color="#10B981")
+                cfg(self.lbl_dt, text=f"Δt: {dt_curr_str}")
+                cfg(self.lbl_stages_badge, text="Uniform Δt", text_color="#10B981")
 
             # Update current phase label in status row
             if hasattr(self, "lbl_current_phase"):
                 phase_text = f"P{curr_stage.get('stage_index', 1)}: {curr_stage.get('deg_per_step', 0.0):.1f}°"
-                phase_color = "#38BDF8"
-                self.lbl_current_phase.configure(text=phase_text, text_color=phase_color)
+                cfg(self.lbl_current_phase, text=phase_text, text_color="#38BDF8")
 
             # 2. Detailed text for Stages Card & Tooltip
             lines = []
@@ -2675,15 +2728,16 @@ class LiveMonitorFrame(ctk.CTkFrame):
                 f" • Resolution: {deg_c:.2f}°/step ({steps_per_rev_c:,.0f} steps/rev)"
             )
             stages_text = "\n".join(lines)
-            self.lbl_stages_content.configure(text=stages_text)
-            if hasattr(self, "dt_tooltip") and self.dt_tooltip:
-                self.dt_tooltip.text = stages_text
-            if hasattr(self.lbl_dt, "setToolTip"):
-                self.lbl_dt.setToolTip(stages_text)
+            if cfg(self.lbl_stages_content, text=stages_text):
+                if hasattr(self, "dt_tooltip") and self.dt_tooltip:
+                    self.dt_tooltip.text = stages_text
+                if hasattr(self.lbl_dt, "setToolTip"):
+                    self.lbl_dt.setToolTip(stages_text)
 
             # 3. Derived Physics Card
             st_sfx = f" (Stage {curr_stage['stage_index']}/{n_stages})" if n_stages > 1 else ""
-            self.lbl_derived_echo.configure(
+            cfg(
+                self.lbl_derived_echo,
                 text=f"ω: {omega_val:.2f} rad/s ({rpm_val:.1f} rpm)\n"
                      f"T_rev: {Trev:.4f} s\n"
                      f"Current Δt: {dt_curr_str}{st_sfx}\n"
@@ -2693,59 +2747,56 @@ class LiveMonitorFrame(ctk.CTkFrame):
             # 4. Consistency Checks Card
             if snap.parameter_checks and hasattr(self, "lbl_checks_echo"):
                 dt_summary = f"{n_stages} stages, curr: {dt_curr_str}" if n_stages > 1 else dt_curr_str
-                self.lbl_checks_echo.configure(
-                    text=self._format_checks_summary(snap.parameter_checks, dt_summary)
-                )
+                cfg(self.lbl_checks_echo, text=self._format_checks_summary(snap.parameter_checks, dt_summary))
         elif snap.dt_seconds is not None and snap.dt_seconds > 0:
             dt_s = snap.dt_seconds
             dt_fmt = f"{dt_s:.3e} s" if (dt_s < 1e-3 or dt_s >= 10) else f"{dt_s:.5f} s"
-            self.lbl_dt.configure(text=f"Δt: {dt_fmt}")
-            self.lbl_stages_badge.configure(text="Uniform Δt", text_color="#10B981")
+            cfg(self.lbl_dt, text=f"Δt: {dt_fmt}")
+            cfg(self.lbl_stages_badge, text="Uniform Δt", text_color="#10B981")
             dtheta = (omega_val * dt_s * 180.0 / math.pi) if omega_val > 0 else 0.0
             steps_rev = round(Trev / dt_s) if (Trev > 0 and dt_s > 0) else 0
             if hasattr(self, "lbl_current_phase"):
-                self.lbl_current_phase.configure(text=f"P1: {dtheta:.1f}°", text_color="#38BDF8")
-            self.lbl_derived_echo.configure(
+                cfg(self.lbl_current_phase, text=f"P1: {dtheta:.1f}°", text_color="#38BDF8")
+            cfg(
+                self.lbl_derived_echo,
                 text=f"ω: {omega_val:.2f} rad/s ({rpm_val:.1f} rpm)\nT_rev: {Trev:.4f} s\nΔt: {dt_fmt}\nDeg/step: {dtheta:.2f}° | Steps/rev: {steps_rev:,}"
             )
             st_single_txt = f"Current: Δt = {dt_fmt}\nResolution: {dtheta:.2f}°/step ({steps_rev:,} steps/rev)"
-            self.lbl_stages_content.configure(text=st_single_txt)
-            if hasattr(self, "dt_tooltip") and self.dt_tooltip:
-                self.dt_tooltip.text = st_single_txt
-            if hasattr(self.lbl_dt, "setToolTip"):
-                self.lbl_dt.setToolTip(st_single_txt)
+            if cfg(self.lbl_stages_content, text=st_single_txt):
+                if hasattr(self, "dt_tooltip") and self.dt_tooltip:
+                    self.dt_tooltip.text = st_single_txt
+                if hasattr(self.lbl_dt, "setToolTip"):
+                    self.lbl_dt.setToolTip(st_single_txt)
             if snap.parameter_checks and hasattr(self, "lbl_checks_echo"):
-                self.lbl_checks_echo.configure(
-                    text=self._format_checks_summary(snap.parameter_checks, dt_fmt)
-                )
+                cfg(self.lbl_checks_echo, text=self._format_checks_summary(snap.parameter_checks, dt_fmt))
         else:
-            self.lbl_dt.configure(text="Δt: -")
-            self.lbl_stages_badge.configure(text="Uniform Δt", text_color="gray")
+            cfg(self.lbl_dt, text="Δt: -")
+            cfg(self.lbl_stages_badge, text="Uniform Δt", text_color="gray")
             if hasattr(self, "lbl_current_phase"):
-                self.lbl_current_phase.configure(text="P1: -", text_color="gray")
-            if hasattr(self.lbl_dt, "setToolTip"):
-                self.lbl_dt.setToolTip("Time Step Size (Δt)")
+                cfg(self.lbl_current_phase, text="P1: -", text_color="gray")
+            if getattr(self, "_lm_last_dt_tip", None) != "Time Step Size (Δt)":
+                self._lm_last_dt_tip = "Time Step Size (Δt)"
+                if hasattr(self.lbl_dt, "setToolTip"):
+                    self.lbl_dt.setToolTip("Time Step Size (Δt)")
             if snap.parameter_checks and hasattr(self, "lbl_checks_echo"):
-                self.lbl_checks_echo.configure(
-                    text=self._format_checks_summary(snap.parameter_checks, "auto")
-                )
+                cfg(self.lbl_checks_echo, text=self._format_checks_summary(snap.parameter_checks, "auto"))
 
         # Update KPI chips
         kpi = snap.kpi
         if kpi:
-            self.kpi_cp.configure(text=f"{kpi.get('running_cp', 0.0):.4f}")
+            cfg(self.kpi_cp, text=f"{kpi.get('running_cp', 0.0):.4f}")
             dcp = kpi.get("dcp_prev", 0.0)
-            self.kpi_dcp.configure(text=f"{dcp * 100.0:+.2f}%")
-            self.kpi_stable.configure(text=f"{kpi.get('stable_n', 0)} revs")
-            self.kpi_peak.configure(text=f"{kpi.get('peak_torque', 0.0):.2f} N·m")
+            cfg(self.kpi_dcp, text=f"{dcp * 100.0:+.2f}%")
+            cfg(self.kpi_stable, text=f"{kpi.get('stable_n', 0)} revs")
+            cfg(self.kpi_peak, text=f"{kpi.get('peak_torque', 0.0):.2f} N·m")
             ct_val = kpi.get("ct")
-            self.kpi_ct.configure(text=f"{ct_val:.4f}" if ct_val is not None else "-")
-            self.kpi_ripple.configure(text=f"{kpi.get('ripple', 0.0) * 100.0:.1f}%")
+            cfg(self.kpi_ct, text=f"{ct_val:.4f}" if ct_val is not None else "-")
+            cfg(self.kpi_ripple, text=f"{kpi.get('ripple', 0.0) * 100.0:.1f}%")
 
             aitken = kpi.get("aitken_cp")
-            self.kpi_aitken.configure(text=f"{aitken:.4f}" if aitken is not None else "-")
+            cfg(self.kpi_aitken, text=f"{aitken:.4f}" if aitken is not None else "-")
             extra_r = kpi.get("extra_revs")
-            self.kpi_extra_revs.configure(text=f"+{extra_r} revs" if extra_r is not None else "-")
+            cfg(self.kpi_extra_revs, text=f"+{extra_r} revs" if extra_r is not None else "-")
 
             req_stable = 2
             if self.live_params is not None and self.live_params.n_stable is not None:
@@ -2759,13 +2810,13 @@ class LiveMonitorFrame(ctk.CTkFrame):
             except (ValueError, TypeError):
                 cur_stable = 0
             if cur_stable >= req_stable:
-                self.kpi_verdict.configure(text="STATUS: STABLE", text_color="#10B981")
+                cfg(self.kpi_verdict, text="STATUS: STABLE", text_color="#10B981")
                 if hasattr(self, "kpi_status_card"):
-                    self.kpi_status_card.configure(border_color=("#10B981", "#059669"))
+                    cfg(self.kpi_status_card, border_color=("#10B981", "#059669"))
             else:
-                self.kpi_verdict.configure(text="STATUS: NOT YET STABLE", text_color="#F59E0B")
+                cfg(self.kpi_verdict, text="STATUS: NOT YET STABLE", text_color="#F59E0B")
                 if hasattr(self, "kpi_status_card"):
-                    self.kpi_status_card.configure(border_color=("#F59E0B", "#B45309"))
+                    cfg(self.kpi_status_card, border_color=("#F59E0B", "#B45309"))
 
         # Update File Health List, Prior Run Link Card & Live Alerts Feed
         self._update_files_list(snap.file_stats)
@@ -2842,7 +2893,7 @@ class LiveMonitorFrame(ctk.CTkFrame):
             all_ok = n_f > 0 and all(st.status_color == "green" for st in stats.values())
             any_err = any(st.status_color == "red" for st in stats.values())
             b_col = "#EF4444" if any_err else ("#10B981" if all_ok else ("#F59E0B" if n_f > 0 else "gray"))
-            self.lbl_files_badge.configure(text=f"{n_f} file{'s' if n_f != 1 else ''}", text_color=b_col)
+            self._cfg_if_changed(self.lbl_files_badge, text=f"{n_f} file{'s' if n_f != 1 else ''}", text_color=b_col)
 
         # Remove widgets for roles no longer present
         current_roles = set(stats.keys())
@@ -2865,9 +2916,9 @@ class LiveMonitorFrame(ctk.CTkFrame):
 
             if role in self._file_row_widgets:
                 w = self._file_row_widgets[role]
-                w["dot"].configure(text_color=dot_col)
-                w["title"].configure(text=title_text)
-                w["sub"].configure(text=sub_text)
+                self._cfg_if_changed(w["dot"], text_color=dot_col)
+                self._cfg_if_changed(w["title"], text=title_text)
+                self._cfg_if_changed(w["sub"], text=sub_text)
             else:
                 added_new_row = True
                 row = ctk.CTkFrame(self.files_list_box, corner_radius=4, fg_color=("gray86", "gray16"))
@@ -3202,6 +3253,7 @@ class LiveMonitorFrame(ctk.CTkFrame):
         self._last_rendered_graph_state = None
         self._refresh_pending = False
         self.latest_snapshot = None
+        self._last_chart_snapshot = None
         if hasattr(self, "_probe_ui_cache"):
             self._probe_ui_cache.clear()
         if hasattr(self, "_saved_axis_limits"):
@@ -3311,6 +3363,7 @@ class LiveMonitorFrame(ctk.CTkFrame):
             self.is_paused = False
             self.time_until_refresh = self.refresh_interval_s
             self.worker.start()
+            self._ensure_monitor_timers()
         except Exception as exc:
             self.is_monitoring = False
             self.worker = None
@@ -3328,6 +3381,7 @@ class LiveMonitorFrame(ctk.CTkFrame):
         self.is_monitoring = False
         self.is_paused = False
         self._refresh_pending = False
+        self._stop_monitor_timers()
 
         if self.worker:
             self.worker.stop()
@@ -3411,6 +3465,7 @@ class LiveMonitorFrame(ctk.CTkFrame):
             self.is_paused = False
             self.time_until_refresh = self.refresh_interval_s
             self.worker.start()
+            self._ensure_monitor_timers()
 
             self.btn_toggle.configure(text="⏹ Stop Monitoring", fg_color=("#DC2626", "#B91C1C"), hover_color=("#B91C1C", "#991B1B"))
             self.btn_refresh_now.configure(state="normal")

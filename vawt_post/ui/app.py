@@ -186,8 +186,8 @@ class VAWTPostApp(ctk.CTk, TkinterDnD.DnDWrapper):  # type: ignore
             self.show()
             self.update()
 
-        # Start periodic queue polling
-        self.after(100, self._poll_queue)
+        # Track on-demand analysis queue polling (only runs while analysis worker is active)
+        self._poll_queue_after_id: Optional[str] = None
 
     def _report_startup(self, pct: int, message: str) -> None:
         if self._startup_progress is not None:
@@ -2051,6 +2051,8 @@ class VAWTPostApp(ctk.CTk, TkinterDnD.DnDWrapper):  # type: ignore
                 self.msg_queue.put(("error", f"{exc}\n{traceback.format_exc()}"))
 
         threading.Thread(target=worker, daemon=True).start()
+        if not getattr(self, "_poll_queue_after_id", None):
+            self._poll_queue_after_id = self.after(100, self._poll_queue)
 
     def _cancel_analysis(self):
         if self.is_running and self.cancel_event:
@@ -2149,6 +2151,7 @@ class VAWTPostApp(ctk.CTk, TkinterDnD.DnDWrapper):  # type: ignore
             messagebox.showerror("Diagnostics Failed", f"Could not write diagnostics: {exc}")
 
     def _poll_queue(self):
+        self._poll_queue_after_id = None
         if getattr(self, "_is_closing", False):
             return
         try:
@@ -2230,8 +2233,8 @@ class VAWTPostApp(ctk.CTk, TkinterDnD.DnDWrapper):  # type: ignore
         except Exception as exc:
             self._log(f"Queue poll warning: {exc}", "warn")
         finally:
-            if not getattr(self, "_is_closing", False):
-                self.after(100, self._poll_queue)
+            if not getattr(self, "_is_closing", False) and (self.is_running or not self.msg_queue.empty()):
+                self._poll_queue_after_id = self.after(100, self._poll_queue)
 
     def _log(self, msg: str, tag: Optional[str] = None):
         self.log_text.insert("end", msg + "\n", tag)
