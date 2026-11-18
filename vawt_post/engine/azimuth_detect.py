@@ -351,7 +351,27 @@ def detect_start_azimuth(
                             conf = "high" if stats["r1"] >= 0.45 else "medium"
                             signals["shift_error_deg"] = round(err_deg, 2)
 
-                            if abs(err_deg) > tolerance_deg:
+                            # Guard against high-TSR / shed-wake aerodynamic lag tripping false MEDIUM mid-spin alerts
+                            # when .cas.h5 mesh geometry already confirms t0 alignment or raw torque peak sits near 90 deg
+                            mesh_confirms_t0 = (
+                                not flow_mid_run
+                                and mesh_vs_t0 is not None
+                                and abs(mesh_vs_t0) <= 10.0
+                            )
+                            peak_err_deg = abs(wrap_deg_signed(90.0 - stats["theta_peak"]))
+                            small_aero_lag = (
+                                abs(err_deg) <= 40.0
+                                and peak_err_deg <= 22.0
+                                and stats["drag0_ratio"] <= 0.25
+                            )
+                            aero_lag_consistent = small_aero_lag and (stats["r1"] < 0.45 or mesh_confirms_t0)
+                            needs_midspin_corr = (
+                                abs(err_deg) > tolerance_deg
+                                and not (mesh_confirms_t0 and conf != "high")
+                                and not aero_lag_consistent
+                            )
+
+                            if needs_midspin_corr:
                                 flow_note = (
                                     f" File begins at t0={t0:.4f}s (step {step0})"
                                     if (flow_mid_run and t0 is not None)

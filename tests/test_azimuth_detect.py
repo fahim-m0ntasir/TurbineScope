@@ -261,8 +261,33 @@ def test_live_monitor_ui_alerts_panel_and_apply_theta0(tmp_path):
         lm._apply_detected_theta0()
         assert lm.live_params.theta0 == pytest.approx(130.0, abs=10.0)
 
+        # Click Ignore -> suppresses midspin banner & alert rows across subsequent refreshes
+        lm.midspin_banner.pack(fill="x", padx=10, pady=(0, 6))
+        lm._ignore_detected_theta0()
+        assert lm.midspin_banner.winfo_manager() == ""
+        lm._last_alerts_signature = None
+        lm._update_alerts_feed(snap)
+        assert lm.midspin_banner.winfo_manager() == ""
+
         # Clear hides current alerts cleanly
         lm._clear_alerts()
         assert int(lm.lbl_alerts_badge.cget("text")) == 0
     finally:
         app.destroy()
+
+
+def test_aero_lag_with_zero_mesh_does_not_false_flag_midspin():
+    """Asymmetric high-TSR 1P lag (~120 deg) with r1 < 0.45 and 0-deg mesh must NOT warn mid-spin."""
+    omega = 90.0
+    dt = (2.0 * math.pi / omega) / 360.0
+    steps = np.arange(0, 720)
+    t = steps * dt
+    th = omega * t
+    # Synthesize realistic asymmetric high-TSR curve: raw peak ~103 deg, 2nd harmonic skews 1P centroid ~120 deg with r1 < 0.45
+    m_b1 = 0.05 + 0.35 * np.sin(th - math.radians(30.0)) + 0.28 * np.sin(2.0 * (th - math.radians(55.0))) - 0.10 * np.cos(3.0 * th)
+    cas_zero = {"blade_centroids": [(0.0, 0.35)], "blade_zones": ["blade1"], "mom_center_x": 0.0, "mom_center_y": 0.0}
+    p = Params(U=7.0, omega=omega, R=0.35, chord=0.04, n_blades=3, dt=dt, theta0=0.0, rotation_dir="ccw", azimuth_zero="into_wind")
+
+    az_res = detect_start_azimuth(p, t=t, step=steps, m_b1=m_b1, apply_moment_sign=False, cas_info=cas_zero)
+    assert az_res.needs_correction is False
+    assert az_res.started_at_zero is True

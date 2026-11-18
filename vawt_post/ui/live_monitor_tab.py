@@ -472,6 +472,7 @@ class LiveMonitorFrame(ctk.CTkFrame):
         self._cleared_alert_seq: int = 0
         self._last_alerts_signature: Any = None
         self._recommended_theta0: Optional[float] = None
+        self._ignored_midspin_folders: set = set()
         self._last_rendered_graph_state: Any = None
         self._probe_artists: Dict[Any, Dict[str, Any]] = {}
         self._twin_axes: Dict[Any, Any] = {}
@@ -498,6 +499,9 @@ class LiveMonitorFrame(ctk.CTkFrame):
                 self.prior_source = saved.get("prior_source") or None
                 self.continuity_mode = str(saved.get("continuity_mode", "auto") or "auto")
                 self.autoscale_pref = bool(saved.get("autoscale", True))
+                raw_ignored = saved.get("ignored_midspin_folders")
+                if isinstance(raw_ignored, list):
+                    self._ignored_midspin_folders = {str(p) for p in raw_ignored if p}
                 if isinstance(saved.get("live_params"), dict):
                     try:
                         lp = saved["live_params"]
@@ -1321,8 +1325,10 @@ class LiveMonitorFrame(ctk.CTkFrame):
             wraplength=192,
         )
         self.lbl_midspin_msg.pack(fill="x", padx=8, pady=(5, 3))
+        midspin_btn_row = ctk.CTkFrame(self.midspin_banner, fg_color="transparent")
+        midspin_btn_row.pack(fill="x", padx=8, pady=(0, 6))
         self.btn_apply_theta0 = ctk.CTkButton(
-            self.midspin_banner,
+            midspin_btn_row,
             text="Apply Detected θ₀",
             height=22,
             corner_radius=5,
@@ -1332,7 +1338,20 @@ class LiveMonitorFrame(ctk.CTkFrame):
             text_color="#FFFFFF",
             command=self._apply_detected_theta0,
         )
-        self.btn_apply_theta0.pack(fill="x", padx=8, pady=(0, 6))
+        self.btn_apply_theta0.pack(side="left", fill="x", expand=True, padx=(0, 4))
+        self.btn_ignore_theta0 = ctk.CTkButton(
+            midspin_btn_row,
+            text="Ignore",
+            width=54,
+            height=22,
+            corner_radius=5,
+            font=ctk.CTkFont(size=10, weight="bold"),
+            fg_color=("gray82", "#334155"),
+            hover_color=("gray72", "#475569"),
+            text_color=("gray20", "#E2E8F0"),
+            command=self._ignore_detected_theta0,
+        )
+        self.btn_ignore_theta0.pack(side="right")
 
         # Feed list container
         self.alerts_feed_box = ctk.CTkFrame(
@@ -1379,6 +1398,25 @@ class LiveMonitorFrame(ctk.CTkFrame):
                 self.lbl_alerts_badge.configure(text="0", fg_color=("gray82", "#252B34"), text_color=("#64748B", "#9CA3AF"))
             self._render_empty_alerts_placeholder()
 
+    def _midspin_ignore_key(self) -> str:
+        folder = getattr(self, "custom_watch_folder", None)
+        if not folder:
+            return "__default__"
+        try:
+            return os.path.normcase(os.path.abspath(folder))
+        except Exception:
+            return str(folder)
+
+    def _ignore_detected_theta0(self):
+        """Suppress recurring mid-spin start alerts and banner for the current simulation folder."""
+        self._ignored_midspin_folders.add(self._midspin_ignore_key())
+        self._save_settings()
+        self._last_alerts_signature = None
+        if self.latest_snapshot is not None:
+            self._update_alerts_feed(self.latest_snapshot)
+        elif hasattr(self, "midspin_banner") and self.midspin_banner.winfo_manager():
+            self.midspin_banner.pack_forget()
+
     def _apply_detected_theta0(self):
         """Apply auto-detected Blade 1 start azimuth θ0 to active Live Monitor parameters."""
         if self._recommended_theta0 is None:
@@ -1395,6 +1433,7 @@ class LiveMonitorFrame(ctk.CTkFrame):
         if not hasattr(self, "alerts_feed_box"):
             return
 
+        midspin_ignored = self._midspin_ignore_key() in getattr(self, "_ignored_midspin_folders", set())
         alerts_all = list(snap.alerts) if (snap and snap.alerts) else []
         has_seq = any(a.get("seq") is not None for a in alerts_all)
         if has_seq:
@@ -1403,10 +1442,17 @@ class LiveMonitorFrame(ctk.CTkFrame):
             if len(alerts_all) < self._cleared_alert_count:
                 self._cleared_alert_count = 0
             visible = alerts_all[self._cleared_alert_count:]
+        if midspin_ignored:
+            visible = [a for a in visible if a.get("key") != "midspin_detected"]
         recent = list(reversed(visible))[:12]
 
         saz = snap.start_azimuth if (snap and isinstance(snap.start_azimuth, dict)) else None
-        needs_corr = bool(saz and saz.get("needs_correction") and saz.get("recommended_theta0_deg") is not None)
+        needs_corr = bool(
+            not midspin_ignored
+            and saz
+            and saz.get("needs_correction")
+            and saz.get("recommended_theta0_deg") is not None
+        )
         rec_deg = float(saz["recommended_theta0_deg"]) if (needs_corr and saz is not None) else None
         self._recommended_theta0 = rec_deg
         midspin_sig = (needs_corr, round(rec_deg, 1) if rec_deg is not None else None)
@@ -3549,6 +3595,7 @@ class LiveMonitorFrame(ctk.CTkFrame):
                     "continuity_mode": self.continuity_mode,
                     "live_params": lp_dict,
                     "manual_params_override": self._manual_params_override,
+                    "ignored_midspin_folders": sorted(self._ignored_midspin_folders)[-20:],
                 }
                 self.app.config_mgr.set_live_settings(cfg)
             except Exception as e:
