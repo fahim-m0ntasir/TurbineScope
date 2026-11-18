@@ -822,6 +822,95 @@ def test_qtimer_after_cleanup_and_idle_live_monitor(tmp_path):
         app.destroy()
 
 
+def test_kpi_and_status_recover_after_session_reset():
+    """Verify _reset_session_views resets all KPI fields cleanly and identical replay repopulates them."""
+    from vawt_post.engine.live_monitor import LiveMonitorSnapshot, LiveFileStats
+    from vawt_post.ui.app import VAWTPostApp
+
+    app = VAWTPostApp()
+    try:
+        lm = app.live_monitor_frame
+        snap = LiveMonitorSnapshot(
+            status="Monitoring",
+            is_full_refresh=True,
+            current_step=3800,
+            current_time=0.5081,
+            dt_seconds=9.696e-5,
+            stages=[
+                {
+                    "stage_index": 1,
+                    "step_from": 0,
+                    "step_to": 1440,
+                    "t_from": 0.0,
+                    "t_to": 0.2793,
+                    "n_steps": 1440,
+                    "dt": 1.9393e-4,
+                    "deg_per_step": 1.0,
+                    "steps_per_rev": 360.0,
+                    "revolutions": 4.0,
+                },
+                {
+                    "stage_index": 2,
+                    "step_from": 1440,
+                    "step_to": 3800,
+                    "t_from": 0.2793,
+                    "t_to": 0.5081,
+                    "n_steps": 2360,
+                    "dt": 9.696e-5,
+                    "deg_per_step": 0.5,
+                    "steps_per_rev": 720.0,
+                    "revolutions": 3.28,
+                },
+            ],
+            file_stats={
+                "total": LiveFileStats(
+                    role="total", filename="moment-rfile.out", status_color="green",
+                    row_count=3801, last_step=3800, last_flow_time=0.5081, age_seconds=1.0,
+                )
+            },
+            kpi={
+                "running_cp": 0.3462,
+                "dcp_prev": -0.015,
+                "stable_n": 1,
+                "peak_torque": 1.12,
+                "ct": 1.25,
+                "ripple": 0.85,
+                "aitken_cp": 0.3432,
+                "extra_revs": 2,
+            },
+        )
+
+        # Pass 1 populates KPI and status badges
+        lm._update_telemetry(snap)
+        assert lm.kpi_cp.text() == "0.3462"
+        assert lm.kpi_aitken.text() == "0.3432"
+        assert lm.kpi_extra_revs.text() == "+2 revs"
+        assert lm.kpi_verdict.text() == "STATUS: NOT YET STABLE"
+        assert lm.lbl_files_badge.text() == "1 file"
+        assert "Stage 2/2" in lm.lbl_dt.text()
+
+        # Reset clears all KPIs including Aitken and extra_revs
+        lm._reset_session_views()
+        assert lm.kpi_cp.text() == "-"
+        assert lm.kpi_aitken.text() == "-"
+        assert lm.kpi_extra_revs.text() == "-"
+        assert lm.kpi_verdict.text() == "STATUS: WAITING"
+        assert lm.lbl_files_badge.text() == "0 files"
+        assert lm.lbl_dt.text() == "Δt: -"
+
+        # Pass 2 with identical snapshot must repopulate every single field (no stale cache lock)
+        lm._update_telemetry(snap)
+        assert lm.kpi_cp.text() == "0.3462"
+        assert lm.kpi_aitken.text() == "0.3432"
+        assert lm.kpi_extra_revs.text() == "+2 revs"
+        assert lm.kpi_verdict.text() == "STATUS: NOT YET STABLE"
+        assert lm.lbl_files_badge.text() == "1 file"
+        assert "Stage 2/2" in lm.lbl_dt.text()
+    finally:
+        app.destroy()
+
+
+
 
 
 

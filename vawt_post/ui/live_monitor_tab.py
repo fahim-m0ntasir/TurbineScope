@@ -2627,16 +2627,15 @@ class LiveMonitorFrame(ctk.CTkFrame):
 
     @staticmethod
     def _cfg_if_changed(widget: Any, **kwargs: Any) -> bool:
-        """Configure widget only with properties whose values changed since last call."""
-        cache = getattr(widget, "_lm_cfg_cache", None)
-        if cache is None:
-            cache = {}
-            setattr(widget, "_lm_cfg_cache", cache)
-        diff = {k: v for k, v in kwargs.items() if k not in cache or cache[k] != v}
-        if not diff:
-            return False
-        cache.update(diff)
-        widget.configure(**diff)
+        """Configure widget only with properties that differ from its live _props."""
+        props = getattr(widget, "_props", None)
+        if isinstance(props, dict):
+            diff = {k: v for k, v in kwargs.items() if k not in props or props[k] != v}
+            if not diff:
+                return False
+            widget.configure(**diff)
+            return True
+        widget.configure(**kwargs)
         return True
 
     def _countdown_tick(self):
@@ -3328,6 +3327,7 @@ class LiveMonitorFrame(ctk.CTkFrame):
         if hasattr(self, "lbl_current_phase"):
             self.lbl_current_phase.configure(text="P1: -", text_color="gray")
         if hasattr(self, "lbl_dt") and hasattr(self.lbl_dt, "setToolTip"):
+            self._lm_last_dt_tip = "Time Step Size (Δt)"
             self.lbl_dt.setToolTip("Time Step Size (Δt)")
         if hasattr(self, "kpi_cp"):
             self.kpi_cp.configure(text="-")
@@ -3336,7 +3336,11 @@ class LiveMonitorFrame(ctk.CTkFrame):
             self.kpi_peak.configure(text="-")
             self.kpi_ct.configure(text="-")
             self.kpi_ripple.configure(text="-")
+            self.kpi_aitken.configure(text="-")
+            self.kpi_extra_revs.configure(text="-")
             self.kpi_verdict.configure(text="STATUS: WAITING", text_color="gray")
+            if hasattr(self, "kpi_status_card"):
+                self.kpi_status_card.configure(border_color=("#CBD5E1", "#334155"))
         self._render_empty_alerts_placeholder()
         self._hide_all_probes(redraw=False)
         if hasattr(self, "fig") and hasattr(self, "_rebuild_plot_axes"):
