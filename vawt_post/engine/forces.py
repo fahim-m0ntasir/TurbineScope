@@ -70,7 +70,7 @@ def compute_blade_kinematics(
 
     # Dynamic stall indicators (based on geometric stall exceedance)
     is_deep_stall = np.abs(alpha) >= static_stall_deg
-    stall_fraction_pct = float(np.mean(is_deep_stall) * 100.0)
+    stall_fraction_pct = float(np.mean(is_deep_stall) * 100.0) if len(is_deep_stall) > 0 else 0.0
 
     # First azimuth angle in [0, 180) where geometric stall is exceeded
     upwind_mask = (th >= 0.0) & (th < 180.0)
@@ -180,47 +180,50 @@ def plot_hysteresis_loop(
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
     fig, ax = plt.subplots(figsize=(8, 5.5), dpi=300, layout="constrained")
+    try:
+        alpha = np.asarray(alpha, dtype=float)
+        y_coeff = np.asarray(y_coeff, dtype=float)
+        theta = np.asarray(theta, dtype=float)
+        valid = np.isfinite(alpha) & np.isfinite(y_coeff) & np.isfinite(theta)
+        alpha_v, y_v, theta_v = alpha[valid], y_coeff[valid], theta[valid]
+        if len(alpha_v) >= 2:
+            # Create colored line segments by azimuth
+            points = np.array([alpha_v, y_v]).T.reshape(-1, 1, 2)
+            segments = np.concatenate([points[:-1], points[1:]], axis=1)
 
-    alpha = np.asarray(alpha, dtype=float)
-    y_coeff = np.asarray(y_coeff, dtype=float)
-    theta = np.asarray(theta, dtype=float)
-    if len(alpha) >= 2:
-        # Create colored line segments by azimuth
-        points = np.array([alpha, y_coeff]).T.reshape(-1, 1, 2)
-        segments = np.concatenate([points[:-1], points[1:]], axis=1)
+            norm = Normalize(0.0, 360.0)
+            lc = LineCollection(list(segments), cmap="twilight", norm=norm, linewidth=2.4)
+            lc.set_array(theta_v[:-1])
+            line = ax.add_collection(lc)
 
-        norm = Normalize(0.0, 360.0)
-        lc = LineCollection(list(segments), cmap="twilight", norm=norm, linewidth=2.4)
-        lc.set_array(theta[:-1])
-        line = ax.add_collection(lc)
+            # Plot start marker at theta=0
+            ax.plot(alpha_v[0], y_v[0], "ko", markersize=6, label="$\\theta = 0^\\circ$")
 
-        # Plot start marker at theta=0
-        ax.plot(alpha[0], y_coeff[0], "ko", markersize=6, label="$\\theta = 0^\\circ$")
+            cbar = fig.colorbar(line, ax=ax, pad=0.03)
+            cbar.set_label("Rotor Azimuth $\\theta$ (deg)", fontsize=10, fontweight="bold")
+            cbar.set_ticks([0, 90, 180, 270, 360])
 
-        cbar = fig.colorbar(line, ax=ax, pad=0.03)
-        cbar.set_label("Rotor Azimuth $\\theta$ (deg)", fontsize=10, fontweight="bold")
-        cbar.set_ticks([0, 90, 180, 270, 360])
+            pad_x = max(2.0, float(np.max(alpha_v) - np.min(alpha_v)) * 0.08)
+            pad_y = max(0.05, float(np.max(y_v) - np.min(y_v)) * 0.08)
+            ax.set_xlim(min(-static_stall_deg * 1.15, float(np.min(alpha_v)) - pad_x), max(static_stall_deg * 1.15, float(np.max(alpha_v)) + pad_x))
+            ax.set_ylim(float(np.min(y_v)) - pad_y, float(np.max(y_v)) + pad_y)
+        else:
+            ax.set_xlim(-static_stall_deg * 1.5, static_stall_deg * 1.5)
+            ax.set_ylim(-0.5, 0.5)
 
-        pad_x = max(2.0, float(np.max(alpha) - np.min(alpha)) * 0.08)
-        pad_y = max(0.05, float(np.max(y_coeff) - np.min(y_coeff)) * 0.08)
-        ax.set_xlim(min(-static_stall_deg * 1.15, float(np.min(alpha)) - pad_x), max(static_stall_deg * 1.15, float(np.max(alpha)) + pad_x))
-        ax.set_ylim(float(np.min(y_coeff)) - pad_y, float(np.max(y_coeff)) + pad_y)
-    else:
-        ax.set_xlim(-static_stall_deg * 1.5, static_stall_deg * 1.5)
-        ax.set_ylim(-0.5, 0.5)
+        # Static stall threshold lines
+        ax.axvline(static_stall_deg, color="#DC2626", linestyle="--", linewidth=1.4, alpha=0.8, label=f"Static Stall ($\\pm{static_stall_deg:g}^\\circ$)")
+        ax.axvline(-static_stall_deg, color="#DC2626", linestyle="--", linewidth=1.4, alpha=0.8)
 
-    # Static stall threshold lines
-    ax.axvline(static_stall_deg, color="#DC2626", linestyle="--", linewidth=1.4, alpha=0.8, label=f"Static Stall ($\\pm{static_stall_deg:g}^\\circ$)")
-    ax.axvline(-static_stall_deg, color="#DC2626", linestyle="--", linewidth=1.4, alpha=0.8)
+        ax.set_xlabel("Geometric Angle of Attack $\\alpha$ (deg)", fontsize=11, fontweight="bold")
+        ax.set_ylabel(ylabel, fontsize=11, fontweight="bold")
+        ax.set_title(title, fontsize=12, fontweight="bold", pad=12)
+        ax.grid(True, linestyle="--", alpha=0.6)
+        ax.legend(loc="upper left", frameon=True, fontsize=9)
 
-    ax.set_xlabel("Geometric Angle of Attack $\\alpha$ (deg)", fontsize=11, fontweight="bold")
-    ax.set_ylabel(ylabel, fontsize=11, fontweight="bold")
-    ax.set_title(title, fontsize=12, fontweight="bold", pad=12)
-    ax.grid(True, linestyle="--", alpha=0.6)
-    ax.legend(loc="upper left", frameon=True, fontsize=9)
-
-    fig.savefig(filepath)
-    plt.close(fig)
+        fig.savefig(filepath)
+    finally:
+        plt.close(fig)
     return filepath
 
 
@@ -233,44 +236,48 @@ def plot_dynamic_stall_aids(
     out_dir = os.path.dirname(os.path.abspath(filepath))
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
-    th = kin["theta"]
-    alpha = kin["alpha"]
-    k_red = kin["k_reduced"]
+    th = np.asarray(kin["theta"], dtype=float)
+    alpha = np.asarray(kin["alpha"], dtype=float)
+    k_red = np.asarray(kin["k_reduced"], dtype=float)
+    cm_arr = np.asarray(Cm, dtype=float)
     stall_angle = kin["static_stall_deg"]
 
     fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(8.5, 7.5), dpi=300, sharex=True, layout="constrained")
+    try:
+        # Panel 1: Angle of attack vs azimuth with shaded stall band
+        ax1.plot(th, alpha, color="#1F3864", linewidth=2.0, label="Geometric $\\alpha(\\theta)$")
+        ax1.axhline(stall_angle, color="#DC2626", linestyle="--", linewidth=1.2, label=f"Static Stall limit $\\pm{stall_angle:g}^\\circ$")
+        ax1.axhline(-stall_angle, color="#DC2626", linestyle="--", linewidth=1.2)
+        ax1.fill_between(th, stall_angle, alpha, where=(alpha > stall_angle), color="#FEE2E2", alpha=0.7, label="Deep Stall Region")
+        ax1.fill_between(th, -stall_angle, alpha, where=(alpha < -stall_angle), color="#FEE2E2", alpha=0.7)
+        ax1.set_ylabel("AoA $\\alpha$ (deg)", fontsize=10, fontweight="bold")
+        ax1.set_title(
+            f"Dynamic Stall Aerodynamics (Deep Stall Duration: {kin['stall_fraction_pct']:.1f}% of rotation)",
+            fontsize=12, fontweight="bold"
+        )
+        ax1.grid(True, linestyle="--", alpha=0.5)
+        ax1.legend(loc="upper right", frameon=True, fontsize=8)
 
-    # Panel 1: Angle of attack vs azimuth with shaded stall band
-    ax1.plot(th, alpha, color="#1F3864", linewidth=2.0, label="Geometric $\\alpha(\\theta)$")
-    ax1.axhline(stall_angle, color="#DC2626", linestyle="--", linewidth=1.2, label=f"Static Stall limit $\\pm{stall_angle:g}^\\circ$")
-    ax1.axhline(-stall_angle, color="#DC2626", linestyle="--", linewidth=1.2)
-    ax1.fill_between(th, stall_angle, alpha, where=(alpha > stall_angle), color="#FEE2E2", alpha=0.7, label="Deep Stall Region")
-    ax1.fill_between(th, -stall_angle, alpha, where=(alpha < -stall_angle), color="#FEE2E2", alpha=0.7)
-    ax1.set_ylabel("AoA $\\alpha$ (deg)", fontsize=10, fontweight="bold")
-    ax1.set_title(
-        f"Dynamic Stall Aerodynamics (Deep Stall Duration: {kin['stall_fraction_pct']:.1f}% of rotation)",
-        fontsize=12, fontweight="bold"
-    )
-    ax1.grid(True, linestyle="--", alpha=0.5)
-    ax1.legend(loc="upper right", frameon=True, fontsize=8)
+        # Panel 2: Moment coefficient vs azimuth with shaded stall band
+        ax2.plot(th, cm_arr, color="#059669", linewidth=2.0, label="Blade $C_m(\\theta)$")
+        fin_cm = cm_arr[np.isfinite(cm_arr)]
+        if len(fin_cm) > 0 and len(th) == len(alpha):
+            ax2.fill_between(th, float(np.min(fin_cm)), float(np.max(fin_cm)), where=(np.abs(alpha) > stall_angle), color="#FEE2E2", alpha=0.45, label="Stall Phase")
+        ax2.set_ylabel("Blade $C_m$", fontsize=10, fontweight="bold")
+        ax2.grid(True, linestyle="--", alpha=0.5)
+        ax2.legend(loc="upper right", frameon=True, fontsize=8)
 
-    # Panel 2: Moment coefficient vs azimuth with shaded stall band
-    ax2.plot(th, Cm, color="#059669", linewidth=2.0, label="Blade $C_m(\\theta)$")
-    ax2.fill_between(th, np.min(Cm), np.max(Cm), where=(np.abs(alpha) > stall_angle), color="#FEE2E2", alpha=0.45, label="Stall Phase")
-    ax2.set_ylabel("Blade $C_m$", fontsize=10, fontweight="bold")
-    ax2.grid(True, linestyle="--", alpha=0.5)
-    ax2.legend(loc="upper right", frameon=True, fontsize=8)
+        # Panel 3: Reduced frequency k vs azimuth
+        ax3.plot(th, k_red, color="#7C3AED", linewidth=2.0, label="Reduced Freq $k = \\omega c / 2W$")
+        ax3.axhline(0.05, color="#D97706", linestyle=":", linewidth=1.5, label="Unsteady threshold ($k = 0.05$)")
+        ax3.axhline(0.20, color="#DC2626", linestyle="--", linewidth=1.5, label="Strongly unsteady ($k = 0.20$)")
+        ax3.set_xlabel("Rotor Azimuth $\\theta$ (deg)", fontsize=11, fontweight="bold")
+        ax3.set_ylabel("Reduced Freq $k$", fontsize=10, fontweight="bold")
+        ax3.set_xlim(0, 360)
+        ax3.grid(True, linestyle="--", alpha=0.5)
+        ax3.legend(loc="upper right", frameon=True, fontsize=8)
 
-    # Panel 3: Reduced frequency k vs azimuth
-    ax3.plot(th, k_red, color="#7C3AED", linewidth=2.0, label="Reduced Freq $k = \\omega c / 2W$")
-    ax3.axhline(0.05, color="#D97706", linestyle=":", linewidth=1.5, label="Unsteady threshold ($k = 0.05$)")
-    ax3.axhline(0.20, color="#DC2626", linestyle="--", linewidth=1.5, label="Strongly unsteady ($k = 0.20$)")
-    ax3.set_xlabel("Rotor Azimuth $\\theta$ (deg)", fontsize=11, fontweight="bold")
-    ax3.set_ylabel("Reduced Freq $k$", fontsize=10, fontweight="bold")
-    ax3.set_xlim(0, 360)
-    ax3.grid(True, linestyle="--", alpha=0.5)
-    ax3.legend(loc="upper right", frameon=True, fontsize=8)
-
-    fig.savefig(filepath)
-    plt.close(fig)
+        fig.savefig(filepath)
+    finally:
+        plt.close(fig)
     return filepath

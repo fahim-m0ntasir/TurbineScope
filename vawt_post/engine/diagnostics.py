@@ -22,7 +22,7 @@ from typing import Dict, List, Optional, Tuple, Any
 import numpy as np
 
 from vawt_post.engine.config import Params, InputFiles
-from vawt_post.engine.parser import inspect_fluent_report, read_fluent_report
+from vawt_post.engine.parser import inspect_fluent_report, parse_report_filename_role, read_fluent_report
 
 
 @dataclass
@@ -108,7 +108,6 @@ def scan_folder_candidates(folder: str, n_blades: int) -> Dict[str, List[Dict[st
     fy_shaft_candidates = []
 
     for fpath in files:
-        fname = os.path.basename(fpath).lower()
         try:
             st = os.stat(fpath)
             sz = st.st_size
@@ -138,28 +137,23 @@ def scan_folder_candidates(folder: str, n_blades: int) -> Dict[str, List[Dict[st
             "last_step": last_step,
         }
 
-        # Skip non-dimensional coefficient files from physical monitor roles
-        if any(tok in fname for tok in ("-cd", "_cd", ".cd", "drag-coeff", "lift-coeff", "-cl", "_cl", ".cl")):
+        # Match roles via unified filename classifier (prevents per-blade force files or airfoil1 colliding)
+        role_cls, b_idx_cls, _ = parse_report_filename_role(os.path.basename(fpath), n_blades=n_blades)
+        if role_cls == "coefficient":
             continue
-
-        # Match roles
-        m = re.search(r"(?:moment|blade|torque)[_-]?(\d+)", fname)
-        if "shaft" in fname and any(k in fname for k in ("force_shaftx", "shaftx", "shaft_x", "shaft-x", "fx_shaft", "fx-shaft")):
+        elif role_cls == "shaft_fx":
             fx_shaft_candidates.append(item)
-        elif "shaft" in fname and any(k in fname for k in ("force_shafty", "shafty", "shaft_y", "shaft-y", "fy_shaft", "fy-shaft")):
+        elif role_cls == "shaft_fy":
             fy_shaft_candidates.append(item)
-        elif "shaft" in fname and any(k in fname for k in ("moment", "torque", "cm")) and not any(f in fname for f in ("force", "fx", "fy")):
+        elif role_cls == "shaft_moment":
             shaft_candidates.append(item)
-        elif "shaft" not in fname and ("forcex" in fname or "force-x" in fname or "force_x" in fname or fname.startswith("fx") or "thrust" in fname) and not ("drag" in fname or "cd" in fname):
+        elif role_cls == "fx":
             fx_candidates.append(item)
-        elif "shaft" not in fname and ("forcey" in fname or "force-y" in fname or "force_y" in fname or fname.startswith("fy") or "side" in fname) and not ("lift" in fname or "cl" in fname):
+        elif role_cls == "fy":
             fy_candidates.append(item)
-        elif m and 1 <= int(m.group(1)) <= n_blades:
-            b_idx = int(m.group(1)) - 1
-            blade_candidates[b_idx].append(item)
-        elif ("total" in fname and ("moment" in fname or "torque" in fname)) or fname in ("moment-rfile.out", "moment.out", "torque.out", "total-moment.out"):
-            total_candidates.append(item)
-        elif ("moment" in fname or "torque" in fname) and not m and "shaft" not in fname:
+        elif role_cls == "blade_moment" and b_idx_cls is not None and 1 <= b_idx_cls <= n_blades:
+            blade_candidates[b_idx_cls - 1].append(item)
+        elif role_cls == "total_moment":
             total_candidates.append(item)
 
     if len(total_candidates) > 1:
@@ -392,7 +386,7 @@ def run_file_health_diagnostics(
                 if not s or s.startswith("#"):
                     continue
                 toks = s.replace("(", " ").replace(")", " ").replace(",", " ").split()
-                if not toks:
+                if len(toks) < 2:
                     continue
                 try:
                     _ = [float(x) for x in toks]
@@ -849,7 +843,7 @@ def run_file_health_diagnostics(
             val_std = float(np.std(val))
             if val_std < 1e-8:
                 report.add(DiagnosticFinding(
-                    severity="ERROR" if "moment" in role or "blade" in role else "WARNING",
+                    severity="ERROR" if (role == "total" or "moment" in role or "blade" in role) else "WARNING",
                     file=role,
                     check="Flat or dead signal",
                     location=f"Steps {step[0]}–{step[-1]}",
@@ -948,11 +942,13 @@ def run_file_health_diagnostics(
             dt_series = np.diff(t_ref)
             dstep_series = np.diff(s_ref)
 
-            # Filter out step gaps when analyzing dt changes
-            valid_dt_mask = (dstep_series == 1) & (dt_series > 0)
+            # Filter out step regressions/zeroes and normalize per-step dt (supports stride > 1 and multi-stage)
+            valid_dt_mask = (dstep_series > 0) & (dt_series > 0)
             if np.any(valid_dt_mask):
-                valid_dts = dt_series[valid_dt_mask]
-                dt_median = float(np.median(valid_dts))
+                valid_dts = dt_series[valid_dt_mask] / dstep_series[valid_dt_mask]
+                # Use the active/final stage tail so coarse startup stages don't falsely warn fine production stages
+                tail_n = min(len(valid_dts), max(20, len(valid_dts) // 4))
+                dt_median = float(np.median(valid_dts[-tail_n:]))
 
                 if p.omega is not None and p.omega > 0:
                     omega_val = p.omega
@@ -1102,34 +1098,38 @@ def run_file_health_diagnostics(
         if omega_val is not None and omega_val > 0:
             A_ref = 2.0 * p.R * p.depth
             P_ref = 0.5 * p.rho * (p.U ** 3) * A_ref
+            if P_ref <= 1e-12:
+                P_ref = 0.0
 
-            if "total" in parsed_files:
-                m_mean = float(np.mean(parsed_files["total"]["value"]))
-            else:
-                m_mean = float(sum(np.mean(parsed_files[b]["value"]) for b in present_blades))
+            if P_ref > 0.0:
+                if "total" in parsed_files:
+                    m_mean = float(np.mean(parsed_files["total"]["value"]))
+                else:
+                    m_mean = float(sum(np.mean(parsed_files[b]["value"]) for b in present_blades))
 
-            # Apply sign
-            sign_val = -1.0 if getattr(p, "rotation_dir", "ccw") == "cw" else 1.0
-            cp_est = sign_val * omega_val * m_mean / P_ref
+                # Apply sign (honoring explicit p.moment_sign override if set)
+                from vawt_post.engine.azimuth_detect import effective_moment_sign
+                sign_val = effective_moment_sign(p)
+                cp_est = sign_val * omega_val * m_mean / P_ref
 
-            if abs(cp_est) > 1.0:
-                report.add(DiagnosticFinding(
-                    severity="WARNING",
-                    file="total",
-                    check="Unphysical Cp magnitude",
-                    location="Aerodynamic scaling",
-                    explanation=f"Estimated |Cp| = {abs(cp_est):.3f} > 1.0. Turbine cannot extract more than 100% of kinetic flux.",
-                    suggested_fix="Check reference parameters (U, R, depth, rho) or monitor moment axis.",
-                ))
-            elif cp_est > 0.593:
-                report.add(DiagnosticFinding(
-                    severity="WARNING",
-                    file="total",
-                    check="Cp exceeds Betz limit",
-                    location="Aerodynamic scaling",
-                    explanation=f"Estimated Cp = {cp_est:.3f} exceeds theoretical Betz limit (0.593 for 1D actuator disk).",
-                    suggested_fix="Notice: Verify tip speed ratio, reference velocity, or blockage effects.",
-                ))
+                if abs(cp_est) > 1.0:
+                    report.add(DiagnosticFinding(
+                        severity="WARNING",
+                        file="total",
+                        check="Unphysical Cp magnitude",
+                        location="Aerodynamic scaling",
+                        explanation=f"Estimated |Cp| = {abs(cp_est):.3f} > 1.0. Turbine cannot extract more than 100% of kinetic flux.",
+                        suggested_fix="Check reference parameters (U, R, depth, rho) or monitor moment axis.",
+                    ))
+                elif cp_est > 0.593:
+                    report.add(DiagnosticFinding(
+                        severity="WARNING",
+                        file="total",
+                        check="Cp exceeds Betz limit",
+                        location="Aerodynamic scaling",
+                        explanation=f"Estimated Cp = {cp_est:.3f} exceeds theoretical Betz limit (0.593 for 1D actuator disk).",
+                        suggested_fix="Notice: Verify tip speed ratio, reference velocity, or blockage effects.",
+                    ))
 
     # Check 15: Rotor-speed check (Harmonics on total torque & fundamental f0 on blade torque)
     try:
@@ -1370,6 +1370,9 @@ def reconstruct_missing_blade(
     if shaft_data:
         c_steps &= set(shaft_data["step"].tolist())
 
+    if not c_steps:
+        raise ValueError("Cannot reconstruct missing blade: no common time steps found across input files.")
+
     c_arr = np.array(sorted(c_steps), dtype=np.int64)
     p_tot = _map_step_positions(total_data["step"], c_arr)
     steps = c_arr
@@ -1384,16 +1387,20 @@ def reconstruct_missing_blade(
         p_sh = _map_step_positions(shaft_data["step"], c_arr)
         vals -= shaft_data["value"][p_sh]
 
-    # Write reconstructed report file
+    # Write reconstructed report file (2-column when inputs lack flow-time so align_series preserves dt fallback)
     os.makedirs(output_dir, exist_ok=True)
     out_name = f"reconstructed_blade_{missing_blade_idx + 1}_moment.out"
     out_path = os.path.join(output_dir, out_name)
 
     with open(out_path, "w", encoding="utf-8") as fh:
-        fh.write(f'("Time Step" "reconstructed_moment_blade_{missing_blade_idx + 1}" "flow-time")\n')
-        for i in range(len(steps)):
-            t_str = f"{times[i]:.6e}" if times is not None else "0.0"
-            fh.write(f"{steps[i]} {vals[i]:.6e} {t_str}\n")
+        if times is not None:
+            fh.write(f'("Time Step" "reconstructed_moment_blade_{missing_blade_idx + 1}" "flow-time")\n')
+            for i in range(len(steps)):
+                fh.write(f"{steps[i]} {vals[i]:.6e} {times[i]:.6e}\n")
+        else:
+            fh.write(f'("Time Step" "reconstructed_moment_blade_{missing_blade_idx + 1}")\n')
+            for i in range(len(steps)):
+                fh.write(f"{steps[i]} {vals[i]:.6e}\n")
 
     return out_path
 

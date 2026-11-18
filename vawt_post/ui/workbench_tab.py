@@ -749,6 +749,13 @@ class WorkbenchStudioFrame(ctk.CTkFrame):
             blade_list = list(s.blade_moment_files or [])
             for i in range(len(self.app.v_blades)):
                 self.app.v_blades[i].set(blade_list[i] if i < len(blade_list) else "")
+            for attr_list in ("v_fx_blades", "v_fy_blades"):
+                for var in getattr(self.app, attr_list, []):
+                    var.set("")
+            if hasattr(self.app, "v_prior_source"):
+                self.app.v_prior_source.set("")
+                if hasattr(self.app, "_on_prior_changed"):
+                    self.app._on_prior_changed(run_diag=False)
 
             # 3. Update case metadata
             self.app.v_meta_cells.set(str(s.cell_count) if s.cell_count is not None else "")
@@ -793,8 +800,8 @@ class WorkbenchStudioFrame(ctk.CTkFrame):
             stable_tol=5.0,
             n_stable=2,
         )
-        if hasattr(self.app, "page_live") and hasattr(self.app.page_live, "monitor_fluent_run"):
-            self.app.page_live.monitor_fluent_run(watch_folder, p=p)
+        if hasattr(self.app, "live_monitor_frame") and hasattr(self.app.live_monitor_frame, "monitor_fluent_run"):
+            self.app.live_monitor_frame.monitor_fluent_run(watch_folder, p=p)
             self.app._switch_page("live")
         else:
             messagebox.showinfo("Live Monitor", f"Configured live monitor for system '{s.system_id}'.")

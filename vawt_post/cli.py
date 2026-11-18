@@ -15,12 +15,14 @@ from vawt_post.engine.config import Params, InputFiles, ConfigManager, FLUENT_DE
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-    if sys.platform == "win32":
+    if sys.platform == "win32" and (sys.stdout is None or sys.stderr is None):
         try:
             import ctypes
             if ctypes.windll.kernel32.AttachConsole(-1):
-                sys.stdout = open("CONOUT$", "w", encoding="utf-8", errors="replace")
-                sys.stderr = open("CONOUT$", "w", encoding="utf-8", errors="replace")
+                if sys.stdout is None:
+                    sys.stdout = open("CONOUT$", "w", encoding="utf-8", errors="replace")
+                if sys.stderr is None:
+                    sys.stderr = open("CONOUT$", "w", encoding="utf-8", errors="replace")
         except Exception:
             pass
 
@@ -42,23 +44,23 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--out", type=str, default="results", help="Output directory")
     parser.add_argument("--prefix", type=str, default="VAWT_analysis", help="Output filename prefix")
 
-    # Turbine & Operating Parameters
-    parser.add_argument("--U", type=float, default=8.0, help="Free-stream speed (m/s)")
-    parser.add_argument("--tsr", type=float, default=3.5, help="Tip speed ratio lambda (-)")
-    parser.add_argument("--omega", type=float, help="Rotor speed (rad/s); recomputes lambda")
-    parser.add_argument("--R", type=float, default=0.5, help="Rotor radius (m)")
-    parser.add_argument("--chord", type=float, default=0.06, help="Blade chord (m)")
-    parser.add_argument("--blades", type=int, default=3, help="Number of blades (1 to 8)")
-    parser.add_argument("--depth", type=float, default=FLUENT_DEFAULTS["depth"], help="2D depth reference (m)")
-    parser.add_argument("--rho", type=float, default=FLUENT_DEFAULTS["rho"], help="Density (kg/m³)")
-    parser.add_argument("--mu", type=float, default=FLUENT_DEFAULTS["mu"], help="Viscosity (Pa·s)")
-    parser.add_argument("--theta0", type=float, default=0.0, help="Blade 1 azimuth at t=0 (deg)")
-    parser.add_argument("--offsets", choices=["auto", "even"], default="auto", help="Blade phasing mode")
-    parser.add_argument("--sign", choices=["auto", "+1", "-1"], default="auto", help="Moment sign mode")
-    parser.add_argument("--tol", type=float, default=5.0, help="Stability tolerance (%% Cp change)")
-    parser.add_argument("--nstable", type=int, default=2, help="Number of trailing revolutions to report")
-    parser.add_argument("--bin", type=float, default=1.0, help="Azimuth bin width (deg)")
-    parser.add_argument("--dt", type=float, help="Fallback time step (s) if files lack flow-time")
+    # Turbine & Operating Parameters (default=None so --preset and --omega overrides work reliably)
+    parser.add_argument("--U", type=float, default=None, help="Free-stream speed (m/s) [default: 8.0]")
+    parser.add_argument("--tsr", type=float, default=None, help="Tip speed ratio lambda (-) [default: 3.5 unless --omega given]")
+    parser.add_argument("--omega", type=float, default=None, help="Rotor speed (rad/s); recomputes lambda")
+    parser.add_argument("--R", type=float, default=None, help="Rotor radius (m) [default: 0.5]")
+    parser.add_argument("--chord", type=float, default=None, help="Blade chord (m) [default: 0.06]")
+    parser.add_argument("--blades", type=int, default=None, help="Number of blades (1 to 8) [default: 3]")
+    parser.add_argument("--depth", type=float, default=None, help="2D depth reference (m)")
+    parser.add_argument("--rho", type=float, default=None, help="Density (kg/m³)")
+    parser.add_argument("--mu", type=float, default=None, help="Viscosity (Pa·s)")
+    parser.add_argument("--theta0", type=float, default=None, help="Blade 1 azimuth at t=0 (deg)")
+    parser.add_argument("--offsets", choices=["auto", "even"], default=None, help="Blade phasing mode")
+    parser.add_argument("--sign", choices=["auto", "+1", "-1"], default=None, help="Moment sign mode")
+    parser.add_argument("--tol", type=float, default=None, help="Stability tolerance (%% Cp change)")
+    parser.add_argument("--nstable", type=int, default=None, help="Number of trailing revolutions to report")
+    parser.add_argument("--bin", type=float, default=None, help="Azimuth bin width (deg)")
+    parser.add_argument("--dt", type=float, default=None, help="Fallback time step (s) if files lack flow-time")
     parser.add_argument("--no-timeseries", action="store_true", help="Skip writing full time series to Excel")
     parser.add_argument("--generate-multistage", type=str, metavar="OUT_DIR", help="Generate synthetic multi-stage test files and exit")
     parser.add_argument("--stage", nargs=2, action="append", metavar=("STEPS", "SHIFT_DEG"), help="Add simulation stage: e.g. --stage 2880 1.0 --stage 2880 0.5")
@@ -80,7 +82,14 @@ def main(argv: Optional[List[str]] = None) -> int:
         if args.stage:
             for stg_steps, stg_deg in args.stage:
                 stages.append(SimulationStage(n_steps=int(float(stg_steps)), deg_per_step=float(stg_deg)))
-        p_gen = Params(U=args.U, tsr=args.tsr, R=args.R, chord=args.chord, n_blades=args.blades)
+        p_gen = Params(
+            U=args.U if args.U is not None else 8.0,
+            tsr=args.tsr if args.tsr is not None else (None if args.omega is not None else 3.5),
+            omega=args.omega,
+            R=args.R if args.R is not None else 0.5,
+            chord=args.chord if args.chord is not None else 0.06,
+            n_blades=args.blades if args.blades is not None else 3,
+        )
         _, _, info = generate_multistage_dataset(args.generate_multistage, p_gen, stages if stages else None)
         print(f"\nSuccessfully generated multi-stage simulation files in '{args.generate_multistage}':")
         for s_inf in info["stages"]:
@@ -106,24 +115,55 @@ def main(argv: Optional[List[str]] = None) -> int:
         if not p:
             print(f"Error: Preset '{args.preset}' not found.")
             return 1
-        # Override with any explicitly supplied CLI args if different from default
+        # Override preset fields with any explicitly supplied CLI arguments
+        override_map = {
+            "U": args.U,
+            "R": args.R,
+            "chord": args.chord,
+            "n_blades": args.blades,
+            "depth": args.depth,
+            "rho": args.rho,
+            "mu": args.mu,
+            "theta0": args.theta0,
+            "offsets": args.offsets,
+            "moment_sign": args.sign,
+            "stable_tol": args.tol,
+            "n_stable": args.nstable,
+            "bin_deg": args.bin,
+            "dt": args.dt,
+        }
+        for attr, val in override_map.items():
+            if val is not None:
+                setattr(p, attr, val)
+        if args.omega is not None and args.tsr is None:
+            p.omega = args.omega
+            p.tsr = None
+        elif args.tsr is not None and args.omega is None:
+            p.tsr = args.tsr
+            p.omega = None
+        elif args.tsr is not None and args.omega is not None:
+            p.tsr = args.tsr
+            p.omega = args.omega
+        if args.no_timeseries:
+            p.write_timeseries = False
     if p is None:
+        eff_tsr = args.tsr if args.tsr is not None else (None if args.omega is not None else 3.5)
         p = Params(
-            U=args.U,
-            tsr=args.tsr,
+            U=args.U if args.U is not None else 8.0,
+            tsr=eff_tsr,
             omega=args.omega,
-            R=args.R,
-            chord=args.chord,
-            n_blades=args.blades,
-            depth=args.depth,
-            rho=args.rho,
-            mu=args.mu,
-            theta0=args.theta0,
-            offsets=args.offsets,
-            moment_sign=args.sign,
-            stable_tol=args.tol,
-            n_stable=args.nstable,
-            bin_deg=args.bin,
+            R=args.R if args.R is not None else 0.5,
+            chord=args.chord if args.chord is not None else 0.06,
+            n_blades=args.blades if args.blades is not None else 3,
+            depth=args.depth if args.depth is not None else FLUENT_DEFAULTS["depth"],
+            rho=args.rho if args.rho is not None else FLUENT_DEFAULTS["rho"],
+            mu=args.mu if args.mu is not None else FLUENT_DEFAULTS["mu"],
+            theta0=args.theta0 if args.theta0 is not None else 0.0,
+            offsets=args.offsets if args.offsets is not None else "auto",
+            moment_sign=args.sign if args.sign is not None else "auto",
+            stable_tol=args.tol if args.tol is not None else 5.0,
+            n_stable=args.nstable if args.nstable is not None else 2,
+            bin_deg=args.bin if args.bin is not None else 1.0,
             dt=args.dt,
             write_timeseries=not args.no_timeseries,
             preset_name=args.preset

@@ -102,30 +102,38 @@ def detect_offsets(
 def detect_stages(step: np.ndarray, t: np.ndarray, Trev: float, omega: float) -> List[Dict[str, Any]]:
     """Detects sustained simulation time-step stages using STAGE_DT_CHANGE_REL_TOL, ignoring isolated gaps (L8)."""
     dts = np.diff(t)
-    phases = []
+    phases: List[Dict[str, Any]] = []
     if len(dts) == 0:
         return phases
+    dsteps = np.diff(step) if len(step) == len(t) else np.ones(len(dts), dtype=np.int64)
+    dt_per_step = dts / np.maximum(dsteps, 1)
     start = 0
     i = 1
     tol = STAGE_DT_CHANGE_REL_TOL  # Unified 2% threshold from config (Bug L8)
     while i <= len(dts):
         is_end = (i == len(dts))
         if not is_end:
-            cur_dt = dts[start]
-            rel_diff = abs(dts[i] - cur_dt) / max(abs(cur_dt), 1e-12)
+            cur_dt = float(np.median(dt_per_step[start : min(start + 5, len(dt_per_step))]))
+            rel_diff = abs(dt_per_step[i] - cur_dt) / max(abs(cur_dt), 1e-12)
             if rel_diff > tol:
-                # Check if this change is sustained or an isolated step glitch / single-step gap
-                if i + 3 <= len(dts):
-                    next_diffs = [abs(dts[k] - cur_dt) / max(abs(cur_dt), 1e-12) for k in range(i + 1, min(i + 4, len(dts)))]
-                    if any(nd < tol for nd in next_diffs):
-                        # Reverts back immediately: isolated step gap, not a new sustained stage
-                        i += 1
-                        continue
+                # Check if this change is sustained or an isolated step glitch / EOF single-step gap
+                if i + 1 >= len(dts):
+                    # Single-step glitch right at EOF is not a sustained stage
+                    i += 1
+                    continue
+                next_end = min(i + 4, len(dts))
+                next_diffs = [abs(dt_per_step[k] - cur_dt) / max(abs(cur_dt), 1e-12) for k in range(i + 1, next_end)]
+                if any(nd < tol for nd in next_diffs):
+                    # Reverts back immediately: isolated step gap, not a new sustained stage
+                    i += 1
+                    continue
             else:
                 i += 1
                 continue
 
-        d = float(np.mean(dts[start:i]))
+        seg = dt_per_step[start:i]
+        pos_seg = seg[seg > 0]
+        d = float(np.median(pos_seg)) if len(pos_seg) > 0 else float(np.mean(dts[start:i]))
         n_st = i - start
         dur = float(t[i] - t[start])
         steps_per_rev = Trev / d if d > 0 else 0.0
@@ -722,6 +730,8 @@ def analyze(
             if Cy_shaft is not None:
                 Cy_shaft = Cy_shaft[m_custom]
             S = {k: v[m_custom] for k, v in S.items()}
+            if len(recovered_mask) == len(m_custom):
+                recovered_mask = recovered_mask[m_custom]
             n = len(t)
         n_full = len(sel)
         phases = [
@@ -938,7 +948,11 @@ def analyze(
 
             f_band = (freqs >= 0.4 * f_bpf) & (freqs <= 3.5 * f_bpf)
             if f_band.any():
-                f_peak_overall = float(freqs[f_band][np.argmax(m_fft[f_band])])
+                band_freqs = freqs[f_band]
+                band_fft = m_fft[f_band]
+                peak_idx_b = int(np.argmax(band_fft))
+                f_peak_overall = float(band_freqs[peak_idx_b])
+                peak_amp = float(band_fft[peak_idx_b])
                 k_harmonic = max(1, round(f_peak_overall / f_bpf))
                 f_expected_k = k_harmonic * f_bpf
                 dominant_harmonic_ratio = f_peak_overall / f_bpf
@@ -946,8 +960,16 @@ def analyze(
                 res["detected_omega"] = 2.0 * math.pi * (f_peak_overall / k_harmonic) / max(1, p.n_blades)
                 res["freq_match_ratio"] = dominant_harmonic_ratio
                 res["harmonic_k"] = k_harmonic
+                rel_err_bpf = abs(f_peak_overall - f_expected_k) / max(f_expected_k, 1e-12)
+                # For k >= 2 overtone matches, require meaningful fundamental 1x BPF energy so a 2x/3x omega entry error still triggers
+                fund_band = (freqs >= 0.9 * f_bpf) & (freqs <= 1.1 * f_bpf)
+                fund_amp = float(np.max(m_fft[fund_band])) if fund_band.any() else 0.0
+                has_fundamental = (k_harmonic == 1) or (peak_amp > 0 and fund_amp >= 0.25 * peak_amp)
+                bpf_is_match = (rel_err_bpf <= 0.10) and has_fundamental
+                res["bpf_rel_err"] = rel_err_bpf
+                res["bpf_is_match"] = bpf_is_match
 
-                if abs(dominant_harmonic_ratio - 1.0) > 0.10:
+                if not bpf_is_match:
                     warnings.append(
                         f"Rotor speed mismatch: Rotor speed implied by the data differs from the entered ω: "
                         f"dominant frequency ({f_peak_overall:.2f} Hz) = {dominant_harmonic_ratio:.2f}× expected blade-passing frequency ({f_bpf:.2f} Hz). "
@@ -1166,7 +1188,11 @@ def run_qa_checks(
     try:
         omega = p.omega_val()
         Trev = 2.0 * math.pi / omega
-        dt_nom = float(np.median(np.diff(aligned_t))) if len(aligned_t) > 1 else (p.dt or 1.0)
+        phases_qa = res.get("phases") or []
+        if phases_qa and phases_qa[-1].get("dt", 0.0) > 0:
+            dt_nom = float(phases_qa[-1]["dt"])
+        else:
+            dt_nom = float(np.median(np.diff(aligned_t))) if len(aligned_t) > 1 else (p.dt or 1.0)
         steps_per_rev = Trev / dt_nom
         rem = abs(steps_per_rev - round(steps_per_rev))
         is_int = rem <= 0.05
@@ -1250,7 +1276,9 @@ def run_qa_checks(
 
     # 11. Rotor Speed / BPF Dominant Frequency
     match_ratio = res.get("freq_match_ratio", 1.0)
-    bpf_ok = abs(match_ratio - 1.0) <= 0.10
+    k_harm_qa = max(1, int(res.get("harmonic_k", max(1, round(match_ratio)))))
+    bpf_rel_err = res.get("bpf_rel_err", abs(match_ratio - k_harm_qa) / k_harm_qa)
+    bpf_ok = bool(res.get("bpf_is_match", bpf_rel_err <= 0.10))
     qa.append({
         "check": "Rotor speed / BPF check",
         "status": "PASS" if bpf_ok else "WARN",

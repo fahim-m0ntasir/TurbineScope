@@ -1333,18 +1333,15 @@ class ResultsFrame(ctk.CTkFrame):
             return
         scale = 0.84 if event.button == "up" else (1.0 / 0.84)
         self._push_view_history(group)
-        primary = group[0]
-        self._scale_axis_around(primary, event.xdata, event.ydata, scale)
-        for sibling in group[1:]:
-            if getattr(sibling, "name", "") == "polar":
-                self._scale_axis_around(sibling, None, None, scale)
+        for ax in group:
+            if getattr(ax, "name", "") == "polar":
+                self._scale_axis_around(ax, None, None, scale)
                 continue
-            # Convert cursor pixel position into sibling axis data coordinates
             try:
-                sx, sy = sibling.transData.inverted().transform((event.x, event.y))
+                sx, sy = ax.transData.inverted().transform((event.x, event.y))
             except Exception:
                 sx, sy = None, None
-            self._scale_axis_around(sibling, sx, sy, scale)
+            self._scale_axis_around(ax, sx, sy, scale)
         self._hide_probe_markers(redraw=False)
         self._schedule_canvas_redraw(delay_ms=16)
 
@@ -1479,7 +1476,16 @@ class ResultsFrame(ctk.CTkFrame):
         state = self._drag_state
         self._drag_state = None
         if state["mode"] == "pan":
-            self._push_view_history([a for a, _, _ in state["init_lims"]])
+            moved = any(
+                (a.get_xlim() != xl or a.get_ylim() != yl)
+                for a, xl, yl in state["init_lims"]
+            )
+            if moved:
+                snap_lims = [(a, xl, yl) for a, xl, yl in state["init_lims"] if a in self._home_limits]
+                if snap_lims:
+                    self._view_history.append(snap_lims)
+                    if len(self._view_history) > 40:
+                        self._view_history = self._view_history[-40:]
             self.res_mpl_canvas.draw_idle()
             return
         if state["mode"] == "box":
@@ -2168,7 +2174,7 @@ class ResultsFrame(ctk.CTkFrame):
     # -------------------------------------------------------------------------
     # Logging Methods
     # -------------------------------------------------------------------------
-    def log(self, message: str, tag: str = "info") -> None:
+    def log(self, message: str, tag: Optional[str] = None) -> None:
         """Append line to execution log console."""
         if self._raw_log_text is not None:
             self._raw_log_text += f"{message}\n"
@@ -2195,7 +2201,9 @@ class ResultsFrame(ctk.CTkFrame):
                 full_txt = self._raw_log_text
                 self._raw_log_text = None
                 self.log_text.delete("1.0", "end")
-                self.log_text.insert("1.0", full_txt.rstrip("\n"))
+                restored = full_txt.rstrip("\n")
+                if restored:
+                    self.log_text.insert("1.0", restored + "\n")
                 self.log_text.see("end")
             return
         lines = [ln for ln in self._raw_log_text.splitlines() if query in ln.lower()]

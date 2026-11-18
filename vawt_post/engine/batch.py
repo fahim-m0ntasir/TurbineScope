@@ -19,7 +19,8 @@ from typing import Callable, Dict, List, Optional, Any
 
 import numpy as np
 import matplotlib
-matplotlib.use("Agg")
+if matplotlib.get_backend().lower() not in ("agg", "qtagg"):
+    matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
@@ -47,6 +48,8 @@ def natural_cubic_spline(x_pts: np.ndarray, y_pts: np.ndarray) -> Callable[[Any]
     if n < 2:
         raise ValueError("At least 2 points required for spline interpolation.")
     if n == 2:
+        if x[1] <= x[0]:
+            raise ValueError("x-coordinates must be strictly increasing.")
         m = (y[1] - y[0]) / (x[1] - x[0])
         return lambda xq: y[0] + m * (np.asarray(xq) - x[0])
 
@@ -110,6 +113,8 @@ def pchip_spline(x_pts: np.ndarray, y_pts: np.ndarray) -> Callable[[Any], Any]:
     if n < 2:
         raise ValueError("At least 2 points required for interpolation.")
     if n == 2:
+        if x[1] <= x[0]:
+            raise ValueError("x-coordinates must be strictly increasing.")
         m = (y[1] - y[0]) / (x[1] - x[0])
         return lambda xq: y[0] + m * (np.asarray(xq) - x[0])
 
@@ -223,6 +228,9 @@ def run_batch_analysis(
         except Exception:
             pass
 
+    if len(cases) < 2:
+        raise ValueError("Batch analysis requires at least 2 operating points (TSR cases).")
+
     os.makedirs(outdir, exist_ok=True)
     stamp = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
     _safe_log(f"Starting batch post-processing for {len(cases)} operating points...")
@@ -291,11 +299,11 @@ def run_batch_analysis(
     cm_spline_fn = pchip_spline(tsrs, cms)
     cm_dense = cm_spline_fn(tsr_dense)
 
-    have_ct = not np.all(np.isnan(cts))
+    valid_ct = ~np.isnan(cts)
+    have_ct = int(np.sum(valid_ct)) >= 2
     ct_dense = None
     if have_ct:
-        ct_clean = np.nan_to_num(cts, nan=0.0)
-        ct_spline_fn = pchip_spline(tsrs, ct_clean)
+        ct_spline_fn = pchip_spline(tsrs[valid_ct], cts[valid_ct])
         ct_dense = ct_spline_fn(tsr_dense)
 
     # Peak Cp and optimal lambda (PCHIP + local quadratic peak refinement)
@@ -323,62 +331,66 @@ def run_batch_analysis(
         tsr_opt_spline = float(tsr_dense[idx_peak])
 
     n_supporting_points = len(processed_points)
-    log(f"Batch Analysis Complete: Peak Cp = {cp_max_spline:.4f} at optimal TSR λ_opt = {tsr_opt_spline:.3f} (supported by {n_supporting_points} sampled points)")
+    _safe_log(f"Batch Analysis Complete: Peak Cp = {cp_max_spline:.4f} at optimal TSR λ_opt = {tsr_opt_spline:.3f} (supported by {n_supporting_points} sampled points)")
 
     # Generate Publication Figures
     figs: Dict[str, str] = {}
 
     # 1. Cp vs TSR
     fig, ax = plt.subplots(figsize=(8, 5), dpi=300)
-    yerr_lower = cps - np.array([p["cp_min"] for p in processed_points])
-    yerr_upper = np.array([p["cp_max"] for p in processed_points]) - cps
-    ax.errorbar(
-        tsrs, cps, yerr=[yerr_lower, yerr_upper],
-        fmt="o", color="#1F3864", ecolor="#60A5FA", elinewidth=1.6, capsize=4.5,
-        markersize=6.5, label="CFD Data Points (Mean $\\pm$ Rev Envelope)"
-    )
-    ax.plot(tsr_dense, cp_dense, "-", color="#2563EB", linewidth=2.0, label="Monotone Spline (PCHIP)")
+    try:
+        yerr_lower = np.maximum(0.0, cps - np.array([p["cp_min"] for p in processed_points]))
+        yerr_upper = np.maximum(0.0, np.array([p["cp_max"] for p in processed_points]) - cps)
+        ax.errorbar(
+            tsrs, cps, yerr=[yerr_lower, yerr_upper],
+            fmt="o", color="#1F3864", ecolor="#60A5FA", elinewidth=1.6, capsize=4.5,
+            markersize=6.5, label="CFD Data Points (Mean $\\pm$ Rev Envelope)"
+        )
+        ax.plot(tsr_dense, cp_dense, "-", color="#2563EB", linewidth=2.0, label="Monotone Spline (PCHIP)")
 
-    # Star marker for peak Cp
-    ax.plot(tsr_opt_spline, cp_max_spline, marker="*", color="#DC2626", markersize=14, label=f"Peak: $C_{{p,\\max}} = {cp_max_spline:.3f}$ at $\\lambda = {tsr_opt_spline:.2f}$")
-    ax.axvline(tsr_opt_spline, color="#DC2626", linestyle=":", alpha=0.5)
-    ax.axhline(cp_max_spline, color="#DC2626", linestyle=":", alpha=0.5)
+        # Star marker for peak Cp
+        ax.plot(tsr_opt_spline, cp_max_spline, marker="*", color="#DC2626", markersize=14, label=f"Peak: $C_{{p,\\max}} = {cp_max_spline:.3f}$ at $\\lambda = {tsr_opt_spline:.2f}$")
+        ax.axvline(tsr_opt_spline, color="#DC2626", linestyle=":", alpha=0.5)
+        ax.axhline(cp_max_spline, color="#DC2626", linestyle=":", alpha=0.5)
 
-    ax.set_xlabel("Tip Speed Ratio $\\lambda = \\omega R / U_\\infty$", fontsize=11, fontweight="bold")
-    ax.set_ylabel("Power Coefficient $C_p$", fontsize=11, fontweight="bold")
-    ax.set_title("VAWT Rotor Power Coefficient Curve ($C_p - \\lambda$)", fontsize=12, fontweight="bold", pad=12)
-    ax.grid(True, linestyle="--", alpha=0.6)
-    ax.legend(frameon=True, fontsize=10)
-    plt.tight_layout()
-    f_cp = os.path.join(outdir, f"{prefix}_{stamp}_01_cp_vs_tsr.png")
-    fig.savefig(f_cp)
-    plt.close(fig)
-    figs["cp_vs_tsr"] = f_cp
+        ax.set_xlabel("Tip Speed Ratio $\\lambda = \\omega R / U_\\infty$", fontsize=11, fontweight="bold")
+        ax.set_ylabel("Power Coefficient $C_p$", fontsize=11, fontweight="bold")
+        ax.set_title("VAWT Rotor Power Coefficient Curve ($C_p - \\lambda$)", fontsize=12, fontweight="bold", pad=12)
+        ax.grid(True, linestyle="--", alpha=0.6)
+        ax.legend(frameon=True, fontsize=10)
+        fig.tight_layout()
+        f_cp = os.path.join(outdir, f"{prefix}_{stamp}_01_cp_vs_tsr.png")
+        fig.savefig(f_cp)
+        figs["cp_vs_tsr"] = f_cp
+    finally:
+        plt.close(fig)
 
     # 2. Cm and Ct vs TSR
     fig, ax1 = plt.subplots(figsize=(8, 5), dpi=300)
-    color_cm = "#059669"
-    ax1.plot(tsrs, cms, "s", color=color_cm, markersize=6)
-    ax1.plot(tsr_dense, cm_dense, "-", color=color_cm, linewidth=1.8, label="Moment Coeff $C_m$")
-    ax1.set_xlabel("Tip Speed Ratio $\\lambda$", fontsize=11, fontweight="bold")
-    ax1.set_ylabel("Moment Coefficient $C_m$", color=color_cm, fontsize=11, fontweight="bold")
-    ax1.tick_params(axis="y", labelcolor=color_cm)
-    ax1.grid(True, linestyle="--", alpha=0.5)
+    try:
+        color_cm = "#059669"
+        ax1.plot(tsrs, cms, "s", color=color_cm, markersize=6)
+        ax1.plot(tsr_dense, cm_dense, "-", color=color_cm, linewidth=1.8, label="Moment Coeff $C_m$")
+        ax1.set_xlabel("Tip Speed Ratio $\\lambda$", fontsize=11, fontweight="bold")
+        ax1.set_ylabel("Moment Coefficient $C_m$", color=color_cm, fontsize=11, fontweight="bold")
+        ax1.tick_params(axis="y", labelcolor=color_cm)
+        ax1.grid(True, linestyle="--", alpha=0.5)
 
-    if have_ct and ct_dense is not None:
-        ax2 = ax1.twinx()
-        color_ct = "#7C3AED"
-        ax2.plot(tsrs, cts, "^", color=color_ct, markersize=6)
-        ax2.plot(tsr_dense, ct_dense, "--", color=color_ct, linewidth=1.8, label="Thrust Coeff $C_t$")
-        ax2.set_ylabel("Thrust Coefficient $C_t$ ($F_x$)", color=color_ct, fontsize=11, fontweight="bold")
-        ax2.tick_params(axis="y", labelcolor=color_ct)
+        if have_ct and ct_dense is not None:
+            ax2 = ax1.twinx()
+            color_ct = "#7C3AED"
+            ax2.plot(tsrs[valid_ct], cts[valid_ct], "^", color=color_ct, markersize=6)
+            ax2.plot(tsr_dense, ct_dense, "--", color=color_ct, linewidth=1.8, label="Thrust Coeff $C_t$")
+            ax2.set_ylabel("Thrust Coefficient $C_t$ ($F_x$)", color=color_ct, fontsize=11, fontweight="bold")
+            ax2.tick_params(axis="y", labelcolor=color_ct)
 
-    plt.title("VAWT Rotor $C_m - \\lambda$ and $C_t - \\lambda$ Characteristics", fontsize=12, fontweight="bold", pad=12)
-    plt.tight_layout()
-    f_cm = os.path.join(outdir, f"{prefix}_{stamp}_02_cm_ct_vs_tsr.png")
-    fig.savefig(f_cm)
-    plt.close(fig)
-    figs["cm_ct_vs_tsr"] = f_cm
+        ax1.set_title("VAWT Rotor $C_m - \\lambda$ and $C_t - \\lambda$ Characteristics", fontsize=12, fontweight="bold", pad=12)
+        fig.tight_layout()
+        f_cm = os.path.join(outdir, f"{prefix}_{stamp}_02_cm_ct_vs_tsr.png")
+        fig.savefig(f_cm)
+        figs["cm_ct_vs_tsr"] = f_cm
+    finally:
+        plt.close(fig)
 
     # Export CSV Files
     csv_table_path = os.path.join(outdir, f"{prefix}_{stamp}_cp_lambda_table.csv")
@@ -544,4 +556,7 @@ def export_batch_excel(
     for j in range(len(sp_headers)):
         ws_sp.column_dimensions[COL(j + 1)].width = 16
 
-    wb.save(filepath)
+    try:
+        wb.save(filepath)
+    finally:
+        wb.close()

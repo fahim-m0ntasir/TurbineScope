@@ -602,10 +602,16 @@ def stitch_series_pair(
 
     if len(b_step) == 0:
         out = dict(curr_s)
+        out["step"] = c_step
+        out["time"] = c_time
+        out["value"] = c_val
         out["recovered_mask"] = np.zeros(len(c_step), dtype=bool)
         return out, {"status": "empty_backup", "recovered_count": 0, "overlap_count": 0}
     if len(c_step) == 0:
         out = dict(prior_s)
+        out["step"] = b_step
+        out["time"] = b_time
+        out["value"] = b_val
         out["recovered_mask"] = np.zeros(len(b_step), dtype=bool)
         return out, {"status": "empty_current", "recovered_count": 0, "overlap_count": 0}
 
@@ -652,6 +658,16 @@ def stitch_series_pair(
     if c_start <= b_end:
         overlap_steps = np.intersect1d(b_step, c_step)
         info["overlap_count"] = int(len(overlap_steps))
+        # Reject disjoint future backup (backup starts strictly after current ends, or no overlap with c_start <= b_start)
+        if int(c_step[-1]) < int(b_step[0]) or (len(overlap_steps) == 0 and c_start <= int(b_step[0])):
+            out = dict(curr_s)
+            out["step"] = c_step
+            out["time"] = c_time
+            out["value"] = c_val
+            out["recovered_mask"] = np.zeros(len(c_step), dtype=bool)
+            info["status"] = "incompatible_backup"
+            info["method"] = "rejected_unrelated_backup"
+            return out, info
         if len(overlap_steps) > 0:
             info["overlap_step_range"] = (int(overlap_steps[0]), int(overlap_steps[-1]))
             ib = np.searchsorted(b_step, overlap_steps)
@@ -893,7 +909,15 @@ def stitch_and_recover_all(
     nrmse_vals = [float(r["val_nrmse_pct"]) for r in role_reports.values() if r.get("val_nrmse_pct") is not None]
     mean_nrmse = float(np.mean(nrmse_vals)) if nrmse_vals else None
 
-    primary_rep = role_reports.get(next(iter(matched_roles), ""), {}) if matched_roles else {}
+    primary_rep: Dict[str, Any] = {}
+    if matched_roles:
+        primary_rep = (
+            next((role_reports[k] for k in matched_roles if role_reports.get(k, {}).get("recovered_count", 0) > 0), None)
+            or next((role_reports[k] for k in matched_roles if role_reports.get(k, {}).get("status") == "gap_unfilled"), None)
+            or next((role_reports[k] for k in matched_roles if role_reports.get(k, {}).get("overlap_divergent")), None)
+            or next((role_reports[k] for k in matched_roles if role_reports.get(k, {}).get("status") != "incompatible_backup"), None)
+            or role_reports.get(next(iter(matched_roles), ""), {})
+        )
     rec_step_ranges = primary_rep.get("recovered_step_ranges", [])
     rec_time_ranges = primary_rep.get("recovered_time_ranges", [])
     splice_steps = primary_rep.get("splice_steps", [])

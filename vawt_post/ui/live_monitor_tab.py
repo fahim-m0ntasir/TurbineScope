@@ -1808,11 +1808,18 @@ class LiveMonitorFrame(ctk.CTkFrame):
             round(float(getattr(lp_ref, "omega", 0.0) or 0.0), 6),
             round(float(getattr(lp_ref, "R", 0.0) or 0.0), 6),
             round(float(getattr(lp_ref, "chord", 0.0) or 0.0), 6),
+            round(float(getattr(lp_ref, "depth", 1.0) or 1.0), 6),
             round(float(getattr(lp_ref, "rho", 0.0) or 0.0), 6),
             round(float(getattr(lp_ref, "mu", 0.0) or 0.0), 8),
+            round(float(getattr(lp_ref, "dt", 0.0) or 0.0), 9),
+            round(float(getattr(lp_ref, "bin_deg", 1.0) or 1.0), 4),
+            int(getattr(lp_ref, "n_blades", 3) or 3),
             round(float(getattr(lp_ref, "static_stall_deg", 12.0) or 12.0), 2),
             round(float(getattr(lp_ref, "theta0", 0.0) or 0.0), 4),
+            round(float(getattr(lp_ref, "azimuth_offset", 0.0) or 0.0), 4),
+            str(getattr(lp_ref, "azimuth_zero", "into_wind") or "into_wind"),
             str(getattr(lp_ref, "rotation_dir", "ccw") or "ccw"),
+            str(getattr(lp_ref, "moment_sign", "auto") or "auto"),
         ) if lp_ref is not None else ()
         t_arr = ts_meta.get("t")
         mb_list = ts_meta.get("Mb")
@@ -2456,10 +2463,11 @@ class LiveMonitorFrame(ctk.CTkFrame):
                 t0 = 0.0
                 if self.latest_snapshot and self.latest_snapshot.timeseries and len(self.latest_snapshot.timeseries.get("t", [])) > 0:
                     t0 = float(self.latest_snapshot.timeseries["t"][0])
-                th0 = float(getattr(self.live_params, "theta0", 0.0) or 0.0) if self.live_params else 0.0
+                from vawt_post.engine.azimuth_detect import compute_az_base
+                az_base = compute_az_base(self.live_params) if self.live_params is not None else 0.0
                 dt_rel = max(0.0, x_snap - t0)
                 rev_at_t = int(dt_rel // Trev) + 1
-                az_at_t = (th0 + math.degrees(dt_rel * omega_val)) % 360.0
+                az_at_t = (az_base + math.degrees(x_snap * omega_val)) % 360.0
                 phase_txt = f"Rev {rev_at_t} ({az_at_t:.1f}°)"
                 rows.append(("Phase / Rev", phase_txt, "gray"))
                 detail_lines.append(f"Phase: {phase_txt}")
@@ -2572,6 +2580,7 @@ class LiveMonitorFrame(ctk.CTkFrame):
             return
         try:
             latest_snap: Optional[LiveMonitorSnapshot] = None
+            latest_full_snap: Optional[LiveMonitorSnapshot] = None
             any_full = False
             while True:
                 try:
@@ -2579,13 +2588,14 @@ class LiveMonitorFrame(ctk.CTkFrame):
                     latest_snap = snap
                     if snap.is_full_refresh:
                         any_full = True
+                        latest_full_snap = snap
                 except queue.Empty:
                     break
 
             if latest_snap is not None and self.is_monitoring:
-                if any_full:
-                    self._last_chart_snapshot = latest_snap
-                elif self._last_chart_snapshot is not None and not latest_snap.timeseries:
+                if latest_full_snap is not None:
+                    self._last_chart_snapshot = latest_full_snap
+                if not latest_snap.is_full_refresh and self._last_chart_snapshot is not None and not latest_snap.timeseries:
                     prev_c = self._last_chart_snapshot
                     latest_snap.timeseries = prev_c.timeseries
                     latest_snap.azimuth_curve = prev_c.azimuth_curve
@@ -2688,7 +2698,9 @@ class LiveMonitorFrame(ctk.CTkFrame):
         """Update status strip, side panels, and alerts without touching graphs."""
         cfg = self._cfg_if_changed
         # Status Badge
-        if snap.status == "Monitoring":
+        if self.is_paused:
+            cfg(self.state_badge, text="⏸ Paused", text_color="#06B6D4")
+        elif snap.status == "Monitoring":
             cfg(self.state_badge, text="● Monitoring", text_color="#10B981")
         elif "Stalled" in snap.status:
             cfg(self.state_badge, text="⚠ Stalled?", text_color="#F59E0B")
@@ -3033,8 +3045,10 @@ class LiveMonitorFrame(ctk.CTkFrame):
         if self.worker and (self.is_monitoring or self.worker.is_alive()):
             snap = self.worker.update_params(new_p)
             self.latest_snapshot = snap
+            if snap.is_full_refresh:
+                self._last_chart_snapshot = snap
             self._update_telemetry(snap)
-            self._render_graphs(snap)
+            self._render_graphs(snap, force=True)
         elif self.latest_snapshot:
             # Re-evaluate stability on existing snapshot rev_history with new tolerance
             tol_rel = (new_p.stable_tol or 5.0) / 100.0
@@ -3253,8 +3267,10 @@ class LiveMonitorFrame(ctk.CTkFrame):
         if force_detect and self.worker and (self.is_monitoring or self.worker.is_alive()):
             snap = self.worker.update_params(p)
             self.latest_snapshot = snap
+            if snap.is_full_refresh:
+                self._last_chart_snapshot = snap
             self._update_telemetry(snap)
-            self._render_graphs(snap)
+            self._render_graphs(snap, force=True)
         return p
 
     def _update_telemetry_echoes(self, p: Params, model_name: Optional[str] = None):
@@ -3552,7 +3568,7 @@ class LiveMonitorFrame(ctk.CTkFrame):
             self.lbl_countdown.configure(text="⏱ Paused", text_color="#06B6D4")
             if self.app and hasattr(self.app, "tab_btn_live"):
                 self.app.tab_btn_live.configure(text="📡 Live Monitor  ⏸", text_color="#06B6D4")
-            self.worker.add_alert("INFO", "Auto-refresh paused by user.", key="pause_state")
+            self.worker.add_alert("INFO", "Auto-refresh paused by user.")
         else:
             self.worker.resume_auto_refresh()
             self.is_paused = False
@@ -3562,7 +3578,7 @@ class LiveMonitorFrame(ctk.CTkFrame):
             mins = int(self.time_until_refresh // 60)
             secs = int(self.time_until_refresh % 60)
             self.lbl_countdown.configure(text=f"⏱ Next: {mins}:{secs:02d}")
-            self.worker.add_alert("INFO", "Auto-refresh resumed.", key="pause_state")
+            self.worker.add_alert("INFO", "Auto-refresh resumed.")
 
     def _refresh_now(self):
         """Immediately trigger heavy snapshot and graph redraw."""
@@ -3646,6 +3662,8 @@ class LiveMonitorFrame(ctk.CTkFrame):
         if self.worker and (self.is_monitoring or self.worker.is_alive()):
             snap = self.worker.set_prior_source(self.prior_source, self.continuity_mode)
             self.latest_snapshot = snap
+            if snap.is_full_refresh:
+                self._last_chart_snapshot = snap
             self._update_telemetry(snap)
             self._render_graphs(snap, force=True)
 

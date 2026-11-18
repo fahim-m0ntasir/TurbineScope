@@ -56,6 +56,9 @@ def _hdr(ws, row: int, labels: list, col: int = 1, height: Optional[float] = Non
 
 
 def _put(ws, row: int, col: int, v: Any, font: Font = F_N, fmt: Optional[str] = None, fill: Optional[PatternFill] = None, wrap: bool = False):
+    if isinstance(v, float) and not math.isfinite(v):
+        v = "n/a"
+        fmt = None
     c = ws.cell(row=row, column=col, value=v)
     c.font = font
     if fmt:
@@ -645,19 +648,21 @@ def write_excel(
     _put(wg, 1, 1, "Generated Publication Figures (saved as PNG in _figures folder)", F_T)
     order = [k for k in sorted(figs)]
     row_g = 3
-    for i, fig_key in enumerate(order):
+    placed = 0
+    for fig_key in order:
         if not os.path.isfile(figs[fig_key]):
             continue
         try:
             img = XLImage(figs[fig_key])
             scale = min(1.0, 780.0 / img.width)
             img.width, img.height = int(img.width * scale), int(img.height * scale)
-            col_g = 1 if i % 2 == 0 else 14
-            if i % 2 == 0 and i > 0:
+            col_g = 1 if placed % 2 == 0 else 14
+            if placed % 2 == 0 and placed > 0:
                 row_g += 27
             _put(wg, row_g - 1, col_g, fig_key.replace(".png", "").replace("_", " ").title(), F_B, fill=SF)
             wg.merge_cells(start_row=row_g - 1, start_column=col_g, end_row=row_g - 1, end_column=col_g + 11)
             wg.add_image(img, f"{COL(col_g)}{row_g}")
+            placed += 1
         except Exception:
             pass
 
@@ -903,7 +908,7 @@ def _write_mesh_info_sheet(wb: Workbook, R: Dict[str, Any], mesh_info: Dict[str,
                 q.get("skewness_mean"),
                 q.get("skewness_p95"),
                 q.get("skewness_max"),
-                f"Excellent (<0.25): {q.get('skew_excellent_lt_025_pct', 0):.1f}% | Good (<0.5): {q.get('skew_good_025_050_pct', 0):.1f}% | Fair: {q.get('skew_fair_050_080_pct', 0):.1f}% | Poor (>0.8): {q.get('skew_poor_gt_080_pct', 0):.2f}%",
+                f"Excellent (<0.25): {(q.get('skew_excellent_lt_025_pct') or 0.0):.1f}% | Good (<0.5): {(q.get('skew_good_025_050_pct') or 0.0):.1f}% | Fair: {(q.get('skew_fair_050_080_pct') or 0.0):.1f}% | Poor (>0.8): {(q.get('skew_poor_gt_080_pct') or 0.0):.2f}%",
                 "0.0000",
             ),
             (
@@ -913,7 +918,7 @@ def _write_mesh_info_sheet(wb: Workbook, R: Dict[str, Any], mesh_info: Dict[str,
                 q.get("ortho_mean"),
                 q.get("ortho_median"),
                 None,
-                f"High (>0.70): {q.get('ortho_high_gt_070_pct', 0):.1f}% | Critical (<0.15): {q.get('ortho_low_lt_015_pct', 0):.2f}% (Col 3 = P5, Col 5 = Median)",
+                f"High (>0.70): {(q.get('ortho_high_gt_070_pct') or 0.0):.1f}% | Critical (<0.15): {(q.get('ortho_low_lt_015_pct') or 0.0):.2f}% (Col 3 = P5, Col 5 = Median)",
                 "0.0000",
             ),
             (
@@ -943,7 +948,7 @@ def _write_mesh_info_sheet(wb: Workbook, R: Dict[str, Any], mesh_info: Dict[str,
                 q.get("growth_rate_mean"),
                 q.get("growth_rate_p95"),
                 q.get("growth_rate_max"),
-                f"Cells with jump > 2.0x: {q.get('growth_rate_gt_2_pct', 0):.2f}% (target smooth <= 1.2 mean)",
+                f"Cells with jump > 2.0x: {(q.get('growth_rate_gt_2_pct') or 0.0):.2f}% (target smooth <= 1.2 mean)",
                 "0.000",
             ),
         ]

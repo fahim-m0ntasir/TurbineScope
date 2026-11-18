@@ -473,34 +473,46 @@ def scan_workbench_project(project_path_or_dir: str) -> Optional[WorkbenchProjec
         files_dir=files_dir
     )
 
-    # Discover Design Points (dp0, dp1, ...)
-    dp_dirs = glob.glob(os.path.join(files_dir, "dp*"))
-    design_points = [os.path.basename(d) for d in dp_dirs if os.path.isdir(d)]
+    # Discover Design Points (dp0, dp1, ...) or direct system folder (dp0/FFF-n)
+    dp_dirs = [
+        d for d in glob.glob(os.path.join(files_dir, "dp*"))
+        if os.path.isdir(d) and re.match(r"^dp\d+$", os.path.basename(d), re.IGNORECASE)
+    ]
+    design_points = sorted(os.path.basename(d) for d in dp_dirs)
     if not design_points:
-        # Maybe dp0 is files_dir itself
         design_points = ["dp0"]
-    project.design_points = sorted(design_points)
+    project.design_points = design_points
 
-    primary_dp = "dp0" if "dp0" in design_points else (design_points[0] if design_points else "")
-    dp_path = os.path.join(files_dir, primary_dp) if primary_dp and primary_dp != "dp0" or os.path.isdir(os.path.join(files_dir, primary_dp)) else files_dir
-
-    # Discover all Fluent systems e.g. FFF, FFF-1, FFF-2
-    # In Workbench, each Fluent system has a directory in dp0/ containing Fluent, DM, MECH, etc.
-    candidate_sys_dirs = []
+    # Discover all Fluent systems e.g. FFF, FFF-1, FFF-2 across all discovered design points
+    # (or directly if the user pointed straight at a system directory containing Fluent/)
+    candidate_sys_dirs: List[Tuple[str, str, str, str]] = []  # (sys_id, sys_path, dp_name, dp_path)
     ignored_patterns = ("global", "geom", ".backup", "backup", "session_files", "progress_files", "user_files", "import_files")
-    if os.path.isdir(dp_path):
-        for entry in os.listdir(dp_path):
-            full_entry = os.path.join(dp_path, entry)
-            # Skip backup directories or hidden directories (P0-2 fix)
-            if entry.startswith(".") or any(p in entry.lower() for p in ignored_patterns):
+    if os.path.isdir(os.path.join(files_dir, "Fluent")):
+        parent_dp = os.path.basename(os.path.dirname(files_dir))
+        dp_name = parent_dp if re.match(r"^dp\d+$", parent_dp, re.IGNORECASE) else "dp0"
+        candidate_sys_dirs.append((os.path.basename(files_dir), files_dir, dp_name, os.path.dirname(files_dir)))
+    else:
+        dp_scan_list: List[Tuple[str, str]] = []
+        if dp_dirs:
+            for d_full in sorted(dp_dirs):
+                dp_scan_list.append((os.path.basename(d_full), d_full))
+        else:
+            dp_scan_list.append(("dp0", files_dir))
+
+        for dp_name, cur_dp_path in dp_scan_list:
+            if not os.path.isdir(cur_dp_path):
                 continue
-            if os.path.isdir(full_entry) and os.path.isdir(os.path.join(full_entry, "Fluent")):
-                candidate_sys_dirs.append((entry, full_entry))
+            for entry in sorted(os.listdir(cur_dp_path)):
+                full_entry = os.path.join(cur_dp_path, entry)
+                if entry.startswith(".") or any(p in entry.lower() for p in ignored_patterns):
+                    continue
+                if os.path.isdir(full_entry) and os.path.isdir(os.path.join(full_entry, "Fluent")):
+                    sys_label = entry if (len(dp_scan_list) == 1 or dp_name.lower() == "dp0") else f"{dp_name}/{entry}"
+                    candidate_sys_dirs.append((sys_label, full_entry, dp_name, cur_dp_path))
 
-    # Real progress_files path from section 1.3: <project>_files/progress_files/dp0/<system>/Fluent
-    progress_dir = os.path.join(files_dir, "progress_files", primary_dp)
-
-    for sys_id, sys_path in candidate_sys_dirs:
+    for sys_id, sys_path, cur_dp_name, cur_dp_path in candidate_sys_dirs:
+        raw_sys_name = os.path.basename(sys_path)
+        progress_dir = os.path.join(files_dir, "progress_files", cur_dp_name)
         fluent_dir = os.path.join(sys_path, "Fluent")
         mech_dir = os.path.join(sys_path, "MECH")
         sys_info = FluentSystemInfo(
@@ -511,13 +523,18 @@ def scan_workbench_project(project_path_or_dir: str) -> Optional[WorkbenchProjec
 
         # 1. Look for .cas.h5 and .dat.h5 (prefer files matching exact system_id and solved checkpoints over stale duplicated Setup files)
         other_sys_prefixes = [
-            s_other.lower() for s_other, _ in candidate_sys_dirs
-            if s_other.lower() != sys_id.lower() and s_other.lower().startswith(sys_id.lower() + "-")
+            os.path.basename(s_path_o).lower() for _, s_path_o, _, _ in candidate_sys_dirs
+            if os.path.basename(s_path_o).lower() != raw_sys_name.lower()
+            and os.path.basename(s_path_o).lower().startswith(raw_sys_name.lower() + "-")
         ]
 
         def _matches_sys_id(fpath: str) -> bool:
             b = os.path.basename(fpath).lower()
-            sid_l = sys_id.lower()
+            sid_l = raw_sys_name.lower()
+            # Recognize Fluent native checkpoint naming (e.g. FFF-1-00001.cas.h5 for FFF)
+            # before rejecting prefixes belonging to sibling systems like FFF-1.
+            if re.match(rf"^{re.escape(sid_l)}-\d+-\d+\.(cas|dat)(\.h5)?$", b):
+                return True
             if any(b.startswith(op + "-") or b.startswith(op + ".") for op in other_sys_prefixes):
                 return False
             return b.startswith(sid_l + ".") or b.startswith(sid_l + "-")
@@ -550,6 +567,7 @@ def scan_workbench_project(project_path_or_dir: str) -> Optional[WorkbenchProjec
             sys_info.data_path = dat_files[0]
 
         # 2. Extract geometry and physics directly from HDF5 case via inspect_hdf5_case (Step B)
+        h5_turb_verified = False
         if sys_info.case_path and os.path.isfile(sys_info.case_path) and sys_info.case_path.lower().endswith(".h5"):
             try:
                 h5_data = inspect_hdf5_case(sys_info.case_path)
@@ -582,6 +600,7 @@ def scan_workbench_project(project_path_or_dir: str) -> Optional[WorkbenchProjec
                     sys_info.viscosity = h5_data["viscosity"]
                 if h5_data.get("turb_model"):
                     sys_info.turb_model = h5_data["turb_model"]
+                    h5_turb_verified = True
             except Exception:
                 pass
 
@@ -594,45 +613,46 @@ def scan_workbench_project(project_path_or_dir: str) -> Optional[WorkbenchProjec
                 sys_info.cell_count = msh_stats.get("cells")
                 sys_info.node_count = msh_stats.get("nodes")
         else:
-            global_mshdb = os.path.join(dp_path, "global", "MECH", f"{sys_id}.mshdb")
+            global_mshdb = os.path.join(cur_dp_path, "global", "MECH", f"{raw_sys_name}.mshdb")
             if os.path.isfile(global_mshdb):
                 sys_info.msh_path = global_mshdb
 
-        # 4. Fallback: Look for report.xml if physics not already extracted
-        if sys_info.omega is None or sys_info.velocity is None:
-            xml_candidates = [
-                os.path.join(progress_dir, sys_id, "Fluent", "report.xml"),
-                os.path.join(sys_info.fluent_dir, "report.xml"),
-                os.path.join(files_dir, "progress_files", sys_id, "report.xml"),
-            ]
-            for xml_p in xml_candidates:
-                if os.path.isfile(xml_p):
-                    sys_info.report_xml_path = xml_p
-                    xml_data = parse_fluent_report_xml(xml_p)
-                    if sys_info.omega is None:
-                        sys_info.omega = xml_data.get("omega")
-                    if sys_info.velocity is None:
-                        sys_info.velocity = xml_data.get("velocity")
-                    if sys_info.time_step is None:
-                        sys_info.time_step = xml_data.get("time_step")
-                    if sys_info.density is None:
-                        sys_info.density = xml_data.get("density")
-                    if sys_info.viscosity is None:
-                        sys_info.viscosity = xml_data.get("viscosity")
-                    if not sys_info.blade_zones:
-                        sys_info.blade_zones = xml_data.get("blade_zones", [])
-                    if sys_info.shaft_zone is None:
-                        sys_info.shaft_zone = xml_data.get("shaft_zone")
-                    if sys_info.rotating_zone is None:
-                        sys_info.rotating_zone = xml_data.get("rotating_zone")
-                    if sys_info.stationary_zone is None:
-                        sys_info.stationary_zone = xml_data.get("stationary_zone")
-                    break
+        # 4. Always inspect report.xml if present to fill any missing physics/model metadata
+        xml_candidates = [
+            os.path.join(progress_dir, raw_sys_name, "Fluent", "report.xml"),
+            os.path.join(sys_info.fluent_dir, "report.xml"),
+            os.path.join(files_dir, "progress_files", raw_sys_name, "report.xml"),
+        ]
+        for xml_p in xml_candidates:
+            if os.path.isfile(xml_p):
+                sys_info.report_xml_path = xml_p
+                xml_data = parse_fluent_report_xml(xml_p)
+                if sys_info.omega is None:
+                    sys_info.omega = xml_data.get("omega")
+                if sys_info.velocity is None:
+                    sys_info.velocity = xml_data.get("velocity")
+                if sys_info.time_step is None:
+                    sys_info.time_step = xml_data.get("time_step")
+                if sys_info.density is None:
+                    sys_info.density = xml_data.get("density")
+                if sys_info.viscosity is None:
+                    sys_info.viscosity = xml_data.get("viscosity")
+                if not h5_turb_verified and xml_data.get("turb_model"):
+                    sys_info.turb_model = xml_data["turb_model"]
+                if not sys_info.blade_zones:
+                    sys_info.blade_zones = xml_data.get("blade_zones", [])
+                if sys_info.shaft_zone is None:
+                    sys_info.shaft_zone = xml_data.get("shaft_zone")
+                if sys_info.rotating_zone is None:
+                    sys_info.rotating_zone = xml_data.get("rotating_zone")
+                if sys_info.stationary_zone is None:
+                    sys_info.stationary_zone = xml_data.get("stationary_zone")
+                break
 
         # 5. Check Solution.trn if cells not yet found
         if sys_info.cell_count is None:
             trn_candidates = [
-                os.path.join(progress_dir, sys_id, "Fluent", "Solution.trn"),
+                os.path.join(progress_dir, raw_sys_name, "Fluent", "Solution.trn"),
                 os.path.join(sys_info.fluent_dir, "Solution.trn"),
             ]
             for trn_p in trn_candidates:
@@ -665,7 +685,8 @@ def scan_workbench_project(project_path_or_dir: str) -> Optional[WorkbenchProjec
         latest_t = 0.0
         now_t = time.time()
         for root, _, fnames in os.walk(sys_info.fluent_dir):
-            if any(part.startswith(".") for part in root.split(os.sep)):
+            rel_root = os.path.relpath(root, sys_info.fluent_dir)
+            if rel_root != "." and any(part.startswith(".") for part in rel_root.split(os.sep)):
                 continue
             for fn in fnames:
                 fp = os.path.join(root, fn)
@@ -970,6 +991,8 @@ def _extract_system_converged_torque(s: FluentSystemInfo) -> Dict[str, Any]:
             series["total"] = read_fluent_report(s.total_moment_file)
             if s.shaft_moment_file and os.path.isfile(s.shaft_moment_file):
                 series["shaft"] = read_fluent_report(s.shaft_moment_file)
+        elif len(blade_files) == 1:
+            series["blade1"] = read_fluent_report(blade_files[0])
 
         if not series:
             return out
@@ -1152,10 +1175,11 @@ def evaluate_tsr_sweep(
 
 def plot_tsr_sweep_curve(sweep_data: Dict[str, Any], dark_mode: bool = False) -> Any:
     """Generate publication plot for Tip Speed Ratio vs Power Coefficient curve."""
-    import matplotlib.pyplot as plt
+    from matplotlib.figure import Figure
     import numpy as np
 
-    fig, ax = plt.subplots(figsize=(7.5, 4.8), dpi=100)
+    fig = Figure(figsize=(7.5, 4.8), dpi=100)
+    ax = fig.add_subplot(111)
 
     bg_col = "#0F172A" if dark_mode else "#FFFFFF"
     text_col = "#F8FAFC" if dark_mode else "#0F172A"
@@ -1219,7 +1243,7 @@ def plot_tsr_sweep_curve(sweep_data: Dict[str, Any], dark_mode: bool = False) ->
     else:
         ax.legend(loc="best", framealpha=0.9, fontsize=9.0)
 
-    plt.tight_layout()
+    fig.tight_layout()
     return fig
 
 
@@ -1565,7 +1589,7 @@ def plot_steady_convergence(system: FluentSystemInfo, dark_mode: bool = False):
       1. Top plot: Total Rotor Moment vs Iterations (all blades + shaft combined into one total curve).
       2. Bottom plot: Aerodynamic Forces (Fx: Drag, Fy: Lateral) vs Iterations.
     """
-    import matplotlib.pyplot as plt
+    from matplotlib.figure import Figure
     import numpy as np
     from vawt_post.engine.parser import read_fluent_report
 
@@ -1576,7 +1600,9 @@ def plot_steady_convergence(system: FluentSystemInfo, dark_mode: bool = False):
     fx_col = "#3B82F6"   # Blue
     fy_col = "#F59E0B"   # Amber
 
-    fig, (ax_mom, ax_force) = plt.subplots(2, 1, figsize=(7.5, 4.8), dpi=100, sharex=True)
+    fig = Figure(figsize=(7.5, 4.8), dpi=100)
+    ax_mom = fig.add_subplot(2, 1, 1)
+    ax_force = fig.add_subplot(2, 1, 2, sharex=ax_mom)
     fig.patch.set_facecolor(bg_col)
 
     for ax in (ax_mom, ax_force):
@@ -1611,7 +1637,7 @@ def plot_steady_convergence(system: FluentSystemInfo, dark_mode: bool = False):
                             mom_steps = rep.get("step")
             if system.shaft_moment_file and os.path.isfile(system.shaft_moment_file):
                 s_rep = read_fluent_report(system.shaft_moment_file)
-                if s_rep.get("value") is not None:
+                if s_rep.get("value") is not None and len(s_rep["value"]) > 0:
                     all_b_vals.append(s_rep["value"])
             if all_b_vals:
                 min_len = min(len(v) for v in all_b_vals)
@@ -1689,10 +1715,11 @@ def plot_multicase_tsr_overlay(
     dark_mode: bool = False
 ) -> Any:
     """Plot multi-case / multi-system Cp vs TSR performance comparison curve."""
-    import matplotlib.pyplot as plt
+    from matplotlib.figure import Figure
     import numpy as np
 
-    fig, ax = plt.subplots(figsize=(7.5, 4.8), dpi=100)
+    fig = Figure(figsize=(7.5, 4.8), dpi=100)
+    ax = fig.add_subplot(111)
     bg_col = "#0F172A" if dark_mode else "#FFFFFF"
     text_col = "#F8FAFC" if dark_mode else "#0F172A"
     grid_col = "#334155" if dark_mode else "#E2E8F0"
@@ -1758,10 +1785,11 @@ def plot_multicase_cm_azimuth_overlay(
     dark_mode: bool = False
 ) -> Any:
     """Plot multi-case phase-averaged instantaneous Cm(theta) over 0-360 degrees."""
-    import matplotlib.pyplot as plt
+    from matplotlib.figure import Figure
     import numpy as np
 
-    fig, ax = plt.subplots(figsize=(7.5, 4.8), dpi=100)
+    fig = Figure(figsize=(7.5, 4.8), dpi=100)
+    ax = fig.add_subplot(111)
     bg_col = "#0F172A" if dark_mode else "#FFFFFF"
     text_col = "#F8FAFC" if dark_mode else "#0F172A"
     grid_col = "#334155" if dark_mode else "#E2E8F0"
@@ -1807,9 +1835,10 @@ def plot_multicase_ripple_comparison(
     dark_mode: bool = False
 ) -> Any:
     """Plot torque ripple factor comparison bar chart across multiple cases."""
-    import matplotlib.pyplot as plt
+    from matplotlib.figure import Figure
 
-    fig, ax = plt.subplots(figsize=(7.5, 4.8), dpi=100)
+    fig = Figure(figsize=(7.5, 4.8), dpi=100)
+    ax = fig.add_subplot(111)
     bg_col = "#0F172A" if dark_mode else "#FFFFFF"
     text_col = "#F8FAFC" if dark_mode else "#0F172A"
     grid_col = "#334155" if dark_mode else "#E2E8F0"

@@ -87,7 +87,7 @@ GENERIC_DEFAULTS = {
     "static_stall_deg": 12.0,
     "stable_tol": 5.0,
     "stable_tol_abs": 0.001,
-    "drift_tol": 1.0,
+    "drift_tol": None,
     "periodicity_tol": 0.01,
     "n_stable": 2,
     "bin_deg": 1.0,
@@ -331,10 +331,14 @@ class Params:
                 parse_custom_revs_spec(self.custom_revs)
             except ValueError as exc:
                 errors.append(str(exc))
-        if not _finite_pos(self.bin_deg):
-            errors.append("Azimuth bin width must be a finite positive number.")
+        if not _finite_pos(self.bin_deg) or self.bin_deg > 180.0:
+            errors.append("Azimuth bin width must be a finite positive number <= 180°.")
         elif abs(round(360.0 / self.bin_deg) * self.bin_deg - 360.0) > 1e-6:
             errors.append(f"Azimuth bin width ({self.bin_deg}°) must divide 360° evenly (e.g. 0.5°, 1°, 2°, 5°).")
+        if not math.isfinite(float(self.theta0)):
+            errors.append("Blade 1 start azimuth θ₀ must be a finite number.")
+        if not math.isfinite(float(self.azimuth_offset)):
+            errors.append("Azimuth offset must be a finite number.")
         if self.offsets not in ("auto", "even"):
             errors.append("Blade phasing must be 'auto' or 'even'.")
         if self.moment_sign not in ("fixed", "auto", "+1", "-1"):
@@ -413,7 +417,9 @@ class ConfigManager:
     def get_presets(self) -> Dict[str, Dict[str, Any]]:
         """Return combination of built-in presets and user presets."""
         combined = BUILTIN_PRESETS.copy()
-        combined.update(self.data.get("presets", {}))
+        user_presets = self.data.get("presets")
+        if isinstance(user_presets, dict):
+            combined.update(user_presets)
         return combined
 
     def save_preset(self, name: str, params: Params, description: str = "") -> None:
@@ -519,11 +525,24 @@ class ConfigManager:
         self.save()
 
     def _dict_to_params(self, d: Dict[str, Any]) -> Params:
-        """Safely convert dictionary to Params instance."""
+        """Safely convert dictionary to Params instance without sharing mutable state."""
+        import copy as _copy
         valid_keys = set(Params.__dataclass_fields__.keys())
-        filtered = {k: v for k, v in d.items() if k in valid_keys}
-        if "metadata" in filtered and isinstance(filtered["metadata"], dict):
-            filtered["metadata"] = CaseMetadata.from_dict(filtered["metadata"])
+        filtered: Dict[str, Any] = {}
+        for k, v in (d or {}).items():
+            if k not in valid_keys:
+                continue
+            if k == "metadata":
+                if isinstance(v, dict):
+                    filtered[k] = CaseMetadata.from_dict(v)
+                elif isinstance(v, CaseMetadata):
+                    filtered[k] = _copy.deepcopy(v)
+                # Ignore None so Params uses CaseMetadata default_factory
+            elif k in ("param_sources", "applied_repairs"):
+                if v is not None:
+                    filtered[k] = _copy.deepcopy(v)
+            else:
+                filtered[k] = _copy.deepcopy(v) if isinstance(v, (dict, list)) else v
         return Params(**filtered)
 
     def load_preset(self, name: str) -> Optional[Params]:

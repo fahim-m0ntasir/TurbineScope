@@ -21,7 +21,8 @@ from typing import Dict, List, Optional, Tuple, Any
 
 import numpy as np
 import matplotlib
-matplotlib.use("Agg")
+if matplotlib.get_backend().lower() not in ("agg", "qtagg"):
+    matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 from PIL import Image
@@ -127,33 +128,40 @@ def plot_upwind_downwind_split(R: Dict[str, Any], outpath: Optional[str] = None)
         downwind_cps.append(cp_down)
 
     fig, ax = plt.subplots(figsize=(10, 4.6), dpi=130)
-    x = np.arange(len(ks))
-    width = 0.38
+    try:
+        x = np.arange(len(ks))
+        width = 0.38
 
-    ax.bar(x - width / 2, upwind_cps, width, label="Upwind Half (0°–180°)", color="#1F4E79", edgecolor="white")
-    ax.bar(x + width / 2, downwind_cps, width, label="Downwind Half (180°–360°)", color="#D1495B", edgecolor="white")
+        ax.bar(x - width / 2, upwind_cps, width, label="Upwind Half (0°–180°)", color="#1F4E79", edgecolor="white")
+        ax.bar(x + width / 2, downwind_cps, width, label="Downwind Half (180°–360°)", color="#D1495B", edgecolor="white")
 
-    mean_up = float(np.mean([upwind_cps[i] for i, r in enumerate(revs) if r["selected"]]))
-    mean_down = float(np.mean([downwind_cps[i] for i, r in enumerate(revs) if r["selected"]]))
-    tot = max(1e-6, mean_up + mean_down)
-    up_share_pct = (mean_up / tot) * 100.0
+        sel_up = [upwind_cps[i] for i, r in enumerate(revs) if r["selected"]]
+        sel_down = [downwind_cps[i] for i, r in enumerate(revs) if r["selected"]]
+        mean_up = float(np.mean(sel_up)) if sel_up else 0.0
+        mean_down = float(np.mean(sel_down)) if sel_down else 0.0
+        net_tot = mean_up + mean_down
+        if net_tot > 1e-6:
+            share_txt = f"Upwind Share: {(mean_up / net_tot) * 100.0:.1f}%"
+        else:
+            share_txt = "Upwind Share: n/a (net Cp <= 0)"
 
-    ax.axhline(mean_up, color="#1F4E79", ls="--", lw=1.1, alpha=0.8, label=f"Reported Upwind Mean: {mean_up:.3f}")
-    ax.axhline(mean_down, color="#D1495B", ls="--", lw=1.1, alpha=0.8, label=f"Reported Downwind Mean: {mean_down:.3f}")
+        ax.axhline(mean_up, color="#1F4E79", ls="--", lw=1.1, alpha=0.8, label=f"Reported Upwind Mean: {mean_up:.3f}")
+        ax.axhline(mean_down, color="#D1495B", ls="--", lw=1.1, alpha=0.8, label=f"Reported Downwind Mean: {mean_down:.3f}")
 
-    ax.set_xticks(x)
-    ax.set_xticklabels([str(k) for k in ks])
-    ax.set_xlabel("Revolution")
-    ax.set_ylabel("Sector-Averaged Power Coefficient Cp")
-    ax.set_title(f"Upwind vs Downwind Power Extraction per Revolution (Upwind Share: {up_share_pct:.1f}%)")
-    ax.grid(True, alpha=0.3)
-    ax.legend(ncol=2, loc="upper right", fontsize=8.5)
+        ax.set_xticks(x)
+        ax.set_xticklabels([str(k) for k in ks])
+        ax.set_xlabel("Revolution")
+        ax.set_ylabel("Sector-Averaged Power Coefficient Cp")
+        ax.set_title(f"Upwind vs Downwind Power Extraction per Revolution ({share_txt})")
+        ax.grid(True, alpha=0.3)
+        ax.legend(ncol=2, loc="upper right", fontsize=8.5)
 
-    if outpath is None:
-        outpath = "14_upwind_downwind_split.png"
-    os.makedirs(os.path.dirname(os.path.abspath(outpath)), exist_ok=True)
-    fig.savefig(outpath, bbox_inches="tight")
-    plt.close(fig)
+        if outpath is None:
+            outpath = "14_upwind_downwind_split.png"
+        os.makedirs(os.path.dirname(os.path.abspath(outpath)), exist_ok=True)
+        fig.savefig(outpath, bbox_inches="tight")
+    finally:
+        plt.close(fig)
     return outpath
 
 
@@ -252,13 +260,16 @@ def plot_load_rose(R: Dict[str, Any], outpath: Optional[str] = None) -> str:
             t_win = t[t_sel_mask]
             ct_win = d["Ct"][t_sel_mask]
             n_pts = len(ct_win)
-            dt_avg = (t_win[-1] - t_win[0]) / max(1, n_pts - 1)
-            freqs = np.fft.rfftfreq(n_pts, d=dt_avg)
-            harmonics = freqs * Trev
-            amps = 2.0 * np.abs(np.fft.rfft(ct_win - np.mean(ct_win))) / n_pts
-            m_h = (harmonics >= 0) & (harmonics <= 12)
-            ax3.vlines(harmonics[m_h], 0, amps[m_h], color="#1F4E79", lw=1.4)
-            ax3.axvline(p.n_blades, color="#D1495B", ls="--", lw=1.2, label=f"{p.n_blades}x Blade Passing")
+            pos_dt = np.diff(t_win)
+            pos_dt = pos_dt[pos_dt > 0]
+            if n_pts >= 4 and len(pos_dt) > 0:
+                dt_avg = float(np.median(pos_dt))
+                freqs = np.fft.rfftfreq(n_pts, d=dt_avg)
+                harmonics = freqs * Trev
+                amps = 2.0 * np.abs(np.fft.rfft(ct_win - np.mean(ct_win))) / n_pts
+                m_h = (harmonics >= 0) & (harmonics <= 12)
+                ax3.vlines(harmonics[m_h], 0, amps[m_h], color="#1F4E79", lw=1.4)
+                ax3.axvline(p.n_blades, color="#D1495B", ls="--", lw=1.2, label=f"{p.n_blades}x Blade Passing")
         ax3.set_xlabel("Harmonic Order (f / f_rotor)")
         ax3.set_ylabel("Ct Amplitude")
         ax3.set_title("Thrust Coefficient Ct Dynamic Spectrum")
@@ -272,13 +283,16 @@ def plot_load_rose(R: Dict[str, Any], outpath: Optional[str] = None) -> str:
             t_win = t[t_sel_mask]
             cy_win = d["Cy"][t_sel_mask]
             n_pts = len(cy_win)
-            dt_avg = (t_win[-1] - t_win[0]) / max(1, n_pts - 1)
-            freqs = np.fft.rfftfreq(n_pts, d=dt_avg)
-            harmonics = freqs * Trev
-            amps_y = 2.0 * np.abs(np.fft.rfft(cy_win - np.mean(cy_win))) / n_pts
-            m_h_y = (harmonics >= 0) & (harmonics <= 12)
-            ax4.vlines(harmonics[m_h_y], 0, amps_y[m_h_y], color="#D1495B", lw=1.4)
-            ax4.axvline(p.n_blades, color="#1F4E79", ls="--", lw=1.2, label=f"{p.n_blades}x Blade Passing")
+            pos_dt = np.diff(t_win)
+            pos_dt = pos_dt[pos_dt > 0]
+            if n_pts >= 4 and len(pos_dt) > 0:
+                dt_avg = float(np.median(pos_dt))
+                freqs = np.fft.rfftfreq(n_pts, d=dt_avg)
+                harmonics = freqs * Trev
+                amps_y = 2.0 * np.abs(np.fft.rfft(cy_win - np.mean(cy_win))) / n_pts
+                m_h_y = (harmonics >= 0) & (harmonics <= 12)
+                ax4.vlines(harmonics[m_h_y], 0, amps_y[m_h_y], color="#D1495B", lw=1.4)
+                ax4.axvline(p.n_blades, color="#1F4E79", ls="--", lw=1.2, label=f"{p.n_blades}x Blade Passing")
         ax4.set_xlabel("Harmonic Order (f / f_rotor)")
         ax4.set_ylabel("Cy Amplitude")
         ax4.set_title("Side-Force Coefficient Cy Dynamic Spectrum")
@@ -286,12 +300,14 @@ def plot_load_rose(R: Dict[str, Any], outpath: Optional[str] = None) -> str:
         ax4.grid(True, alpha=0.3)
         ax4.legend(fontsize=8.5)
 
-    plt.tight_layout()
-    if outpath is None:
-        outpath = "16_load_rose.png"
-    os.makedirs(os.path.dirname(os.path.abspath(outpath)), exist_ok=True)
-    fig.savefig(outpath, bbox_inches="tight")
-    plt.close(fig)
+    try:
+        plt.tight_layout()
+        if outpath is None:
+            outpath = "16_load_rose.png"
+        os.makedirs(os.path.dirname(os.path.abspath(outpath)), exist_ok=True)
+        fig.savefig(outpath, bbox_inches="tight")
+    finally:
+        plt.close(fig)
     return outpath
 
 
@@ -477,47 +493,52 @@ def plot_yplus_monitor(
     max_yp = float(np.max(yp)) if len(yp) > 0 else 0.0
     mean_yp = float(np.mean(yp)) if len(yp) > 0 else 0.0
 
-    if max_yp <= 1.0:
+    good_lim = float(limit) if limit and limit > 0 else 1.0
+    caution_lim = max(5.0, good_lim * 2.0) if good_lim <= 1.0 else good_lim * 2.0
+
+    if max_yp <= good_lim:
         tier = "Good"
         passed = True
-        status_str = f"GOOD (mean = {mean_yp:.2f}, max = {max_yp:.2f} <= 1.0)"
-        msg = f"Wall y+ is optimal (mean = {mean_yp:.2f}, max = {max_yp:.2f} <= 1.0) - viscous sublayer fully resolved."
-    elif max_yp <= 5.0:
+        status_str = f"GOOD (mean = {mean_yp:.2f}, max = {max_yp:.2f} <= {good_lim:.1f})"
+        msg = f"Wall y+ is optimal (mean = {mean_yp:.2f}, max = {max_yp:.2f} <= {good_lim:.1f}) - viscous sublayer fully resolved."
+    elif max_yp <= caution_lim:
         tier = "Caution"
         passed = True
-        status_str = f"CAUTION (mean = {mean_yp:.2f}, max = {max_yp:.2f} <= 5.0)"
-        msg = f"Wall y+ is in caution range (mean = {mean_yp:.2f}, max = {max_yp:.2f} <= 5.0) - transitional buffer layer; low-Re models acceptable with minor damping."
+        status_str = f"CAUTION (mean = {mean_yp:.2f}, max = {max_yp:.2f} <= {caution_lim:.1f})"
+        msg = f"Wall y+ is in caution range (mean = {mean_yp:.2f}, max = {max_yp:.2f} <= {caution_lim:.1f}) - transitional buffer layer; low-Re models acceptable with minor damping."
     else:
         tier = "Poor"
         passed = False
-        status_str = f"POOR (mean = {mean_yp:.2f}, max = {max_yp:.2f} > 5.0)"
-        msg = f"Wall y+ is poor (mean = {mean_yp:.2f}, max = {max_yp:.2f} > 5.0) - viscous sublayer unresolved for low-Re turbulence models."
+        status_str = f"POOR (mean = {mean_yp:.2f}, max = {max_yp:.2f} > {caution_lim:.1f})"
+        msg = f"Wall y+ is poor (mean = {mean_yp:.2f}, max = {max_yp:.2f} > {caution_lim:.1f}) - viscous sublayer unresolved for low-Re turbulence models."
 
     diag = {
         "passed": passed,
         "tier": tier,
         "mean_yplus": mean_yp,
         "max_yplus": max_yp,
-        "limit": limit,
+        "limit": good_lim,
         "message": msg,
     }
 
     fig, ax = plt.subplots(figsize=(10, 4.5), dpi=130)
-    ax.plot(t, yp, color="#1F4E79", lw=1.2, label=f"Monitored Wall y+ (mean = {mean_yp:.2f}, max = {max_yp:.2f})")
-    ax.axhline(1.0, color="#10B981", ls="--", lw=1.5, label="Good Limit ($y^+ \\leq 1.0$)")
-    ax.axhline(5.0, color="#F59E0B", ls=":", lw=1.5, label="Caution Limit ($1 < y^+ \\leq 5.0$)")
+    try:
+        ax.plot(t, yp, color="#1F4E79", lw=1.2, label=f"Monitored Wall y+ (mean = {mean_yp:.2f}, max = {max_yp:.2f})")
+        ax.axhline(good_lim, color="#10B981", ls="--", lw=1.5, label=f"Good Limit ($y^+ \\leq {good_lim:.1f}$)")
+        ax.axhline(caution_lim, color="#F59E0B", ls=":", lw=1.5, label=f"Caution Limit (${good_lim:.1f} < y^+ \\leq {caution_lim:.1f}$)")
 
-    ax.set_xlabel("Simulation Flow Time (s)")
-    ax.set_ylabel("Wall y+ on Turbine Blades")
-    ax.set_title(f"Wall y+ Boundary Layer Resolution Check [{status_str}]")
-    ax.grid(True, alpha=0.3)
-    ax.legend(loc="upper right", fontsize=9)
+        ax.set_xlabel("Simulation Flow Time (s)")
+        ax.set_ylabel("Wall y+ on Turbine Blades")
+        ax.set_title(f"Wall y+ Boundary Layer Resolution Check [{status_str}]")
+        ax.grid(True, alpha=0.3)
+        ax.legend(loc="upper right", fontsize=9)
 
-    if outpath is None:
-        outpath = "19_yplus_monitor.png"
-    os.makedirs(os.path.dirname(os.path.abspath(outpath)), exist_ok=True)
-    fig.savefig(outpath, bbox_inches="tight")
-    plt.close(fig)
+        if outpath is None:
+            outpath = "19_yplus_monitor.png"
+        os.makedirs(os.path.dirname(os.path.abspath(outpath)), exist_ok=True)
+        fig.savefig(outpath, bbox_inches="tight")
+    finally:
+        plt.close(fig)
     return outpath, diag
 
 
@@ -541,65 +562,66 @@ def create_animated_cp_wheel(
 
     for frame_idx, th_cur in enumerate(theta_steps):
         fig, (ax_wheel, ax_plot) = plt.subplots(1, 2, figsize=(11, 5.0), dpi=100)
+        try:
+            # 1. Left Wheel Representation
+            ax_wheel.set_xlim(-1.4 * R_geom, 1.4 * R_geom)
+            ax_wheel.set_ylim(-1.4 * R_geom, 1.4 * R_geom)
+            ax_wheel.set_aspect("equal")
+            ax_wheel.axis("off")
 
-        # 1. Left Wheel Representation
-        ax_wheel.set_xlim(-1.4 * R_geom, 1.4 * R_geom)
-        ax_wheel.set_ylim(-1.4 * R_geom, 1.4 * R_geom)
-        ax_wheel.set_aspect("equal")
-        ax_wheel.axis("off")
+            # Rotor circular trajectory
+            rotor_circle = patches.Circle((0, 0), R_geom, color="#C9D8E6", fill=False, ls="--", lw=1.5)
+            shaft_circle = patches.Circle((0, 0), 0.12 * R_geom, color="#6C757D", fill=True)
+            ax_wheel.add_patch(rotor_circle)
+            ax_wheel.add_patch(shaft_circle)
 
-        # Rotor circular trajectory
-        rotor_circle = patches.Circle((0, 0), R_geom, color="#C9D8E6", fill=False, ls="--", lw=1.5)
-        shaft_circle = patches.Circle((0, 0), 0.12 * R_geom, color="#6C757D", fill=True)
-        ax_wheel.add_patch(rotor_circle)
-        ax_wheel.add_patch(shaft_circle)
+            # Wind direction arrow from left
+            ax_wheel.annotate(
+                "Wind U∞", xy=(-0.9 * R_geom, 0), xytext=(-1.35 * R_geom, 0),
+                arrowprops=dict(facecolor="#1F4E79", edgecolor="none", width=2.5, headwidth=8),
+                fontsize=9, fontweight="bold", color="#1F4E79", va="center"
+            )
 
-        # Wind direction arrow from left
-        ax_wheel.annotate(
-            "Wind U∞", xy=(-0.9 * R_geom, 0), xytext=(-1.35 * R_geom, 0),
-            arrowprops=dict(facecolor="#1F4E79", edgecolor="none", width=2.5, headwidth=8),
-            fontsize=9, fontweight="bold", color="#1F4E79", va="center"
-        )
+            # Blade positions
+            blade_spacing_deg = 360.0 / n_blades
+            for b in range(n_blades):
+                # theta = 0 at top (pi/2) moving CCW or CW
+                b_th_deg = (th_cur + b * blade_spacing_deg) % 360.0
+                # Cartesian angle: 0 deg azimuth is at top (x=0, y=R)
+                angle_rad = np.radians(90.0 - b_th_deg if p.rotation_dir == "cw" else 90.0 + b_th_deg)
+                bx = R_geom * np.cos(angle_rad)
+                by = R_geom * np.sin(angle_rad)
 
-        # Blade positions
-        blade_spacing_deg = 360.0 / n_blades
-        for b in range(n_blades):
-            # theta = 0 at top (pi/2) moving CCW or CW
-            b_th_deg = (th_cur + b * blade_spacing_deg) % 360.0
-            # Cartesian angle: 0 deg azimuth is at top (x=0, y=R)
-            angle_rad = np.radians(90.0 - b_th_deg if p.rotation_dir == "cw" else 90.0 + b_th_deg)
-            bx = R_geom * np.cos(angle_rad)
-            by = R_geom * np.sin(angle_rad)
+                # Strut
+                ax_wheel.plot([0, bx], [0, by], color="#9DB4C8", lw=1.2)
+                # Blade airfoil marker
+                color_b = PAL[0] if b == 0 else PAL[(b + 1) % len(PAL)]
+                blade_dot = patches.Circle((bx, by), 0.08 * R_geom, color=color_b, zorder=5)
+                ax_wheel.add_patch(blade_dot)
+                ax_wheel.text(bx * 1.18, by * 1.18, f"B{b + 1}", ha="center", va="center", fontsize=8, fontweight="bold", color=color_b)
 
-            # Strut
-            ax_wheel.plot([0, bx], [0, by], color="#9DB4C8", lw=1.2)
-            # Blade airfoil marker
-            color_b = PAL[0] if b == 0 else PAL[(b + 1) % len(PAL)]
-            blade_dot = patches.Circle((bx, by), 0.08 * R_geom, color=color_b, zorder=5)
-            ax_wheel.add_patch(blade_dot)
-            ax_wheel.text(bx * 1.18, by * 1.18, f"B{b + 1}", ha="center", va="center", fontsize=8, fontweight="bold", color=color_b)
+            ax_wheel.set_title(f"Rotor Configuration (θ1 = {th_cur:.0f}°)", fontsize=11, fontweight="bold")
 
-        ax_wheel.set_title(f"Rotor Configuration (θ1 = {th_cur:.0f}°)", fontsize=11, fontweight="bold")
+            # 2. Right Plot Representation: Cp vs Azimuth with current marker
+            _azaxis(ax_plot, upwind=True)
+            ax_plot.plot(th_curve, cp_curve, color="#1F4E79", lw=2, label="Mean Cp(θ)")
 
-        # 2. Right Plot Representation: Cp vs Azimuth with current marker
-        _azaxis(ax_plot, upwind=True)
-        ax_plot.plot(th_curve, cp_curve, color="#1F4E79", lw=2, label="Mean Cp(θ)")
+            cur_cp = float(np.interp(th_cur, th_curve, cp_curve))
+            ax_plot.plot(th_cur, cur_cp, "ro", ms=8, zorder=6, label=f"Instantaneous (θ={th_cur:.0f}°, Cp={cur_cp:.3f})")
+            ax_plot.axvline(th_cur, color="red", ls=":", lw=1.1, alpha=0.7)
+            ax_plot.axhline(0, color="gray", lw=0.8, ls=":")
 
-        cur_cp = float(np.interp(th_cur, th_curve, cp_curve))
-        ax_plot.plot(th_cur, cur_cp, "ro", ms=8, zorder=6, label=f"Instantaneous (θ={th_cur:.0f}°, Cp={cur_cp:.3f})")
-        ax_plot.axvline(th_cur, color="red", ls=":", lw=1.1, alpha=0.7)
-        ax_plot.axhline(0, color="gray", lw=0.8, ls=":")
+            ax_plot.set_ylabel("Instantaneous Rotor Cp")
+            ax_plot.set_title("Power Extraction over Azimuthal Cycle", fontsize=11, fontweight="bold")
+            ax_plot.legend(loc="upper right", fontsize=8.5)
 
-        ax_plot.set_ylabel("Instantaneous Rotor Cp")
-        ax_plot.set_title("Power Extraction over Azimuthal Cycle", fontsize=11, fontweight="bold")
-        ax_plot.legend(loc="upper right", fontsize=8.5)
-
-        fig.canvas.draw()
-        buf_fn = getattr(fig.canvas, "buffer_rgba")
-        rgba = np.asarray(buf_fn())
-        im_pil = Image.fromarray(rgba)
-        frames_pil.append(im_pil)
-        plt.close(fig)
+            fig.canvas.draw()
+            buf_fn = getattr(fig.canvas, "buffer_rgba")
+            rgba = np.asarray(buf_fn())
+            im_pil = Image.fromarray(rgba)
+            frames_pil.append(im_pil)
+        finally:
+            plt.close(fig)
 
     if outpath is None:
         outpath = "20_animated_cp_wheel.gif"
@@ -620,56 +642,67 @@ def create_animated_cp_wheel(
 # =============================================================================
 def plot_qa_dashboard_panel(qa_checks: List[Dict[str, Any]], outpath: Optional[str] = None) -> str:
     """Render comprehensive CFD data quality checks as a visual dashboard with pass/warn/fail cards."""
-    fig = plt.figure(figsize=(12, 7.5), dpi=130)
-    fig.patch.set_facecolor("white")
-    fig.suptitle("CFD Post-Processor: Data Quality & Numerical Integrity Audit", fontsize=14, fontweight="bold", x=0.05, ha="left")
-
     cols = 3
+    n_rows = max(1, math.ceil(len(qa_checks) / cols))
+    fig_h = max(4.2, 1.3 + n_rows * 1.65)
+    fig = plt.figure(figsize=(12, fig_h), dpi=130)
+    try:
+        fig.patch.set_facecolor("white")
+        top_margin = 0.08 if n_rows <= 4 else max(0.05, 0.4 / fig_h)
+        fig.suptitle(
+            "CFD Post-Processor: Data Quality & Numerical Integrity Audit",
+            fontsize=14, fontweight="bold", x=0.05, y=1.0 - top_margin * 0.45, ha="left"
+        )
 
-    for i, chk in enumerate(qa_checks):
-        col_idx = i % cols
-        row_idx = i // cols
+        usable_h = 1.0 - top_margin - 0.04
+        row_step = usable_h / n_rows
+        card_h = row_step * 0.82
+        w = 0.28
 
-        x = 0.05 + col_idx * 0.31
-        y = 0.82 - row_idx * 0.22
-        w, h = 0.28, 0.18
+        for i, chk in enumerate(qa_checks):
+            col_idx = i % cols
+            row_idx = i // cols
 
-        status = chk.get("status", "PASS")
-        if status == "PASS":
-            bg_col = "#E2EFDA"
-            border_col = "#276A3C"
-            badge_txt = "✓ PASS"
-            badge_col = "#276A3C"
-        elif status == "WARN":
-            bg_col = "#FFF2CC"
-            border_col = "#B25E00"
-            badge_txt = "⚠ WARN"
-            badge_col = "#B25E00"
-        else:
-            bg_col = "#FCE4D6"
-            border_col = "#C00000"
-            badge_txt = "✗ FAIL"
-            badge_col = "#C00000"
+            x = 0.05 + col_idx * 0.31
+            y = (1.0 - top_margin) - (row_idx + 1) * row_step + (row_step - card_h) * 0.5
 
-        fig.patches.append(patches.Rectangle((x, y), w, h, transform=fig.transFigure, fc=bg_col, ec=border_col, lw=1.2))
+            status = chk.get("status", "PASS")
+            if status == "PASS":
+                bg_col = "#E2EFDA"
+                border_col = "#276A3C"
+                badge_txt = "✓ PASS"
+                badge_col = "#276A3C"
+            elif status == "WARN":
+                bg_col = "#FFF2CC"
+                border_col = "#B25E00"
+                badge_txt = "⚠ WARN"
+                badge_col = "#B25E00"
+            else:
+                bg_col = "#FCE4D6"
+                border_col = "#C00000"
+                badge_txt = "✗ FAIL"
+                badge_col = "#C00000"
 
-        # Check Name & Badge
-        fig.text(x + 0.015, y + h - 0.03, chk.get("name", f"Check {i + 1}"), fontsize=9.5, fontweight="bold", color="#1F3864")
-        fig.text(x + w - 0.015, y + h - 0.03, badge_txt, fontsize=9.5, fontweight="bold", color=badge_col, ha="right")
+            fig.patches.append(patches.Rectangle((x, y), w, card_h, transform=fig.transFigure, fc=bg_col, ec=border_col, lw=1.2))
 
-        # Value & Criteria
-        fig.text(x + 0.015, y + h - 0.075, f"Value: {chk.get('value', 'n/a')}", fontsize=8.5, color="#333")
-        fig.text(x + 0.015, y + h - 0.115, f"Criteria: {chk.get('criteria', 'n/a')}", fontsize=8, color="#555")
+            chk_name = str(chk.get("name") or chk.get("check") or f"Check {i + 1}")
+            fig.text(x + 0.015, y + card_h * 0.82, chk_name, fontsize=9.5, fontweight="bold", color="#1F3864")
+            fig.text(x + w - 0.015, y + card_h * 0.82, badge_txt, fontsize=9.5, fontweight="bold", color=badge_col, ha="right")
 
-        # Details / Explanation
-        det = chk.get("details", "")
-        if len(det) > 55:
-            det = det[:52] + "..."
-        fig.text(x + 0.015, y + 0.02, det, fontsize=7.5, color="#666")
+            fig.text(x + 0.015, y + card_h * 0.56, f"Value: {chk.get('value', 'n/a')}", fontsize=8.5, color="#333")
+            criteria = chk.get("criteria")
+            if criteria is not None:
+                fig.text(x + 0.015, y + card_h * 0.34, f"Criteria: {criteria}", fontsize=8, color="#555")
 
-    if outpath is None:
-        outpath = "21_qa_dashboard.png"
-    os.makedirs(os.path.dirname(os.path.abspath(outpath)), exist_ok=True)
-    fig.savefig(outpath, bbox_inches="tight")
-    plt.close(fig)
+            det = str(chk.get("details") or chk.get("detail") or "")
+            if len(det) > 55:
+                det = det[:52] + "..."
+            fig.text(x + 0.015, y + card_h * 0.12, det, fontsize=7.5, color="#666")
+
+        if outpath is None:
+            outpath = "21_qa_dashboard.png"
+        os.makedirs(os.path.dirname(os.path.abspath(outpath)), exist_ok=True)
+        fig.savefig(outpath, bbox_inches="tight")
+    finally:
+        plt.close(fig)
     return outpath

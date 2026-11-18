@@ -157,7 +157,8 @@ def inspect_hdf5_case(cas_path: str) -> CaseInspectionResult:
                             res.cell_count = int(np.sum(max_ids - min_ids + 1))
 
                         if "name" in zt and "id" in zt:
-                            names_raw = zt["name"][0].decode("utf-8", errors="ignore").split(";")
+                            raw_cn = zt["name"][0]
+                            names_raw = (raw_cn.decode("utf-8", errors="ignore") if isinstance(raw_cn, (bytes, bytearray)) else str(raw_cn)).split(";")
                             ids = zt["id"][:]
                             types = zt["zoneType"][:] if "zoneType" in zt else [0] * len(names_raw)
                             for z_id, z_name, z_type in zip(ids, names_raw, types):
@@ -181,23 +182,27 @@ def inspect_hdf5_case(cas_path: str) -> CaseInspectionResult:
                             res.face_count = int(np.sum(face_max_ids - face_min_ids + 1))
 
                         if "name" in zf and "id" in zf:
-                            face_names = zf["name"][0].decode("utf-8", errors="ignore").split(";")
+                            raw_fn = zf["name"][0]
+                            face_names = (raw_fn.decode("utf-8", errors="ignore") if isinstance(raw_fn, (bytes, bytearray)) else str(raw_fn)).split(";")
                             f_ids = zf["id"][:]
-                            f_types = zf["zoneType"][:] if "zoneType" in zf else [0] * len(face_names)
+                            has_ftypes = "zoneType" in zf
+                            f_types = zf["zoneType"][:] if has_ftypes else [0] * len(face_names)
                             for z_id, z_name, z_type in zip(f_ids, face_names, f_types):
-                                zone = HDF5Zone(zone_id=int(z_id), name=z_name, zone_type=int(z_type))
+                                zt_int = int(z_type)
+                                zone = HDF5Zone(zone_id=int(z_id), name=z_name, zone_type=zt_int)
                                 res.face_zones.append(zone)
                                 low = z_name.lower()
+                                is_non_wall = (has_ftypes and zt_int != 3) or ("interior" in low) or ("interface" in low) or ("contact" in low)
                                 if "inlet" in low:
                                     res.inlet_zone = z_name
                                 elif "outlet" in low:
                                     res.outlet_zone = z_name
-                                elif "shaft" in low or "tower" in low:
-                                    res.shaft_zone = z_name
-                                elif "blade" in low or "airfoil" in low:
-                                    res.blade_zones.append(z_name)
                                 elif "interface" in low or "contact" in low:
                                     res.interface_zones.append(z_name)
+                                elif ("shaft" in low or "tower" in low) and not is_non_wall:
+                                    res.shaft_zone = z_name
+                                elif ("blade" in low or "airfoil" in low) and not is_non_wall:
+                                    res.blade_zones.append(z_name)
 
                     # Node count
                     coords = None
@@ -208,7 +213,7 @@ def inspect_hdf5_case(cas_path: str) -> CaseInspectionResult:
                                 coords = m["nodes"]["coords"][coord_keys[0]][:]
                                 res.node_count = len(coords)
 
-                    # Extract Blade Geometry (R, chord, centroids)
+                    # Extract Blade Geometry (R, chord, centroids in XY rotation plane)
                     if res.blade_zones and coords is not None and len(face_names) > 0 and "nodes" in m["faces"]:
                         try:
                             fn_group = m["faces"]["nodes"]
@@ -230,16 +235,30 @@ def inspect_hdf5_case(cas_path: str) -> CaseInspectionResult:
                                         end_pos = offsets[b_max]
                                         b_nodes = np.unique(nodes_flat[start_pos:end_pos])
                                         if len(b_nodes) > 0:
-                                            b_xy = coords[b_nodes - 1]
+                                            b_xy = coords[b_nodes - 1, :2]
                                             c_xy = np.mean(b_xy, axis=0)
                                             r_val = float(np.linalg.norm(c_xy))
                                             res.blade_centroids.append((float(c_xy[0]), float(c_xy[1])))
                                             blade_radii.append(r_val)
 
-                                            # Max distance between points = chord
-                                            diffs = b_xy[:, None, :] - b_xy[None, :, :]
-                                            dists = np.sqrt(np.sum(diffs**2, axis=-1))
-                                            blade_chords.append(float(np.max(dists)))
+                                            # Max 2D distance between points = chord (avoid O(N^2) blowup on 3D meshes)
+                                            if len(b_xy) <= 2000:
+                                                diffs = b_xy[:, None, :] - b_xy[None, :, :]
+                                                dists = np.sqrt(np.sum(diffs**2, axis=-1))
+                                                blade_chords.append(float(np.max(dists)))
+                                            else:
+                                                # Project onto principal axis + sample extremal hull points in O(N)
+                                                centered = b_xy - c_xy
+                                                _, _, vh = np.linalg.svd(centered, full_matrices=False)
+                                                proj0 = centered @ vh[0]
+                                                proj1 = centered @ vh[1]
+                                                ext_idx = np.unique([
+                                                    int(np.argmin(proj0)), int(np.argmax(proj0)),
+                                                    int(np.argmin(proj1)), int(np.argmax(proj1)),
+                                                ])
+                                                sub_xy = b_xy[ext_idx]
+                                                diffs = sub_xy[:, None, :] - sub_xy[None, :, :]
+                                                blade_chords.append(float(np.max(np.sqrt(np.sum(diffs**2, axis=-1)))))
 
                                 if blade_radii:
                                     res.rotor_radius_m = float(np.mean(blade_radii))
@@ -253,6 +272,7 @@ def inspect_hdf5_case(cas_path: str) -> CaseInspectionResult:
                             pass
 
             # 2. Parse Solver Settings & Boundary Conditions
+            _NUM = r"[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?"
             if "settings" in f:
                 s = f["settings"]
 
@@ -261,21 +281,35 @@ def inspect_hdf5_case(cas_path: str) -> CaseInspectionResult:
                     tv_raw = s["Thread Variables"][0]
                     tv = tv_raw.decode("utf-8", errors="ignore") if isinstance(tv_raw, bytes) else str(tv_raw)
 
-                    # Moving Mesh / MRF Omega in rotating zone
-                    m_omega = re.search(r"\bomega\s+\.\s+([0-9.+-eE]+)\)", tv)
-                    if not m_omega:
-                        m_omega = re.search(r"mrf-omega\s*\(constant\s+\.\s+([0-9.+-eE]+)\)", tv)
-                    if m_omega:
-                        res.omega_rad_s = float(m_omega.group(1))
-                        res.confidence["omega_rad_s"] = "verified_from_case_settings"
+                    # Moving Mesh / MRF Omega in rotating zone (skip stationary zones with omega=0)
+                    omega_cands = re.findall(rf"\bomega\s+\.\s+({_NUM})\)", tv)
+                    omega_cands += re.findall(rf"mrf-omega\s*\(constant\s+\.\s+({_NUM})\)", tv)
+                    for oc in omega_cands:
+                        try:
+                            ov = float(oc)
+                            if abs(ov) > 0.0:
+                                res.omega_rad_s = ov
+                                res.confidence["omega_rad_s"] = "verified_from_case_settings"
+                                break
+                        except ValueError:
+                            continue
+                    if res.omega_rad_s is None and omega_cands:
+                        try:
+                            res.omega_rad_s = float(omega_cands[0])
+                            res.confidence["omega_rad_s"] = "verified_from_case_settings"
+                        except ValueError:
+                            pass
 
                     # Velocity magnitude in inlet
-                    m_vmag = re.search(r"velocity-inlet[^\)]*\).*?\(vmag\s*\(constant\s+\.\s+([0-9.+-eE]+)\)", tv, re.DOTALL)
+                    m_vmag = re.search(rf"velocity-inlet[^\)]*\).*?\(vmag\s*\(constant\s+\.\s+({_NUM})\)", tv, re.DOTALL)
                     if not m_vmag:
-                        m_vmag = re.search(r"\(vmag\s*\(constant\s+\.\s+([0-9.+-eE]+)\)", tv)
+                        m_vmag = re.search(rf"\(vmag\s*\(constant\s+\.\s+({_NUM})\)", tv)
                     if m_vmag:
-                        res.velocity_m_s = float(m_vmag.group(1))
-                        res.confidence["velocity_m_s"] = "verified_from_case_settings"
+                        try:
+                            res.velocity_m_s = float(m_vmag.group(1))
+                            res.confidence["velocity_m_s"] = "verified_from_case_settings"
+                        except ValueError:
+                            pass
 
                 # Rampant Variables (report definitions and report files)
                 if "Rampant Variables" in s:
@@ -292,12 +326,18 @@ def inspect_hdf5_case(cas_path: str) -> CaseInspectionResult:
 
                         # Check moment center & axis
                         sub = rv[rm.start():rm.start() + 600]
-                        m_center = re.search(r'mom-center\s+([0-9.+-eE]+)\s+([0-9.+-eE]+)\s+([0-9.+-eE]+)', sub)
+                        m_center = re.search(rf'mom-center\s+({_NUM})\s+({_NUM})\s+({_NUM})', sub)
                         if m_center:
-                            rdef.mom_center = (float(m_center.group(1)), float(m_center.group(2)), float(m_center.group(3)))
-                        m_axis = re.search(r'mom-axis\s+([0-9.+-eE]+)\s+([0-9.+-eE]+)\s+([0-9.+-eE]+)', sub)
+                            try:
+                                rdef.mom_center = (float(m_center.group(1)), float(m_center.group(2)), float(m_center.group(3)))
+                            except ValueError:
+                                pass
+                        m_axis = re.search(rf'mom-axis\s+({_NUM})\s+({_NUM})\s+({_NUM})', sub)
                         if m_axis:
-                            rdef.mom_axis = (float(m_axis.group(1)), float(m_axis.group(2)), float(m_axis.group(3)))
+                            try:
+                                rdef.mom_axis = (float(m_axis.group(1)), float(m_axis.group(2)), float(m_axis.group(3)))
+                            except ValueError:
+                                pass
                         res.report_definitions[d_name] = rdef
 
                     # Extract Report Files (monitor sets)
@@ -310,11 +350,20 @@ def inspect_hdf5_case(cas_path: str) -> CaseInspectionResult:
                         rfile = HDF5ReportFile(name=rf_name, file_name=rf_path, frequency=rf_freq, report_defs=rf_defs)
                         res.report_files[rf_name] = rfile
 
-                    # Extract time step size if transient
-                    m_dt = re.search(r'\(time-step-size\s+\.\s+([0-9.+-eE]+)\)', rv)
+                    # Extract time step size if transient (Fluent legacy & 2024 R2 physical-time-step keys)
+                    m_dt = (
+                        re.search(rf'\(time-step-size\s+\.\s+({_NUM})\)', rv)
+                        or re.search(rf'\(physical-time-step\s+({_NUM})\)', rv)
+                        or re.search(rf'\(physical-time-step-expr\s+"({_NUM})"\)', rv)
+                    )
                     if m_dt:
-                        res.time_step_s = float(m_dt.group(1))
-                        res.confidence["time_step_s"] = "verified_from_case_settings"
+                        try:
+                            dt_v = float(m_dt.group(1))
+                            if dt_v > 0:
+                                res.time_step_s = dt_v
+                                res.confidence["time_step_s"] = "verified_from_case_settings"
+                        except ValueError:
+                            pass
 
                     # Viscous / Turbulence model detection using exact Scheme boolean flags
                     def _is_true(flag: str) -> bool:
@@ -371,12 +420,18 @@ def inspect_hdf5_case(cas_path: str) -> CaseInspectionResult:
                         res.time_model = "Steady"
 
                     # Reference fluid properties
-                    m_rho = re.search(r"\(reference-density\s+([0-9.+-eE]+)\)", rv)
+                    m_rho = re.search(rf"\(reference-density\s+({_NUM})\)", rv)
                     if m_rho and res.density_kg_m3 is None:
-                        res.density_kg_m3 = float(m_rho.group(1))
-                    m_mu = re.search(r"\(reference-viscosity\s+([0-9.+-eE]+)\)", rv)
+                        try:
+                            res.density_kg_m3 = float(m_rho.group(1))
+                        except ValueError:
+                            pass
+                    m_mu = re.search(rf"\(reference-viscosity\s+({_NUM})\)", rv)
                     if m_mu and res.viscosity_pa_s is None:
-                        res.viscosity_pa_s = float(m_mu.group(1))
+                        try:
+                            res.viscosity_pa_s = float(m_mu.group(1))
+                        except ValueError:
+                            pass
 
     except Exception as exc:
         res.is_valid = False

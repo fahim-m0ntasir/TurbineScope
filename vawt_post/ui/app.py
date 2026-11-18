@@ -1160,10 +1160,9 @@ class VAWTPostApp(ctk.CTk, TkinterDnD.DnDWrapper):  # type: ignore
                     w.grid_remove()
 
     def _setup_dnd(self):
-        """Enable drag-and-drop support if tkinterdnd2 is available."""
+        """Enable drag-and-drop support on the Qt 6 main window."""
         if _HAS_DND:
             try:
-                self.TkdndVersion = TkinterDnD._require(self)  # type: ignore
                 self.drop_target_register(DND_FILES)  # type: ignore[attr-defined]
                 self.dnd_bind("<<Drop>>", self._on_drop)  # type: ignore[attr-defined]
             except Exception:
@@ -1620,6 +1619,12 @@ class VAWTPostApp(ctk.CTk, TkinterDnD.DnDWrapper):  # type: ignore
             return
 
         prev_folder = getattr(self, "_last_autodetect_folder", None)
+        if not prev_folder:
+            existing_paths = [self.v_total.get().strip()] + [bv.get().strip() for bv in getattr(self, "v_blades", [])]
+            for ep in existing_paths:
+                if ep:
+                    prev_folder = os.path.dirname(os.path.abspath(ep))
+                    break
         abs_folder = os.path.abspath(folder)
         folder_changed = bool(
             prev_folder and os.path.normcase(os.path.abspath(prev_folder)) != os.path.normcase(abs_folder)
@@ -2033,7 +2038,12 @@ class VAWTPostApp(ctk.CTk, TkinterDnD.DnDWrapper):  # type: ignore
         self.status_lbl.configure(text="Processing simulation data...")
         self.footer_status_lbl.configure(text="● Running Analysis...", text_color="#3B82F6")
 
-        self.log_text.delete("1.0", "end")
+        if hasattr(self, "results_frame"):
+            if hasattr(self.results_frame, "log_search_var"):
+                self.results_frame.log_search_var.set("")
+            self.results_frame._clear_log()
+        else:
+            self.log_text.delete("1.0", "end")
         self._log(f"Starting VAWT Post-Processing: {p.n_blades}-blade turbine (R={p.R:g}m, c={p.chord:g}m, U={p.U:g}m/s)...")
 
         # Launch worker thread
@@ -2237,8 +2247,11 @@ class VAWTPostApp(ctk.CTk, TkinterDnD.DnDWrapper):  # type: ignore
                 self._poll_queue_after_id = self.after(100, self._poll_queue)
 
     def _log(self, msg: str, tag: Optional[str] = None):
-        self.log_text.insert("end", msg + "\n", tag)
-        self.log_text.see("end")
+        if hasattr(self, "results_frame"):
+            self.results_frame.log(msg, tag)
+        else:
+            self.log_text.insert("end", msg + "\n", tag)
+            self.log_text.see("end")
 
         if tag == "warn" or "WARNING" in msg:
             self.total_warnings += 1

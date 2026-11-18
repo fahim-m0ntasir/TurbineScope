@@ -32,7 +32,8 @@ from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.utils import get_column_letter as COL
 
 import matplotlib
-matplotlib.use("Agg")
+if matplotlib.get_backend().lower() not in ("agg", "qtagg"):
+    matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import seaborn as sns
 
@@ -163,17 +164,20 @@ def extract_aeropost_data(excel_path: str) -> Dict[str, Any]:
             "cy": _to_num_series(df_az, col_cy, np.nan) if col_cy else None,
         }).dropna(subset=["theta"]).reset_index(drop=True)
 
-        # Sheet: Blade_Azimuth
-        df_blade = _load_sheet_with_smart_header(wb, "Blade_Azimuth", ["θ (deg)", "t blade 1", "cp contribution"])
-        col_b_th = _find_column(df_blade, ["θ (deg)", "theta (deg)", "theta"])
-        col_b_t1 = _find_column(df_blade, ["t blade 1 (n·m)", "t blade 1", "m blade 1", "blade 1 torque"])
-        col_b_cp = _find_column(df_blade, ["cp contribution per blade", "cp contribution", "cp blade"])
+        # Sheet: Blade_Azimuth (optional when workbook was generated without individual blade monitors)
+        if "Blade_Azimuth" in wb.sheetnames:
+            df_blade = _load_sheet_with_smart_header(wb, "Blade_Azimuth", ["θ (deg)", "t blade 1", "cp contribution"])
+            col_b_th = _find_column(df_blade, ["θ (deg)", "theta (deg)", "theta"])
+            col_b_t1 = _find_column(df_blade, ["t blade 1 (n·m)", "t blade 1", "m blade 1", "blade 1 torque"])
+            col_b_cp = _find_column(df_blade, ["cp contribution per blade", "cp contribution", "cp blade"])
 
-        data["Blade_Azimuth"] = pd.DataFrame({
-            "theta": _to_num_series(df_blade, col_b_th, 0.0),
-            "t_blade_1": _to_num_series(df_blade, col_b_t1, 0.0),
-            "cp_contrib": _to_num_series(df_blade, col_b_cp, 0.0),
-        }).dropna(subset=["theta"]).reset_index(drop=True)
+            data["Blade_Azimuth"] = pd.DataFrame({
+                "theta": _to_num_series(df_blade, col_b_th, 0.0),
+                "t_blade_1": _to_num_series(df_blade, col_b_t1, 0.0),
+                "cp_contrib": _to_num_series(df_blade, col_b_cp, 0.0),
+            }).dropna(subset=["theta"]).reset_index(drop=True)
+        else:
+            data["Blade_Azimuth"] = pd.DataFrame(columns=["theta", "t_blade_1", "cp_contrib"])
 
         # Sheet: Alpha_Re
         df_alpha = _load_sheet_with_smart_header(wb, "Alpha_Re", ["θ (deg)", "α geometric", "w / u∞", "chord reynolds"])
@@ -349,14 +353,16 @@ def generate_aeropost_figures(
     cm_vals = df_az["cm"].values
 
     cm_cum = np.cumsum(cm_vals)
-    max_accum = np.max(cm_cum)
-    min_accum = np.min(cm_cum)
-    accum_range = max_accum - min_accum if (max_accum - min_accum) > 1e-9 else 1.0
-
-    if max_accum > 1e-9:
-        cm_norm = (cm_cum / max_accum) * 100.0
+    if len(cm_cum) > 0:
+        max_accum = float(np.max(cm_cum))
+        min_accum = float(np.min(cm_cum))
+        accum_range = max_accum - min_accum if (max_accum - min_accum) > 1e-9 else 1.0
+        if max_accum > 1e-9:
+            cm_norm = (cm_cum / max_accum) * 100.0
+        else:
+            cm_norm = ((cm_cum - min_accum) / accum_range) * 100.0
     else:
-        cm_norm = ((cm_cum - min_accum) / accum_range) * 100.0
+        cm_norm = np.array([], dtype=float)
 
     f2_num = start_fig_num + 1
     fig2, ax2 = plt.subplots(figsize=(7.5, 4.8), dpi=dpi)
@@ -437,17 +443,24 @@ def generate_aeropost_figures(
     figures[f3_filename] = f3_path
     figures["03_blade_tangential_load.png"] = f3_path
 
+    if has_t1:
+        f3_caption = (
+            f"Figure {f3_num}: Instantaneous tangential aerodynamic driving torque (N·m per m depth) on Blade 1 versus "
+            f"blade azimuth angle θ. Peak driving torque of {t1_vals[t_max_idx]:.3f} N·m occurs at θ = {th_b[t_max_idx]:.1f}°, "
+            f"with minimum torque of {t1_vals[t_min_idx]:.3f} N·m at θ = {th_b[t_min_idx]:.1f}° indicating dynamic stall recovery."
+        )
+    else:
+        f3_caption = (
+            f"Figure {f3_num}: Instantaneous tangential aerodynamic driving torque on Blade 1 versus blade azimuth angle θ "
+            f"(individual blade torque data unavailable in this workbook)."
+        )
     figures_meta.append({
         "id": f"Fig {f3_num:02d}",
         "num": f3_num,
         "file": f3_filename,
         "title": "Instantaneous Blade Tangential Load",
         "banner_title": f"Figure {f3_num}: Instantaneous Blade Tangential Load / Torque vs. Azimuth",
-        "caption": (
-            f"Figure {f3_num}: Instantaneous tangential aerodynamic driving torque (N·m per m depth) on Blade 1 versus "
-            f"blade azimuth angle θ. Peak driving torque of {t1_vals[t_max_idx]:.3f} N·m occurs at θ = {th_b[t_max_idx]:.1f}°, "
-            f"with minimum torque of {t1_vals[t_min_idx]:.3f} N·m at θ = {th_b[t_min_idx]:.1f}° indicating dynamic stall recovery."
-        )
+        "caption": f3_caption
     })
 
     # -------------------------------------------------------------------------
@@ -494,6 +507,10 @@ def generate_aeropost_figures(
     figures[f4_filename] = f4_path
     figures["04_geometric_kinematics.png"] = f4_path
 
+    aoa_min = float(np.min(aoa)) if len(aoa) > 0 else 0.0
+    aoa_max = float(np.max(aoa)) if len(aoa) > 0 else 0.0
+    wu_min = float(np.min(w_u)) if len(w_u) > 0 else 0.0
+    wu_max = float(np.max(w_u)) if len(w_u) > 0 else 0.0
     figures_meta.append({
         "id": f"Fig {f4_num:02d}",
         "num": f4_num,
@@ -502,7 +519,7 @@ def generate_aeropost_figures(
         "banner_title": f"Figure {f4_num}: Geometric Kinematics vs. Azimuth (Inflow Deceleration Notice)",
         "caption": (
             f"Figure {f4_num}: Theoretical blade inflow conditions versus blade azimuth angle θ: geometric angle of attack "
-            f"α_geom (extrema [{np.min(aoa):.1f}°, {np.max(aoa):.1f}°]) and normalized relative velocity W/U_inf (range [{np.min(w_u):.2f}, {np.max(w_u):.2f}]). "
+            f"α_geom (extrema [{aoa_min:.1f}°, {aoa_max:.1f}°]) and normalized relative velocity W/U_inf (range [{wu_min:.2f}, {wu_max:.2f}]). "
             f"Notice: Kinematic analytical values do not account for rotor induction flow deceleration."
         )
     })
@@ -867,15 +884,16 @@ def embed_aeropost_figures_safe(
         section_fill = PatternFill("solid", fgColor="D9E1F2")
 
         current_row: int = int(start_row)
-        for i, meta in enumerate(figures_meta):
+        placed_idx = 0
+        for meta in figures_meta:
             fig_path = figs_dict.get(meta["file"])
             if not fig_path or not os.path.isfile(fig_path):
                 continue
 
-            col_idx = 1 if (i % 2 == 0) else 14
+            col_idx = 1 if (placed_idx % 2 == 0) else 14
             col_letter = COL(col_idx)
 
-            if i % 2 == 0 and i > 0:
+            if placed_idx % 2 == 0 and placed_idx > 0:
                 current_row += 28
 
             end_col = col_idx + 11
@@ -895,6 +913,7 @@ def embed_aeropost_figures_safe(
                 ws.add_image(xl_img, f"{col_letter}{current_row}")
             except Exception as e:
                 ws.cell(row=current_row, column=col_idx, value=f"[Image Embedding Error: {e}]")
+            placed_idx += 1
 
         # Update Summary Sheet
         update_summary_sheet_aeropost(wb, summary, quartile_info)

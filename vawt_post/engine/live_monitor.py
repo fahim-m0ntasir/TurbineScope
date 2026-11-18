@@ -166,7 +166,7 @@ class IncrementalFileReader:
             is_generic_fb = (
                 cols == ["Col_1", "Col_2"]
                 and t_col is None
-                and int(info.get("data_row_count", 0) or 0) == 0
+                and int(info.get("row_count", 0) or 0) == 0
             )
             self.columns = cols
             self.step_col = info.get("step_col", 0)
@@ -221,6 +221,9 @@ class IncrementalFileReader:
             self.restart_detected = True
             self.reset()
         elif curr_size == self.byte_offset:
+            if not self.has_missing_col_error:
+                self.is_valid = True
+                self.error_msg = None
             return 0, [], [], []
 
         # Re-inspect header from start if previously locked on an empty/headerless fallback
@@ -246,6 +249,9 @@ class IncrementalFileReader:
                 fh.seek(self.byte_offset)
                 new_bytes = fh.read()
                 self.byte_offset = fh.tell()
+            if not self.has_missing_col_error:
+                self.is_valid = True
+                self.error_msg = None
         except PermissionError:
             # Fluent is actively writing to file; skip this cycle without marking invalid
             return 0, [], [], []
@@ -708,6 +714,7 @@ class LiveMonitorEngine:
                 self._prefix_cutoff_step.clear()
                 self._role_continuity_info.clear()
                 self._prefix_refined_for_gap = False
+                self.continuity_summary = None
                 self.recovered_mask = np.array([], dtype=bool)
                 self._live_tip_step = None
                 self._live_tip_time = None
@@ -856,11 +863,12 @@ class LiveMonitorEngine:
                     if r_info.get("status") == "incompatible_backup":
                         cutoff = int(c_steps[0]) if len(c_steps) > 0 else 0
                     elif cont_mode == "prefer_backup":
+                        c_first = int(c_steps[0]) if len(c_steps) > 0 else 0
                         b_rng = r_info.get("backup_step_range")
                         if b_rng and len(b_rng) == 2:
-                            cutoff = int(b_rng[1]) + 1
+                            cutoff = max(int(b_rng[1]) + 1, c_first)
                         else:
-                            cutoff = int(prior_s["step"][-1]) + 1 if len(prior_s["step"]) > 0 else int(c_steps[0])
+                            cutoff = max(int(prior_s["step"][-1]) + 1, c_first) if len(prior_s["step"]) > 0 else c_first
                     else:
                         cutoff = int(c_steps[0]) if len(c_steps) > 0 else 0
 
@@ -1865,7 +1873,7 @@ class LiveMonitorWorker:
         f: InputFiles,
         snapshot_queue: Optional[queue.Queue] = None,
         graph_refresh_interval: float = 120.0,
-        file_check_interval: float = 10.0,
+        file_check_interval: Optional[float] = None,
         target_revs: Optional[float] = None,
         **kwargs
     ):
@@ -1876,9 +1884,9 @@ class LiveMonitorWorker:
 
         g_int = kwargs.get("graph_refresh_interval_s", graph_refresh_interval)
         self.graph_refresh_interval = max(1.0, float(g_int))
-        if "file_check_interval_s" in kwargs:
+        if "file_check_interval_s" in kwargs and kwargs["file_check_interval_s"] is not None:
             self.file_check_interval = max(1.0, float(kwargs["file_check_interval_s"]))
-        elif file_check_interval != 10.0:
+        elif file_check_interval is not None:
             self.file_check_interval = max(1.0, float(file_check_interval))
         else:
             self.file_check_interval = self.graph_refresh_interval
@@ -2048,15 +2056,24 @@ class LiveMonitorWorker:
                     with self._lock:
                         prev_stall = self.engine._stall_alert_active
                         new_data = self.engine.tick_light()
-                        max_age = max(
-                            (max(0.0, now - rd.last_mtime) if rd.last_mtime > 0 else 0.0)
-                            for rd in self.engine.readers.values()
-                        ) if self.engine.readers else 0.0
-                        stall_due = (not prev_stall) and (max_age > self.engine.stalled_timeout) and len(self.engine.readers) > 0
-                        if new_data or stall_due or (now - last_snap_sent_time >= 10.0):
-                            snap = self.engine.get_snapshot(self.target_revs, is_full_refresh=False)
+                        if getattr(self.engine, "_force_reprocess", False):
+                            # Restart/truncation or newly discovered role: run full refresh immediately
+                            self.engine.tick()
+                            snap = self.engine.get_snapshot(self.target_revs, is_full_refresh=True)
                             self.queue.put(snap)
-                            last_snap_sent_time = time.time()
+                            t_done = time.time()
+                            last_heavy_time = t_done
+                            last_snap_sent_time = t_done
+                        else:
+                            max_age = max(
+                                (max(0.0, now - rd.last_mtime) if rd.last_mtime > 0 else 0.0)
+                                for rd in self.engine.readers.values()
+                            ) if self.engine.readers else 0.0
+                            stall_due = (not prev_stall) and (max_age > self.engine.stalled_timeout) and len(self.engine.readers) > 0
+                            if new_data or stall_due or (now - last_snap_sent_time >= 10.0):
+                                snap = self.engine.get_snapshot(self.target_revs, is_full_refresh=False)
+                                self.queue.put(snap)
+                                last_snap_sent_time = time.time()
                 except Exception as e:
                     with self._lock:
                         self.engine.add_alert("ERROR", f"Light check error: {e}")

@@ -15,7 +15,8 @@ from typing import Dict, List, Optional, Any
 
 import numpy as np
 import matplotlib
-matplotlib.use("Agg")
+if matplotlib.get_backend().lower() not in ("agg", "qtagg"):
+    matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
@@ -189,17 +190,30 @@ def calculate_gci(
         labels = [r.get("parameters", {}).get("preset_name") or r.get("_run_name", f"Run {i + 1}") for i, r in enumerate(runs)]
 
     # Refuse GCI calculation if non-study metadata differs across runs (ASME V&V 20 requirement)
+    def _numeric_differs(vals: List[Any], rel_tol: float = 0.002) -> bool:
+        present = [v for v in vals if v is not None]
+        if not present:
+            return False
+        if len(present) != len(vals):
+            return True
+        try:
+            fvals = [float(v) for v in present]
+        except (TypeError, ValueError):
+            return len(set(present)) > 1
+        ref = max(abs(max(fvals)), abs(min(fvals)), 1e-12)
+        return (max(fvals) - min(fvals)) / ref > rel_tol
+
     mismatches = []
     if study_type == "mesh":
         turb_models = [r.get("case_metadata", {}).get("turb_model") for r in runs]
         if any(tm is not None for tm in turb_models) and len(set(turb_models)) > 1:
             mismatches.append(f"Turbulence model differs: {turb_models}")
         dts = [r.get("case_metadata", {}).get("time_step_s") or r.get("parameters", {}).get("dt") for r in runs]
-        if any(dt is not None for dt in dts) and len(set(dts)) > 1:
+        if _numeric_differs(dts):
             mismatches.append(f"Time step dt differs: {dts}")
         for param_key in ("U", "R", "tsr", "omega"):
             vals = [r.get("parameters", {}).get(param_key) for r in runs]
-            if any(v is not None for v in vals) and len(set(vals)) > 1:
+            if _numeric_differs(vals):
                 mismatches.append(f"Parameter '{param_key}' differs: {vals}")
     else:  # "timestep"
         mesh_counts = [r.get("case_metadata", {}).get("mesh_cells") for r in runs]
@@ -210,7 +224,7 @@ def calculate_gci(
             mismatches.append(f"Turbulence model differs: {turb_models}")
         for param_key in ("U", "R", "tsr", "omega"):
             vals = [r.get("parameters", {}).get(param_key) for r in runs]
-            if any(v is not None for v in vals) and len(set(vals)) > 1:
+            if _numeric_differs(vals):
                 mismatches.append(f"Parameter '{param_key}' differs: {vals}")
 
     if mismatches:
@@ -224,7 +238,10 @@ def calculate_gci(
     # In 2D: characteristic cell size h = (domain_area / N_cells)^0.5
     triplets = []
     for i, r in enumerate(runs):
-        phi = float(r.get("summary_kpis", {}).get(key_metric, 0.0))
+        raw_phi = r.get("summary_kpis", {}).get(key_metric)
+        if raw_phi is None:
+            raise ValueError(f"Run '{labels[i]}' is missing summary KPI '{key_metric}' for GCI study.")
+        phi = float(raw_phi)
         if study_type == "mesh":
             cells = r.get("case_metadata", {}).get("mesh_cells")
             if not cells or cells <= 0:
@@ -243,6 +260,11 @@ def calculate_gci(
 
     r21 = h2 / h1
     r32 = h3 / h2
+    if r21 <= 1.0 + 1e-9 or r32 <= 1.0 + 1e-9:
+        raise ValueError(
+            f"GCI requires 3 strictly distinct refinement levels (h1 < h2 < h3); "
+            f"got r21 = {r21:.4f}, r32 = {r32:.4f}."
+        )
 
     r_warning = None
     if r21 < 1.3 or r32 < 1.3:
@@ -254,6 +276,9 @@ def calculate_gci(
     if abs(eps21) < 1e-12 or abs(eps32) < 1e-12:
         return {
             "status": "CONVERGED_EXACT",
+            "study_type": study_type,
+            "key_metric": key_metric,
+            "fine_label": lbl1, "medium_label": lbl2, "coarse_label": lbl3,
             "message": "Solution difference between grids is negligible; numerical discretization error is already below machine precision.",
             "phi1": phi1, "phi2": phi2, "phi3": phi3,
             "h1": h1, "h2": h2, "h3": h3,
@@ -269,6 +294,9 @@ def calculate_gci(
         # Oscillatory convergence
         return {
             "status": "OSCILLATORY_CONVERGENCE",
+            "study_type": study_type,
+            "key_metric": key_metric,
+            "fine_label": lbl1, "medium_label": lbl2, "coarse_label": lbl3,
             "message": (
                 f"Oscillatory convergence detected (ratio of differences eps21/eps32 = {R_ratio:.3f} < 0). "
                 "Per ASME V&V 20 and Celik et al. (2008), monotonic power-law Richardson extrapolation is not valid for oscillatory data."
@@ -280,6 +308,26 @@ def calculate_gci(
             "gci_fine_pct": float(abs((phi1 - phi2) / max(abs(phi1), 1e-6)) * 125.0),
             "observed_order_p": float("nan"),
             "phi_ext": float(0.5 * (phi1 + phi2)),
+        }
+
+    if R_ratio >= 1.0:
+        return {
+            "status": "DIVERGENT",
+            "study_type": study_type,
+            "key_metric": key_metric,
+            "fine_label": lbl1, "medium_label": lbl2, "coarse_label": lbl3,
+            "message": (
+                f"Monotonic divergence detected (ratio of differences eps21/eps32 = {R_ratio:.3f} >= 1.0). "
+                "Richardson extrapolation is not valid for divergent solutions."
+            ),
+            "phi1": phi1, "phi2": phi2, "phi3": phi3,
+            "h1": h1, "h2": h2, "h3": h3,
+            "r21": r21, "r32": r32,
+            "r_warning": r_warning,
+            "gci_fine_pct": float(abs((phi1 - phi2) / max(abs(phi1), 1e-6)) * 125.0),
+            "observed_order_p": float("nan"),
+            "phi_ext": float("nan"),
+            "convergence_mode": "Divergence",
         }
 
     oscillatory = (R_ratio < 0.0)
@@ -418,43 +466,49 @@ def plot_gci_extrapolation(
     filepath: str
 ) -> str:
     """Render Richardson extrapolation curve with GCI error band towards h -> 0."""
-    os.makedirs(os.path.dirname(filepath), exist_ok=True)
+    os.makedirs(os.path.dirname(os.path.abspath(filepath)), exist_ok=True)
     fig, ax = plt.subplots(figsize=(7, 4.5), dpi=300)
+    try:
+        h_pts = np.array([gci["h1"], gci["h2"], gci["h3"]])
 
-    h_pts = np.array([gci["h1"], gci["h2"], gci["h3"]])
+        # Theoretical continuum curve phi(h) = phi_ext + alpha * h^p (when valid)
+        p = gci.get("observed_order_p", float("nan"))
+        phi_ext = gci.get("phi_ext", float("nan"))
+        has_fit = (
+            isinstance(p, (int, float)) and math.isfinite(p)
+            and isinstance(phi_ext, (int, float)) and math.isfinite(phi_ext)
+        )
+        if has_fit:
+            alpha = (gci["phi1"] - phi_ext) / (gci["h1"] ** p) if gci["h1"] > 0 else 0.0
+            h_fine_grid = np.linspace(0, max(h_pts) * 1.15, 200)
+            phi_model = phi_ext + alpha * (h_fine_grid ** p)
+            ax.plot(h_fine_grid, phi_model, "k--", label=f"Richardson Fit ($p={p:.2f}$)", linewidth=1.5)
 
-    # Theoretical continuum curve phi(h) = phi_ext + alpha * h^p
-    p = gci["observed_order_p"]
-    phi_ext = gci["phi_ext"]
-    alpha = (gci["phi1"] - phi_ext) / (gci["h1"] ** p) if gci["h1"] > 0 else 0.0
+        # Plot grid points with fine GCI error bar on grid 1
+        gci_val = gci["gci_fine_pct"] / 100.0 * abs(gci["phi1"])
+        ax.errorbar(
+            [gci["h1"]], [gci["phi1"]], yerr=[gci_val], fmt="ro", markersize=7,
+            capsize=5, capthick=1.5, label=f"Fine Grid 1 $\\pm \\text{{GCI}}_{{21}}$ ({gci['gci_fine_pct']:.2f}%)"
+        )
+        ax.plot([gci["h2"]], [gci["phi2"]], "bs", markersize=6, label=f"Medium Grid 2 ({gci.get('medium_label', 'Medium')})")
+        ax.plot([gci["h3"]], [gci["phi3"]], "g^", markersize=6, label=f"Coarse Grid 3 ({gci.get('coarse_label', 'Coarse')})")
 
-    h_fine_grid = np.linspace(0, max(h_pts) * 1.15, 200)
-    phi_model = phi_ext + alpha * (h_fine_grid ** p)
+        # Plot extrapolated zero-grid point
+        if has_fit:
+            ax.plot([0], [phi_ext], "m*", markersize=10, label=f"Extrapolated ($h \\to 0$): {phi_ext:.4f}")
 
-    ax.plot(h_fine_grid, phi_model, "k--", label=f"Richardson Fit ($p={p:.2f}$)", linewidth=1.5)
+        scale_lbl = "$h = 1/\\sqrt{N_{\\text{cells}}}$" if gci.get("study_type") == "mesh" else "$\\Delta t$ (s)"
+        ax.set_xlabel(f"Discretization Scale ({scale_lbl})", fontsize=11, fontweight="bold")
+        ax.set_ylabel(f"Solution Metric ({gci.get('key_metric', 'Cp')})", fontsize=11, fontweight="bold")
+        p_txt = f"Observed Order $p = {p:.2f}$" if has_fit else f"Status: {gci.get('status', 'N/A')}"
+        ax.set_title(f"Grid Convergence Index (GCI) Verification Study ({p_txt})", fontsize=12, fontweight="bold", pad=12)
+        ax.grid(True, linestyle="--", alpha=0.6)
+        ax.legend(frameon=True, fontsize=9)
 
-    # Plot grid points with fine GCI error bar on grid 1
-    gci_val = gci["gci_fine_pct"] / 100.0 * abs(gci["phi1"])
-    ax.errorbar(
-        [gci["h1"]], [gci["phi1"]], yerr=[gci_val], fmt="ro", markersize=7,
-        capsize=5, capthick=1.5, label=f"Fine Grid 1 $\\pm \\text{{GCI}}_{{21}}$ ({gci['gci_fine_pct']:.2f}%)"
-    )
-    ax.plot([gci["h2"]], [gci["phi2"]], "bs", markersize=6, label=f"Medium Grid 2 ({gci['medium_label']})")
-    ax.plot([gci["h3"]], [gci["phi3"]], "g^", markersize=6, label=f"Coarse Grid 3 ({gci['coarse_label']})")
-
-    # Plot extrapolated zero-grid point
-    ax.plot([0], [phi_ext], "m*", markersize=10, label=f"Extrapolated ($h \\to 0$): {phi_ext:.4f}")
-
-    scale_lbl = "$h = 1/\\sqrt{N_{\\text{cells}}}$" if gci.get("study_type") == "mesh" else "$\\Delta t$ (s)"
-    ax.set_xlabel(f"Discretization Scale ({scale_lbl})", fontsize=11, fontweight="bold")
-    ax.set_ylabel(f"Solution Metric ({gci.get('key_metric', 'Cp')})", fontsize=11, fontweight="bold")
-    ax.set_title(f"Grid Convergence Index (GCI) Verification Study (Observed Order $p = {p:.2f}$)", fontsize=12, fontweight="bold", pad=12)
-    ax.grid(True, linestyle="--", alpha=0.6)
-    ax.legend(frameon=True, fontsize=9)
-
-    plt.tight_layout()
-    fig.savefig(filepath)
-    plt.close(fig)
+        fig.tight_layout()
+        fig.savefig(filepath)
+    finally:
+        plt.close(fig)
     return filepath
 
 
@@ -570,4 +624,7 @@ def export_comparison_excel(
         ws_gci.column_dimensions["B"].width = 24
         ws_gci.column_dimensions["C"].width = 55
 
-    wb.save(filepath)
+    try:
+        wb.save(filepath)
+    finally:
+        wb.close()

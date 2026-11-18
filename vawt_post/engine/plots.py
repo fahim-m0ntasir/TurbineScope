@@ -1169,13 +1169,17 @@ def make_figures(
                 fig.suptitle("")
                 for ax in fig.get_axes():
                     ax.set_title("")
-            primary_path = os.path.join(outdir, f"{base}.png")
-            for fmt in formats:
-                ext = fmt.lstrip(".")
+            norm_exts = [fmt.lstrip(".").lower() for fmt in formats if fmt and fmt.lstrip(".")]
+            if not norm_exts:
+                norm_exts = ["png"]
+            primary_path: Optional[str] = None
+            for ext in norm_exts:
                 target_path = os.path.join(outdir, f"{base}.{ext}")
                 fig.savefig(target_path, bbox_inches="tight", dpi=dpi_save)
+                if ext == "png" or primary_path is None:
+                    primary_path = target_path
             fig.clear()
-            figs[name] = primary_path
+            figs[name] = primary_path or os.path.join(outdir, f"{base}.png")
 
     export_captions(R, outdir)
     log(f"Rendered {len(figs)} publication figures in {outdir}")

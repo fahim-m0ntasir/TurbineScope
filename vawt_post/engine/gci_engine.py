@@ -312,11 +312,12 @@ def validate_gci_comparability(
     grids: List[GridLevelData],
     r21: float,
     r32: float,
-    asymptotic_range: float
+    asymptotic_range: float,
+    is_temporal: bool = False,
 ) -> Tuple[bool, List[str]]:
     """
     Apply ASME V&V 20 / Celik et al. guardrails:
-      1. Check time step difference across systems <= 0.2%
+      1. Check time step difference across systems <= 0.2% (spatial GCI) or mesh cell count equality (temporal GCI)
       2. Check revolutions completed match
       3. Check refinement ratios r21, r32 >= 1.10 (mandatory), >= 1.30 (recommended)
       4. Check turbulence model and operating parameters match
@@ -324,17 +325,26 @@ def validate_gci_comparability(
     """
     failed_checks: List[str] = []
 
-    # 1. Compare time step across systems
-    dt_vals = [g.dt_s for g in grids if g.dt_s is not None and g.dt_s > 0]
-    if len(dt_vals) == 3:
-        dt_max = max(dt_vals)
-        dt_min = min(dt_vals)
-        dt_mean = sum(dt_vals) / 3.0
-        rel_dt_diff = (dt_max - dt_min) / dt_mean
-        if rel_dt_diff > 0.002:
+    # 1. Compare time step (spatial GCI) or mesh cell count (temporal GCI) across systems
+    if not is_temporal:
+        dt_vals = [g.dt_s for g in grids if g.dt_s is not None and g.dt_s > 0]
+        if len(dt_vals) == 3:
+            dt_max = max(dt_vals)
+            dt_min = min(dt_vals)
+            dt_mean = sum(dt_vals) / 3.0
+            rel_dt_diff = (dt_max - dt_min) / dt_mean
+            if rel_dt_diff > 0.002:
+                failed_checks.append(
+                    f"Time-step mismatch: dt varies by {rel_dt_diff*100:.2f}% (> 0.2%) across grids "
+                    f"({dt_min:.6e}s to {dt_max:.6e}s). Runs must share identical dt for spatial GCI."
+                )
+    else:
+        dt_vals = [g.dt_s for g in grids if g.dt_s is not None and g.dt_s > 0]
+        cell_vals = [g.cell_count for g in grids if g.cell_count is not None and g.cell_count > 0]
+        if len(dt_vals) == 3 and len(cell_vals) == 3 and len(set(cell_vals)) > 1:
             failed_checks.append(
-                f"Time-step mismatch: dt varies by {rel_dt_diff*100:.2f}% (> 0.2%) across grids "
-                f"({dt_min:.6e}s to {dt_max:.6e}s). Runs must share identical dt for spatial GCI."
+                f"Mesh cell count mismatch: temporal GCI runs use different meshes "
+                f"({min(cell_vals):,} to {max(cell_vals):,} cells). Runs must share identical mesh for temporal GCI."
             )
 
     # 2. Compare revolutions completed
@@ -395,20 +405,35 @@ def compute_asme_gci(
     if len(grids) != 3:
         return None
 
-    # Sort descending by cell count (or step count for temporal)
-    sorted_grids = sorted(grids, key=lambda g: g.cell_count, reverse=True)
-    g1, g2, g3 = sorted_grids[0], sorted_grids[1], sorted_grids[2]
+    # Sort from finest to coarsest:
+    # - For temporal GCI with distinct positive dt_s, sort ascending by dt_s (smallest dt = finest)
+    # - Otherwise sort descending by cell_count (largest N = finest)
+    use_dt_refinement = (
+        is_temporal
+        and all(g.dt_s is not None and g.dt_s > 0 for g in grids)
+    )
+    if use_dt_refinement:
+        sorted_grids = sorted(grids, key=lambda g: float(g.dt_s or 0.0))
+        g1, g2, g3 = sorted_grids[0], sorted_grids[1], sorted_grids[2]
+        dt1, dt2, dt3 = float(g1.dt_s or 0.0), float(g2.dt_s or 0.0), float(g3.dt_s or 0.0)
+        if dt1 <= 0 or dt2 <= dt1 or dt3 <= dt2:
+            return None
+        r21 = dt2 / dt1
+        r32 = dt3 / dt2
+    else:
+        sorted_grids = sorted(grids, key=lambda g: g.cell_count, reverse=True)
+        g1, g2, g3 = sorted_grids[0], sorted_grids[1], sorted_grids[2]
 
-    N1, N2, N3 = float(g1.cell_count), float(g2.cell_count), float(g3.cell_count)
+        N1, N2, N3 = float(g1.cell_count), float(g2.cell_count), float(g3.cell_count)
+        if dimension <= 0 or N3 <= 0 or N1 <= N2 or N2 <= N3:
+            return None
+
+        # 1. Grid refinement ratios (D = 1 for 1D temporal step counts, else spatial dimension)
+        D = 1.0 if is_temporal else float(dimension)
+        r21 = (N1 / N2) ** (1.0 / D)
+        r32 = (N2 / N3) ** (1.0 / D)
+
     phi1, phi2, phi3 = float(g1.phi), float(g2.phi), float(g3.phi)
-
-    if dimension <= 0 or N3 <= 0 or N1 <= N2 or N2 <= N3:
-        return None
-
-    # 1. Grid refinement ratios
-    D = float(dimension)
-    r21 = (N1 / N2) ** (1.0 / D)
-    r32 = (N2 / N3) ** (1.0 / D)
 
     # 2. Grid step differences
     eps21 = phi2 - phi1
@@ -416,15 +441,16 @@ def compute_asme_gci(
 
     # Check convergence condition according to ASME V&V 20 / Celik (2008):
     # Convergence ratio R_conv = eps21 / eps32 = (phi2 - phi1) / (phi3 - phi2)
-    # Monotonic convergence: 0 < R_conv < 1
+    # Monotonic convergence: 0 <= R_conv < 1 (eps21 == 0 means fine-grid exact convergence)
     # Oscillatory convergence: R_conv < 0
-    # Divergence: R_conv > 1
+    # Divergence: R_conv >= 1
     denom_eps32 = eps32 if abs(eps32) > 1e-14 else (1e-14 if eps32 >= 0 else -1e-14)
     R_conv = eps21 / denom_eps32
 
-    is_monotonic_conv = 0.0 < R_conv < 1.0
-    is_oscillatory_conv = R_conv < 0.0
-    is_divergent = R_conv > 1.0 or R_conv == 0.0
+    is_exact_fine = abs(eps21) <= 1e-12
+    is_monotonic_conv = (0.0 < R_conv < 1.0) or (is_exact_fine and abs(eps32) > 1e-12)
+    is_oscillatory_conv = (not is_exact_fine) and (R_conv < 0.0)
+    is_divergent = (not is_exact_fine) and (R_conv >= 1.0)
 
     # 3. Solve for apparent order p via fixed-point iteration (Celik et al. 2008)
     denom_eps21 = eps21 if abs(eps21) > 1e-14 else (1e-14 if eps21 >= 0 else -1e-14)
@@ -490,6 +516,17 @@ def compute_asme_gci(
         gci_fine_21_pct = 0.0
         gci_medium_32_pct = 0.0
         notes.append("Grid solutions are numerically identical across all 3 levels (GCI = 0.00%).")
+    elif is_exact_fine:
+        is_monotonic_conv = True
+        is_oscillatory_conv = False
+        is_divergent = False
+        phi_ext_21 = phi1
+        e_a_21 = 0.0
+        e_a_32 = abs((phi2 - phi3) / denom_phi2)
+        e_ext_21 = 0.0
+        gci_fine_21_pct = 0.0
+        gci_medium_32_pct = (safety_factor * e_a_32 / abs(denom32)) * 100.0
+        notes.append("Fine and medium solutions are numerically identical (GCI_21 = 0.00%).")
     elif is_monotonic_conv:
         phi_ext_21 = ((r21**p) * phi1 - phi2) / denom21
         denom_ext = abs(phi_ext_21) if abs(phi_ext_21) > 1e-9 else 1.0
@@ -531,7 +568,8 @@ def compute_asme_gci(
         grids=sorted_grids,
         r21=r21,
         r32=r32,
-        asymptotic_range=asymptotic_range
+        asymptotic_range=asymptotic_range,
+        is_temporal=is_temporal,
     )
 
     # Combined spatial-temporal uncertainty calculation
@@ -575,11 +613,10 @@ def plot_gci_curve(report: GCIReport, out_path: Optional[str] = None, dark_mode:
     Generate an academic publication plot showing the Richardson Extrapolation
     and explicitly labeled GCI uncertainty error bands (GCI21, GCI32).
     """
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
+    from matplotlib.figure import Figure
 
-    fig, ax = plt.subplots(figsize=(7.8, 5.0), dpi=150)
+    fig = Figure(figsize=(7.8, 5.0), dpi=150)
+    ax = fig.add_subplot(111)
 
     if dark_mode:
         fig.patch.set_facecolor("#1E293B")
@@ -594,11 +631,9 @@ def plot_gci_curve(report: GCIReport, out_path: Optional[str] = None, dark_mode:
     else:
         ax.grid(True, linestyle=":", alpha=0.6)
 
-    D = float(report.dimension)
-    N1 = float(report.fine.cell_count)
     h1 = 1.0
-    h2 = (N1 / float(report.medium.cell_count)) ** (1.0 / D)
-    h3 = (N1 / float(report.coarse.cell_count)) ** (1.0 / D)
+    h2 = float(report.r21)
+    h3 = float(report.r21 * report.r32)
 
     err_points = [
         abs(report.fine.phi) * (report.gci_fine_21_pct / 100.0),
@@ -680,14 +715,16 @@ def plot_gci_curve(report: GCIReport, out_path: Optional[str] = None, dark_mode:
     else:
         ax.legend(loc="best", framealpha=0.9, fontsize=9.0)
 
-    plt.tight_layout()
-
     if out_path:
+        from matplotlib.backends.backend_agg import FigureCanvasAgg
+        FigureCanvasAgg(fig)
+        fig.tight_layout()
         os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
-        plt.savefig(out_path, dpi=300, bbox_inches="tight")
-        plt.close(fig)
+        fig.savefig(out_path, dpi=300, bbox_inches="tight")
+        fig.clear()
         return out_path
 
+    fig.tight_layout()
     return fig
 
 
@@ -850,10 +887,11 @@ def plot_multi_grid_curve(
     """
     Generate clean publication curve for multi-grid dependency study across all mesh levels.
     """
-    import matplotlib.pyplot as plt
+    from matplotlib.figure import Figure
     import numpy as np
 
-    fig, ax = plt.subplots(figsize=(7.5, 4.8), dpi=100)
+    fig = Figure(figsize=(7.5, 4.8), dpi=100)
+    ax = fig.add_subplot(111)
 
     bg_col = "#0F172A" if dark_mode else "#FFFFFF"
     text_col = "#F8FAFC" if dark_mode else "#0F172A"
@@ -867,7 +905,10 @@ def plot_multi_grid_curve(
         spine.set_color(text_col)
 
     N_fine = float(report.grids[0].cell_count) if report.grids else 1.0
-    h_vals = [(N_fine / float(g.cell_count)) ** (1.0 / report.dimension) for g in report.grids]
+    h_vals = [
+        (N_fine / float(g.cell_count)) ** (1.0 / report.dimension) if g.cell_count > 0 else 1.0
+        for g in report.grids
+    ]
     phi_vals = [g.phi for g in report.grids]
 
     colors = ["#3B82F6", "#10B981", "#F59E0B", "#EC4899", "#8B5CF6", "#06B6D4"]
@@ -908,13 +949,15 @@ def plot_multi_grid_curve(
     else:
         ax.legend(loc="best", framealpha=0.9, fontsize=8.5)
 
-    plt.tight_layout()
-
     if out_path:
+        from matplotlib.backends.backend_agg import FigureCanvasAgg
+        FigureCanvasAgg(fig)
+        fig.tight_layout()
         os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
-        plt.savefig(out_path, dpi=300, bbox_inches="tight")
-        plt.close(fig)
+        fig.savefig(out_path, dpi=300, bbox_inches="tight")
+        fig.clear()
         return out_path
 
+    fig.tight_layout()
     return fig
 

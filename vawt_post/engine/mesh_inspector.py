@@ -93,21 +93,25 @@ def resolve_workbench_system_context(path_or_folder: str) -> Dict[str, Any]:
     if not os.path.isdir(p):
         return ctx
 
-    # Case 1: User selected Fluent/, MECH/, or DM/ directly inside dp0/FFF-{n}
+    # Case 1: User selected Fluent/, MECH/, or DM/ directly inside dp{k}/{sys_id}
     base = os.path.basename(p)
     parent = os.path.dirname(p)
-    if base.lower() in ("fluent", "mech", "dm") and os.path.basename(os.path.dirname(parent)).lower() == "dp0":
+    _is_dp_dir = lambda dname: bool(re.match(r"^dp\d+$", dname, re.IGNORECASE))
+    if base.lower() in ("fluent", "mech", "dm") and _is_dp_dir(os.path.basename(os.path.dirname(parent))):
         p = parent
         base = os.path.basename(p)
         parent = os.path.dirname(p)
 
-    # Case 2: User selected dp0/FFF or dp0/FFF-{number}
+    # Case 2: User selected dp{k}/FFF, dp{k}/FFF-{number}, or any dp{k}/{sys_id} with Fluent/
     sys_dir: Optional[str] = None
     fluent_dir: Optional[str] = None
     dp_dir: Optional[str] = None
     sys_id: Optional[str] = None
 
-    if os.path.basename(parent).lower() == "dp0" and re.match(r"^(FFF|FLTG|FLUID)(-\d+)?$", base, re.IGNORECASE):
+    if _is_dp_dir(os.path.basename(parent)) and (
+        re.match(r"^(FFF|FLTG|FLUID)(-\d+)?$", base, re.IGNORECASE)
+        or (base.lower() not in ("global", "geom", "backup") and os.path.isdir(os.path.join(p, "Fluent")))
+    ):
         sys_dir = p
         dp_dir = parent
         sys_id = base
@@ -122,10 +126,10 @@ def resolve_workbench_system_context(path_or_folder: str) -> Dict[str, Any]:
         sys_id = base
         ctx["is_workbench_system"] = True
         fluent_dir = os.path.join(sys_dir, "Fluent")
-        if os.path.basename(parent).lower() == "dp0":
+        if _is_dp_dir(os.path.basename(parent)):
             dp_dir = parent
     else:
-        # Case 3: User selected a .wbpj folder, *_files folder, or dp0 folder -> use scanner
+        # Case 3: User selected a .wbpj folder, *_files folder, or dp{k} folder -> use scanner
         try:
             from vawt_post.engine.workbench import scan_workbench_project
             wb = scan_workbench_project(p)
@@ -142,7 +146,7 @@ def resolve_workbench_system_context(path_or_folder: str) -> Dict[str, Any]:
                 sys_id = best.system_id
                 fluent_dir = best.fluent_dir
                 ctx["is_workbench_system"] = True
-                if sys_dir and os.path.basename(os.path.dirname(sys_dir)).lower() == "dp0":
+                if sys_dir and _is_dp_dir(os.path.basename(os.path.dirname(sys_dir))):
                     dp_dir = os.path.dirname(sys_dir)
         except Exception:
             pass
@@ -166,6 +170,7 @@ def resolve_workbench_system_context(path_or_folder: str) -> Dict[str, Any]:
 
     if dp_dir:
         files_root = os.path.dirname(dp_dir)
+        dp_name = os.path.basename(dp_dir)
         ctx["files_root"] = files_root
         ctx["project_root"] = os.path.dirname(files_root)
         g_mech = os.path.join(dp_dir, "global", "MECH")
@@ -175,7 +180,7 @@ def resolve_workbench_system_context(path_or_folder: str) -> Dict[str, Any]:
         if os.path.isfile(wbdp):
             ctx["wbdp_file"] = wbdp
         if sys_id:
-            prog_fl = os.path.join(files_root, "progress_files", "dp0", sys_id, "Fluent")
+            prog_fl = os.path.join(files_root, "progress_files", dp_name, sys_id, "Fluent")
             if os.path.isdir(prog_fl):
                 ctx["progress_fluent_dir"] = prog_fl
 
@@ -207,7 +212,7 @@ def resolve_workbench_system_context(path_or_folder: str) -> Dict[str, Any]:
 
     if ctx["mech_dir"]:
         ctx["msh_file"] = _pick_latest_file(
-            glob.glob(os.path.join(ctx["mech_dir"], "*.msh*"))
+            glob.glob(os.path.join(ctx["mech_dir"], "*.msh"))
         )
     if ctx["global_mech_dir"]:
         mshdb_cands = []
@@ -429,11 +434,22 @@ def inspect_hdf5_mesh_quality(
                     if int(zct) == 0 and zmx >= zmn
                 ]) if np.any(c_ztypes == 0) else np.arange(0)
                 offset_m = 0
-                for ck in sorted(m["cells"]["ctype"].keys()):
+                def _num_key(k: str) -> Tuple[int, str]:
+                    return (int(k), k) if k.isdigit() else (10**9, k)
+                for ck in sorted(m["cells"]["ctype"].keys(), key=_num_key):
                     cg = m["cells"]["ctype"][ck]
-                    for dkey in cg.keys():
-                        arr_ct = cg[dkey][:]
-                        if len(mixed_indices) > 0 and offset_m + len(arr_ct) <= len(mixed_indices):
+                    for dkey in sorted(cg.keys(), key=_num_key):
+                        ds_ct = cg[dkey]
+                        arr_ct = ds_ct[:]
+                        min_a = ds_ct.attrs.get("minId", cg.attrs.get("minId"))
+                        max_a = ds_ct.attrs.get("maxId", cg.attrs.get("maxId"))
+                        if min_a is not None and max_a is not None:
+                            s0 = max(0, int(np.asarray(min_a).flat[0]) - 1)
+                            s1 = min(n_cells, int(np.asarray(max_a).flat[0]))
+                            cnt_sl = min(s1 - s0, len(arr_ct))
+                            if cnt_sl > 0:
+                                cell_types[s0 : s0 + cnt_sl] = arr_ct[:cnt_sl]
+                        elif len(mixed_indices) > 0 and offset_m + len(arr_ct) <= len(mixed_indices):
                             cell_types[mixed_indices[offset_m : offset_m + len(arr_ct)]] = arr_ct
                             offset_m += len(arr_ct)
                         elif len(arr_ct) <= n_cells:
@@ -455,13 +471,36 @@ def inspect_hdf5_mesh_quality(
             dom_len = x_max - x_min
             dom_wid = y_max - y_min
 
-            # Faces
-            c0_raw = m["faces"]["c0"][list(m["faces"]["c0"].keys())[0]][:].astype(np.int64) - 1
-            c1_arr = m["faces"]["c1"][list(m["faces"]["c1"].keys())[0]][:].astype(np.int64) - 1
-            n_faces = len(c0_raw)
-            fn_g = m["faces"]["nodes"][list(m["faces"]["nodes"].keys())[0]]
+            # Faces (respect minId/maxId attributes across one or more datasets)
+            def _num_k(k: str) -> Tuple[int, str]:
+                return (int(k), k) if k.isdigit() else (10**9, k)
+
+            fn_g = m["faces"]["nodes"][sorted(m["faces"]["nodes"].keys(), key=_num_k)[0]]
             nn = fn_g["nnodes"][:]
             nf = fn_g["nodes"][:]
+            n_faces = len(nn)
+
+            def _load_face_cell_arr(grp: Any, total_f: int) -> np.ndarray:
+                out_arr = np.full(total_f, -1, dtype=np.int64)
+                for fk in sorted(grp.keys(), key=_num_k):
+                    ds = grp[fk]
+                    vals = ds[:].astype(np.int64) - 1
+                    min_f = ds.attrs.get("minId")
+                    max_f = ds.attrs.get("maxId")
+                    if min_f is not None and max_f is not None:
+                        s0 = max(0, int(np.asarray(min_f).flat[0]) - 1)
+                        s1 = min(total_f, int(np.asarray(max_f).flat[0]))
+                        cnt = min(s1 - s0, len(vals))
+                        if cnt > 0:
+                            out_arr[s0 : s0 + cnt] = vals[:cnt]
+                    else:
+                        cnt = min(total_f, len(vals))
+                        if cnt > 0:
+                            out_arr[:cnt] = vals[:cnt]
+                return out_arr
+
+            c0_raw = _load_face_cell_arr(m["faces"]["c0"], n_faces)
+            c1_pad_all = _load_face_cell_arr(m["faces"]["c1"], n_faces) if "c1" in m["faces"] else np.full(n_faces, -1, dtype=np.int64)
 
             ft_c = m["faces"]["zoneTopology"]
             f_names_raw = ft_c["name"][0]
@@ -524,7 +563,8 @@ def inspect_hdf5_mesh_quality(
                         el = np.linalg.norm(pb - pa, axis=1)
                         fz_entry["length_m"] = round(float(np.sum(el)), 6)
                         low_n = zname.lower()
-                        if "blade" in low_n or "airfoil" in low_n:
+                        is_non_wall = (int(zt_code) != 0 and int(zt_code) != 3) or ("interior" in low_n) or ("interface" in low_n) or ("contact" in low_n)
+                        if ("blade" in low_n or "airfoil" in low_n) and not is_non_wall:
                             pts_u = np.unique(
                                 np.concatenate([nf[offs[f_sl_v]] - 1, nf[offs[f_sl_v] + 1] - 1])
                             )
@@ -535,7 +575,7 @@ def inspect_hdf5_mesh_quality(
                                 if len(bxy) <= 2000:
                                     diffs = bxy[:, None, :] - bxy[None, :, :]
                                     blade_chords.append(float(np.max(np.sqrt(np.sum(diffs ** 2, axis=-1)))))
-                        elif "interface" in low_n and "contact" in low_n or (
+                        elif ("interface" in low_n and "contact" in low_n) or (
                             "interface" in low_n and "interior" not in low_n
                         ):
                             r_if = float(np.mean(np.linalg.norm(pa, axis=1)))
@@ -551,9 +591,7 @@ def inspect_hdf5_mesh_quality(
                 n_a = nf[offs[idx_f]] - 1
                 n_b = nf[offs[idx_f] + 1] - 1
                 c0 = c0_raw[idx_f]
-                c1_pad = np.full(len(nn), -1, dtype=np.int64)
-                c1_pad[: len(c1_arr)] = c1_arr
-                c1 = c1_pad[idx_f]
+                c1 = c1_pad_all[idx_f]
 
                 p0 = xy[n_a]
                 p1 = xy[n_b]
@@ -740,16 +778,18 @@ def inspect_hdf5_mesh_quality(
                     "core_ar_max": round(float(np.max(core_ar)), 2),
                     "wall_bl_ar_mean": round(float(np.mean(wall_ar)), 2) if wall_ar is not None else None,
                     "wall_bl_ar_max": round(float(np.max(wall_ar)), 2) if wall_ar is not None else None,
-                    "growth_rate_mean": round(float(np.mean(gr)), 3),
-                    "growth_rate_p95": round(float(np.percentile(gr, 95)), 3),
-                    "growth_rate_max": round(float(np.max(gr)), 3),
-                    "growth_rate_gt_2_pct": round(100.0 * float(np.mean(gr > 2.0)), 2),
+                    "growth_rate_mean": round(float(np.mean(gr)), 3) if len(gr) > 0 else None,
+                    "growth_rate_p95": round(float(np.percentile(gr, 95)), 3) if len(gr) > 0 else None,
+                    "growth_rate_max": round(float(np.max(gr)), 3) if len(gr) > 0 else None,
+                    "growth_rate_gt_2_pct": round(100.0 * float(np.mean(gr > 2.0)), 2) if len(gr) > 0 else None,
                 }
                 result["quality"] = q_dict
 
-                # Wall / Boundary Layer first-layer thickness y1 and estimated y+
-                for zname, fmn, fmx in zip(f_names, f_min, f_max):
+                # Wall / Boundary Layer first-layer thickness y1 and estimated y+ (y_P = y_cent)
+                for zname, fmn, fmx, zt_code in zip(f_names, f_min, f_max, f_ztypes):
                     low_w = zname.lower()
+                    if (int(zt_code) != 0 and int(zt_code) != 3) or "interior" in low_w or "interface" in low_w or "contact" in low_w:
+                        continue
                     if not ("blade" in low_w or "airfoil" in low_w or "shaft" in low_w or "tower" in low_w):
                         continue
                     if fmx < fmn or fmx >= len(nn):
@@ -766,7 +806,7 @@ def inspect_hdf5_mesh_quality(
                     ds = np.linalg.norm(wb - wa, axis=1)
                     ev = (wb - wa) / np.maximum(ds, 1e-30)[:, None]
                     wc_xy = np.stack([cx[w_cells], cy[w_cells]], axis=1)
-                    # For quad/triangle boundary cell, perpendicular centroid offset gives normal height
+                    # For quad/triangle boundary cell, perpendicular centroid offset gives y_P; full height is 2*y_P / 3*y_P
                     y_cent = np.abs((wc_xy[:, 0] - wa[:, 0]) * (-ev[:, 1]) + (wc_xy[:, 1] - wa[:, 1]) * ev[:, 0])
                     is_tri_w = cell_types[w_cells] == 1
                     y1_arr = np.where(is_tri_w, 3.0 * y_cent, 2.0 * y_cent)
@@ -780,8 +820,9 @@ def inspect_hdf5_mesh_quality(
                         re_peak = max(1000.0, float(rho_ref) * v_peak * float(c_ref) / float(mu_ref))
                         u_tau_nom = v_nom * np.sqrt(0.058 * (re_nom ** -0.2) / 2.0)
                         u_tau_peak = v_peak * np.sqrt(0.058 * (re_peak ** -0.2) / 2.0)
-                        yplus_mean = round(float(rho_ref) * u_tau_nom * float(np.mean(y1_arr)) / float(mu_ref), 3)
-                        yplus_peak = round(float(rho_ref) * u_tau_peak * float(np.mean(y1_arr)) / float(mu_ref), 3)
+                        # Fluent finite-volume y+ uses first-cell centroid distance y_P = y_cent
+                        yplus_mean = round(float(rho_ref) * u_tau_nom * float(np.mean(y_cent)) / float(mu_ref), 3)
+                        yplus_peak = round(float(rho_ref) * u_tau_peak * float(np.mean(y_cent)) / float(mu_ref), 3)
 
                     result["wall_layers"].append({
                         "zone": zname,

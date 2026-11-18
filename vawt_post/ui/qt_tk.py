@@ -15,7 +15,19 @@ import re
 import sys
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
-from PySide6.QtCore import Qt, QRect, QRectF, QSize, QPoint, QPointF, QTimer, QItemSelectionModel
+from PySide6.QtCore import (
+    Qt,
+    QObject,
+    QThread,
+    Signal,
+    QRect,
+    QRectF,
+    QSize,
+    QPoint,
+    QPointF,
+    QTimer,
+    QItemSelectionModel,
+)
 from PySide6.QtGui import (
     QFont,
     QColor,
@@ -132,8 +144,29 @@ def _apply_windows_titlebar_theme(win: QWidget, is_dark: bool = True) -> None:
         pass
 
 
+class _MainThreadDispatcher(QObject):
+    """Marshals callables from worker Python threads onto the Qt GUI thread."""
+
+    dispatch = Signal(object)
+
+    def __init__(self, parent: Optional[QObject] = None) -> None:
+        super().__init__(parent)
+        self.dispatch.connect(self._invoke, Qt.ConnectionType.QueuedConnection)
+
+    @staticmethod
+    def _invoke(fn: Callable[[], Any]) -> None:
+        try:
+            fn()
+        except Exception:
+            pass
+
+
+_MAIN_DISPATCHER: Optional[_MainThreadDispatcher] = None
+
+
 def ensure_qapp() -> QApplication:
     """Return the active QApplication singleton, creating it with Fusion + dark QSS if needed."""
+    global _MAIN_DISPATCHER
     app = QApplication.instance()
     if app is None:
         app = QApplication(sys.argv if sys.argv else ["TurbineScope"])
@@ -141,6 +174,8 @@ def ensure_qapp() -> QApplication:
         app.setStyle("Fusion")
         app.setPalette(_build_qpalette("dark"))
         app.setStyleSheet(get_qt_stylesheet("dark"))
+    if _MAIN_DISPATCHER is None and QThread.currentThread() == app.thread():
+        _MAIN_DISPATCHER = _MainThreadDispatcher(app)
     return app  # type: ignore[return-value]
 
 
@@ -1219,8 +1254,13 @@ class QtWidgetBase:
 
     def grab_set(self) -> None:
         if isinstance(self, QDialog):
+            was_visible = self.isVisible()
+            if was_visible:
+                self.hide()
             self.setWindowModality(Qt.WindowModality.ApplicationModal)
             self.setModal(True)
+            if was_visible:
+                self.show()
 
     def transient(self, parent: Any = None) -> None:
         pass
@@ -1230,31 +1270,50 @@ class QtWidgetBase:
             return "after_noop"
         self._after_counter += 1
         tid = f"after_{id(self)}_{self._after_counter}"
-        timer = QTimer(self if isinstance(self, QWidget) else None)
-        timer.setSingleShot(True)
+        delay_ms = max(1, int(ms))
 
-        def _fire() -> None:
-            self._after_timers.pop(tid, None)
-            try:
-                func(*args)
-            except Exception:
-                pass
-            finally:
+        def _schedule_on_gui() -> None:
+            cancelled = getattr(self, "_cancelled_after_ids", None)
+            if isinstance(cancelled, set) and tid in cancelled:
+                cancelled.discard(tid)
+                return
+            timer = QTimer(self if isinstance(self, QWidget) else None)
+            timer.setSingleShot(True)
+
+            def _fire() -> None:
+                self._after_timers.pop(tid, None)
                 try:
-                    timer.deleteLater()
+                    func(*args)
                 except Exception:
                     pass
+                finally:
+                    try:
+                        timer.deleteLater()
+                    except Exception:
+                        pass
 
-        timer.timeout.connect(_fire)
-        self._after_timers[tid] = timer
-        timer.start(max(1, int(ms)))
+            timer.timeout.connect(_fire)
+            self._after_timers[tid] = timer
+            timer.start(delay_ms)
+
+        app = QApplication.instance()
+        if app is not None and QThread.currentThread() != app.thread():
+            if _MAIN_DISPATCHER is not None:
+                _MAIN_DISPATCHER.dispatch.emit(_schedule_on_gui)
+                return tid
+        _schedule_on_gui()
         return tid
 
     def after_cancel(self, tid: Any) -> None:
-        timer = self._after_timers.pop(str(tid), None)
+        tid_s = str(tid)
+        timer = self._after_timers.pop(tid_s, None)
         if timer is not None:
             timer.stop()
             timer.deleteLater()
+        else:
+            if not hasattr(self, "_cancelled_after_ids"):
+                self._cancelled_after_ids: set = set()
+            self._cancelled_after_ids.add(tid_s)
 
     def bind(self, sequence: str, func: Callable[..., Any], add: Any = None) -> None:
         seq = str(sequence)
@@ -1262,14 +1321,6 @@ class QtWidgetBase:
             self._bound_handlers[seq] = []
         if not add:
             self._bound_handlers[seq].clear()
-            sc_map = getattr(self, "_qt_shortcuts", None)
-            if isinstance(sc_map, dict) and seq in sc_map:
-                for old_sc in sc_map.pop(seq, []):
-                    try:
-                        old_sc.setEnabled(False)
-                        old_sc.deleteLater()
-                    except Exception:
-                        pass
         self._bound_handlers[seq].append(func)
 
         if isinstance(self, QWidget):
@@ -1288,11 +1339,18 @@ class QtWidgetBase:
             elif seq == "<Return>" and isinstance(self, QDialog):
                 qt_seq = "Return"
             if qt_seq:
-                sc = QShortcut(QKeySequence(qt_seq), self)
-                sc.activated.connect(lambda _f=func: _f(None))
                 if not hasattr(self, "_qt_shortcuts"):
                     self._qt_shortcuts: Dict[str, List[QShortcut]] = {}
-                self._qt_shortcuts.setdefault(seq, []).append(sc)
+                # Replace any existing shortcut on the same normalized key sequence to avoid Qt ambiguity
+                for old_sc in self._qt_shortcuts.pop(qt_seq, []):
+                    try:
+                        old_sc.setEnabled(False)
+                        old_sc.deleteLater()
+                    except Exception:
+                        pass
+                sc = QShortcut(QKeySequence(qt_seq), self)
+                sc.activated.connect(lambda _f=func: _f(None))
+                self._qt_shortcuts.setdefault(qt_seq, []).append(sc)
 
     def bind_all(self, sequence: str, func: Callable[..., Any], add: Any = None) -> None:
         self.bind(sequence, func, add=add)
@@ -1600,7 +1658,10 @@ class CTkLabel(QLabel, QtWidgetBase):
         return _strip_vs15(self.text())
 
     def _apply_props(self, kwargs: Dict[str, Any]) -> None:
-        if "text" in kwargs and self._textvar is None:
+        if "image" in kwargs:
+            self._ctk_image = kwargs["image"]
+            self._update_image_pixmap()
+        if "text" in kwargs and self._textvar is None and self._ctk_image is None:
             new_t = _force_text_icons(str(kwargs["text"]))
             if new_t != self.text():
                 self.setText(new_t)
@@ -1632,9 +1693,6 @@ class CTkLabel(QLabel, QtWidgetBase):
             else:
                 v_align = Qt.AlignmentFlag.AlignVCenter
             self.setAlignment(h_align | v_align)
-        if "image" in kwargs:
-            self._ctk_image = kwargs["image"]
-            self._update_image_pixmap()
         if any(k in kwargs for k in self._QSS_STYLE_KEYS):
             self._apply_qss()
 
@@ -1674,8 +1732,9 @@ class CTkButton(QPushButton, QtWidgetBase):
             "hover_color": ("#144870", "#144870"),
             "text_color": ("#FFFFFF", "#FFFFFF"),
             "corner_radius": 6,
-            "height": 28,
         }
+        if kwargs.get("image") is None and "height" not in kwargs:
+            defaults["height"] = 28
         if kwargs.get("fg_color") == "transparent":
             defaults["text_color"] = ("#111827", "#DCE4EE")
             defaults["hover_color"] = ("#E5E7EB", "#383838")
@@ -1683,6 +1742,7 @@ class CTkButton(QPushButton, QtWidgetBase):
         super().__init__(_force_text_icons(_escape_qt_ampersand(str(defaults.get("text", "")))), parent_w)
         self._init_qt_base(master, **defaults)
         self._command: Optional[Callable[[], Any]] = defaults.get("command")
+        self._ctk_image: Optional[Any] = defaults.get("image")
         self.setCursor(Qt.CursorShape.PointingHandCursor)
 
         if "font" in defaults:
@@ -1694,13 +1754,41 @@ class CTkButton(QPushButton, QtWidgetBase):
             self.setEnabled(False)
             self.setCursor(Qt.CursorShape.ArrowCursor)
 
+        if self._ctk_image is not None:
+            self._update_image_icon()
+
         self.clicked.connect(self._on_clicked)
         self._apply_qss()
+
+    def _update_image_icon(self) -> None:
+        img = self._ctk_image
+        if img is None:
+            self.setIcon(QIcon())
+            return
+        pix: Optional[QPixmap] = None
+        if hasattr(img, "get_pixmap"):
+            pix = img.get_pixmap()
+        elif isinstance(img, QPixmap):
+            pix = img
+        if pix is not None and not pix.isNull():
+            self.setIcon(QIcon(pix))
+            sz = getattr(img, "size", None)
+            if isinstance(sz, (tuple, list)) and len(sz) >= 2:
+                self.setIconSize(QSize(int(sz[0]), int(sz[1])))
+            else:
+                self.setIconSize(pix.deviceIndependentSize().toSize())
+
+    def _on_theme_refresh(self) -> None:
+        if self._ctk_image is not None:
+            self._update_image_icon()
 
     def _get_text(self) -> str:
         return _strip_vs15(_unescape_qt_ampersand(self.text()))
 
     def _apply_props(self, kwargs: Dict[str, Any]) -> None:
+        if "image" in kwargs:
+            self._ctk_image = kwargs["image"]
+            self._update_image_icon()
         if "text" in kwargs:
             new_t = _force_text_icons(_escape_qt_ampersand(str(kwargs["text"])))
             if new_t != self.text():
@@ -2135,7 +2223,39 @@ class CTkSwitch(CTkCheckBox):
         p.end()
 
 
-CTkRadioButton = CTkCheckBox
+class CTkRadioButton(CTkCheckBox):
+    """Native Qt 6 radio button honoring CustomTkinter `value=` and shared Variable selection."""
+
+    def __init__(self, master: Any = None, **kwargs: Any) -> None:
+        val = kwargs.pop("value", kwargs.get("onvalue", True))
+        self._radio_value: Any = val
+        kwargs["onvalue"] = val
+        kwargs.setdefault("offvalue", None)
+        super().__init__(master, **kwargs)
+        self._sync_from_var()
+
+    def _sync_from_var(self, *_: Any) -> None:
+        if self._var is None:
+            return
+        v = self._var.get()
+        is_on = str(v) == str(self._radio_value)
+        if self.isChecked() != is_on:
+            self.blockSignals(True)
+            self.setChecked(is_on)
+            self.blockSignals(False)
+
+    def _on_toggled(self, checked: bool) -> None:
+        if not checked:
+            # Radio buttons stay selected until another option in the group sets the variable
+            if self._var is None or str(self._var.get()) == str(self._radio_value):
+                self.blockSignals(True)
+                self.setChecked(True)
+                self.blockSignals(False)
+            return
+        if self._var is not None:
+            self._var.set(self._radio_value)
+        if self._command is not None:
+            self._command()
 
 
 class CTkSegmentedButton(QFrame, QtWidgetBase):

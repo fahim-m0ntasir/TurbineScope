@@ -69,11 +69,21 @@ def inspect_fluent_report(path: str) -> Dict[str, Any]:
                 q = re.findall(r'"([^"]+)"', s)
                 if len(q) >= 2 and not re.match(r"^[-+0-9.eE\s]+$", s):
                     names = q
-                elif ("(" in line or line.startswith("#") or line.lower().startswith("time") or line.lower().startswith("step")) and len(toks) >= 2 and all(not re.match(r"^[-+0-9.eE]+$", t) for t in toks):
-                    names = toks
+                else:
+                    hdr_toks = s.lstrip("#").replace("(", " ").replace(")", " ").replace(",", " ").split()
+                    if ("(" in line or line.startswith("#") or line.lower().startswith("time") or line.lower().startswith("step")) and len(hdr_toks) >= 2 and all(not re.match(r"^[-+0-9.eE]+$", t) for t in hdr_toks):
+                        names = hdr_toks
 
-    width = min(sample_widths) if sample_widths else 2
-    if names is None:
+    if sample_widths:
+        if names is not None and len(names) in sample_widths:
+            width = len(names)
+        else:
+            counts = Counter(sample_widths)
+            max_cnt = max(counts.values())
+            width = max(w for w, c in counts.items() if c == max_cnt)
+    else:
+        width = len(names) if names is not None else 2
+    if names is None or (sample_widths and len(names) != width):
         names = [f"Col_{i + 1}" for i in range(width)]
 
     i_step = 0
@@ -173,8 +183,10 @@ def read_fluent_report(
             q = re.findall(r'"([^"]+)"', s)
             if len(q) >= 2 and not re.match(r"^[-+0-9.eE\s]+$", s):
                 names = q
-            elif ("(" in line or line.startswith("#") or line.lower().startswith("time") or line.lower().startswith("step")) and len(toks) >= 2 and all(not re.match(r"^[-+0-9.eE]+$", t) for t in toks):
-                names = toks
+            else:
+                hdr_toks = s.lstrip("#").replace("(", " ").replace(")", " ").replace(",", " ").split()
+                if ("(" in line or line.startswith("#") or line.lower().startswith("time") or line.lower().startswith("step")) and len(hdr_toks) >= 2 and all(not re.match(r"^[-+0-9.eE]+$", t) for t in hdr_toks):
+                    names = hdr_toks
 
     if not rows:
         raise ValueError(f"No numeric rows found in '{os.path.basename(path)}'. Verify that this is a valid Fluent report file.")
@@ -358,37 +370,42 @@ def parse_report_filename_role(filename: str, n_blades: int = 8) -> Tuple[str, O
     if "shaft" in stem and any(k in stem for k in ("moment", "torque", "cm")) and not any(f in stem for f in ("force", "fx", "fy", "drag", "lift")):
         return "shaft_moment", None, warnings
 
-    # Blade number detection: strict regex matching digit attached to blade, bl, moment, torque, fx, fy, forcex, forcey
-    # Examples: moment1, moment-1, moment_1, blade1, bl2, torque3, fx_1, fy-2, forcex1, blade_2_torque
-    m_blade_num = re.search(r"(?:blade|bl|moment|torque|fx|fy|force[_-]?[xy])[_-]?([1-8])(?![0-9])", stem)
+    # Blade number detection: strict regex matching digit attached to blade, airfoil, bl, moment, torque, fx, fy, forcex, forcey
+    # Examples: moment1, moment-1, moment_1, blade1, airfoil1, bl2, torque3, fx_1, fy-2, forcex1, blade_2_torque
+    m_blade_num = re.search(r"(?:blade|airfoil|bl|moment|torque|fx|fy|force[_-]?[xy])[_-]?([1-8])(?![0-9])", stem)
     # Also check if filename has single digit after - or _ before extension or -rfile
-    if not m_blade_num:
+    is_total_explicit = any(k in stem for k in ("total", "rotor", "all_blades", "moment_all", "moment-all"))
+    if not m_blade_num and not is_total_explicit:
         m_blade_num = re.search(r"[_-]([1-8])(?:[_-]rfile|$)", stem)
 
-    blade_idx = int(m_blade_num.group(1)) if m_blade_num else None
+    blade_idx = int(m_blade_num.group(1)) if (m_blade_num and not is_total_explicit) else None
+
+    # Dimensionless coefficient files (Cd/Cl/etc.) should not be misassigned to dimensional blade/force slots
+    if is_coeff and not any(k in stem for k in ("moment", "torque", "forcex", "force-x", "force_x", "forcey", "force-y", "force_y")):
+        return "coefficient", None, warnings
 
     # Forces (Fx, Fy)
-    if ("forcex" in stem or "force-x" in stem or "force_x" in stem or "fx" in stem or "drag" in stem):
+    if ("forcex" in stem or "force-x" in stem or "force_x" in stem or "fx" in stem or "drag" in stem or "thrust" in stem):
         if blade_idx is not None and 1 <= blade_idx <= n_blades:
             return "blade_fx", blade_idx, warnings
         return "fx", None, warnings
 
-    if ("forcey" in stem or "force-y" in stem or "force_y" in stem or "fy" in stem or "lift" in stem):
+    if ("forcey" in stem or "force-y" in stem or "force_y" in stem or "fy" in stem or "lift" in stem or "side" in stem):
         if blade_idx is not None and 1 <= blade_idx <= n_blades:
             return "blade_fy", blade_idx, warnings
         return "fy", None, warnings
 
-    # Moments: distinguish blade moments from total rotor moment
-    if blade_idx is not None and 1 <= blade_idx <= n_blades:
-        # File has an explicit blade number 1..N -> strictly a blade moment!
-        # MUST NEVER be total moment even if it contains "rfile" or "moment"
-        return "blade_moment", blade_idx, warnings
+    # Check explicit total moment tokens before generic numbered fallback
+    if is_total_explicit and any(m in stem for m in ("moment", "torque", "cm", "rfile")):
+        return "total_moment", None, warnings
 
-    # Check for total moment tokens:
-    # "total", "rotor", "moment_all", or exact total files like "moment-rfile.out", "moment.out", "torque.out"
-    if any(k in stem for k in ("total", "rotor", "all_blades", "moment_all", "moment-all")):
-        if any(m in stem for m in ("moment", "torque", "cm", "rfile")):
-            return "total_moment", None, warnings
+    # Moments: distinguish blade moments from total rotor moment (require a moment/blade keyword so yplus_1.out isn't matched)
+    if (
+        blade_idx is not None
+        and 1 <= blade_idx <= n_blades
+        and any(k in stem for k in ("moment", "torque", "blade", "airfoil", "bl"))
+    ):
+        return "blade_moment", blade_idx, warnings
 
     # Exact known generic names (without any blade digit)
     if stem in ("moment-rfile", "moment", "torque-rfile", "torque", "total-moment", "rotor-moment"):
@@ -452,7 +469,7 @@ def resolve_fluent_directory(path_or_folder: str) -> str:
             )
             if (
                 has_fluent_artifacts
-                or parent_name == "dp0"
+                or bool(re.match(r"^dp\d+$", parent_name, re.IGNORECASE))
                 or os.path.isdir(os.path.join(folder, "MECH"))
                 or os.path.isdir(os.path.join(folder, "DM"))
             ):
@@ -962,6 +979,7 @@ def detect_folder_simulation_parameters(
         pass
 
     # 1b. Legacy text case files (*.cas)
+    _NUM = r"[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?"
     try:
         legacy_cas = [f for f in glob.glob(os.path.join(folder, "*.cas")) if not f.endswith(".cas.h5")]
         for lcas in sorted(legacy_cas, key=os.path.getmtime, reverse=True):
@@ -969,19 +987,25 @@ def detect_folder_simulation_parameters(
             with open(lcas, "r", errors="ignore") as f:
                 c_text = f.read(131072)
             if "omega" not in detected:
-                m_mrf = re.search(r"\(mrf-omega\s*\(constant\s+\.\s+([0-9.+-eE]+)\)", c_text)
-                if m_mrf:
-                    om_raw = float(m_mrf.group(1))
-                    if abs(om_raw) > 0:
-                        detected["omega"] = abs(om_raw)
-                        if om_raw < 0 and "rotation_dir" not in detected:
-                            detected["rotation_dir"] = "cw"
-                        found_cas = True
+                for m_oc in re.findall(rf"\(mrf-omega\s*\(constant\s+\.\s+({_NUM})\)", c_text):
+                    try:
+                        om_raw = float(m_oc)
+                        if abs(om_raw) > 0:
+                            detected["omega"] = abs(om_raw)
+                            if om_raw < 0 and "rotation_dir" not in detected:
+                                detected["rotation_dir"] = "cw"
+                            found_cas = True
+                            break
+                    except ValueError:
+                        continue
             if "U" not in detected:
-                m_v = re.search(r"\(reference-velocity\s+([0-9.+-eE]+)\)", c_text)
+                m_v = re.search(rf"\(reference-velocity\s+({_NUM})\)", c_text)
                 if m_v:
-                    detected["U"] = float(m_v.group(1))
-                    found_cas = True
+                    try:
+                        detected["U"] = float(m_v.group(1))
+                        found_cas = True
+                    except ValueError:
+                        pass
             if "turb_model" not in detected:
                 tm = detect_solver_model_from_text(c_text)
                 if tm:
@@ -1004,13 +1028,12 @@ def detect_folder_simulation_parameters(
             os.path.join(os.path.dirname(folder), "report.xml"),
         ])
         norm_parts = os.path.normpath(folder).split(os.sep)
-        if "dp0" in norm_parts:
-            dp0_idx = norm_parts.index("dp0")
-            if dp0_idx > 0:
-                base_dir = os.sep.join(norm_parts[:dp0_idx])
-                sub_path = os.sep.join(norm_parts[dp0_idx:])
-                wb_xml = os.path.join(base_dir, "progress_files", sub_path, "report.xml")
-                xml_candidates.append(wb_xml)
+        dp_idx = next((i for i, pt in enumerate(norm_parts) if re.match(r"^dp\d+$", pt, re.IGNORECASE)), -1)
+        if dp_idx > 0:
+            base_dir = os.sep.join(norm_parts[:dp_idx])
+            sub_path = os.sep.join(norm_parts[dp_idx:])
+            wb_xml = os.path.join(base_dir, "progress_files", sub_path, "report.xml")
+            xml_candidates.append(wb_xml)
 
         for xml_path in xml_candidates:
             if os.path.isfile(xml_path):
@@ -1060,29 +1083,35 @@ def detect_folder_simulation_parameters(
                 content = f.read()
             found_set = False
             if "omega" not in detected:
-                m_mrf = re.findall(r"\(mrf-omega\s*\(constant\s+\.\s+([0-9.+-eE]+)\)", content)
-                if m_mrf:
-                    v = float(m_mrf[-1])
-                    if v > 0:
-                        detected["omega"] = v
-                        found_set = True
+                m_mrf = re.findall(rf"\(mrf-omega\s*\(constant\s+\.\s+({_NUM})\)", content)
+                for raw_oc in m_mrf:
+                    try:
+                        om_raw = float(raw_oc)
+                        if abs(om_raw) > 0:
+                            detected["omega"] = abs(om_raw)
+                            if om_raw < 0 and "rotation_dir" not in detected:
+                                detected["rotation_dir"] = "cw"
+                            found_set = True
+                            break
+                    except ValueError:
+                        continue
             if "U" not in detected:
-                m_v = re.findall(r"\(reference-velocity\s+([0-9.+-eE]+)\)", content)
+                m_v = re.findall(rf"\(reference-velocity\s+({_NUM})\)", content)
                 if m_v:
                     detected["U"] = float(m_v[-1])
                     found_set = True
             if "rho" not in detected:
-                m_rho = re.findall(r"\(reference-density\s+([0-9.+-eE]+)\)", content)
+                m_rho = re.findall(rf"\(reference-density\s+({_NUM})\)", content)
                 if m_rho:
                     detected["rho"] = float(m_rho[-1])
                     found_set = True
             if "mu" not in detected:
-                m_mu = re.findall(r"\(reference-viscosity\s+([0-9.+-eE]+)\)", content)
+                m_mu = re.findall(rf"\(reference-viscosity\s+({_NUM})\)", content)
                 if m_mu:
                     detected["mu"] = float(m_mu[-1])
                     found_set = True
             if "dt" not in detected:
-                m_dt = re.findall(r"\(time-step-size\s+\.\s+([0-9.+-eE]+)\)", content)
+                m_dt = re.findall(rf"\(time-step-size\s+\.\s+({_NUM})\)", content)
                 if m_dt:
                     detected["dt"] = float(m_dt[-1])
                     found_set = True
@@ -1121,17 +1150,21 @@ def detect_folder_simulation_parameters(
                     detected["turb_model"] = tm
                     found_trn = True
             if "omega" not in detected:
-                m_om = re.search(r"Moving Mesh Rotation Speed\s*\[rad/s\]\s+([0-9.+-eE]+)", ttext)
+                m_om = re.search(rf"Moving Mesh Rotation Speed\s*\[rad/s\]\s+({_NUM})", ttext)
                 if m_om:
-                    detected["omega"] = float(m_om.group(1))
-                    found_trn = True
+                    om_raw = float(m_om.group(1))
+                    if abs(om_raw) > 0:
+                        detected["omega"] = abs(om_raw)
+                        if om_raw < 0 and "rotation_dir" not in detected:
+                            detected["rotation_dir"] = "cw"
+                        found_trn = True
             if "U" not in detected:
-                m_vel = re.search(r"Velocity Magnitude\s*\[m/s\]\s+([0-9.+-eE]+)", ttext)
+                m_vel = re.search(rf"Velocity Magnitude\s*\[m/s\]\s+({_NUM})", ttext)
                 if m_vel:
                     detected["U"] = float(m_vel.group(1))
                     found_trn = True
             if "dt" not in detected:
-                m_dt = re.search(r"Time Step Size\s*\[s\]\s+([0-9.+-eE]+)", ttext)
+                m_dt = re.search(rf"Time Step Size\s*\[s\]\s+({_NUM})", ttext)
                 if m_dt:
                     detected["dt"] = float(m_dt.group(1))
                     found_trn = True
