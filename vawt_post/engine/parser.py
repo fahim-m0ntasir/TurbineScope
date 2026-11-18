@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from collections import Counter
 import hashlib
+import math
 import os
 import re
 from typing import Dict, List, Optional, Tuple, Any
@@ -1189,7 +1190,7 @@ def detect_folder_simulation_parameters(
     except Exception:
         pass
 
-    # 5. Monitor files for dt and blade count
+    # 5. Monitor files for dt (tail rows reflect the active/latest stage) and blade count
     try:
         out_candidates = [
             os.path.join(folder, f) for f in os.listdir(folder)
@@ -1198,31 +1199,64 @@ def detect_folder_simulation_parameters(
         # Prioritize moment monitor files first
         out_candidates.sort(key=lambda p: 0 if "moment" in os.path.basename(p).lower() else 1)
         for out_path in out_candidates:
-            if "dt" in detected:
-                break
-            if os.path.isfile(out_path):
-                info = inspect_fluent_report(out_path)
-                time_col = info.get("time_col")
-                if time_col is not None:
-                    times: List[float] = []
-                    with open(out_path, "r", errors="ignore") as fh:
-                        for line in fh:
-                            toks = line.replace("(", " ").replace(")", " ").replace(",", " ").split()
-                            try:
-                                nums = [float(x) for x in toks]
-                                if len(nums) > time_col:
-                                    times.append(nums[time_col])
-                                    if len(times) >= 15:
-                                        break
-                            except ValueError:
-                                pass
-                    if len(times) >= 2:
-                        diffs = [abs(times[i + 1] - times[i]) for i in range(len(times) - 1) if abs(times[i + 1] - times[i]) > 1e-12]
-                        if diffs:
-                            mean_dt = float(np.mean(diffs))
-                            detected["dt"] = round(mean_dt, 8)
-                            sources.append(os.path.basename(out_path))
+            if not os.path.isfile(out_path):
+                continue
+            info = inspect_fluent_report(out_path)
+            time_col = info.get("time_col")
+            step_col = int(info.get("step_col", 0) or 0)
+            if time_col is None:
+                continue
+            tc_int = int(time_col)
+
+            def _extract_rows(lines_iter, t_c: int = tc_int, s_c: int = step_col) -> List[Tuple[Optional[int], float]]:
+                pts: List[Tuple[Optional[int], float]] = []
+                for ln in lines_iter:
+                    toks = ln.replace("(", " ").replace(")", " ").replace(",", " ").split()
+                    try:
+                        nums = [float(x) for x in toks]
+                        if len(nums) > t_c and all(math.isfinite(x) for x in nums):
+                            st_v = int(round(nums[s_c])) if len(nums) > s_c else None
+                            pts.append((st_v, float(nums[t_c])))
+                    except ValueError:
+                        pass
+                return pts
+
+            tail_rows: List[Tuple[Optional[int], float]] = []
+            try:
+                fsize = os.path.getsize(out_path)
+                with open(out_path, "rb") as fh:
+                    if fsize > 16384:
+                        fh.seek(fsize - 16384)
+                        raw_tail = fh.read().decode("utf-8", errors="ignore").splitlines()[1:]
+                    else:
+                        raw_tail = fh.read().decode("utf-8", errors="ignore").splitlines()
+                tail_rows = _extract_rows(raw_tail)[-30:]
+            except Exception:
+                tail_rows = []
+
+            if len(tail_rows) < 2:
+                with open(out_path, "r", encoding="utf-8", errors="ignore") as fh:
+                    head_lines = []
+                    for ln in fh:
+                        head_lines.append(ln)
+                        if len(head_lines) >= 60:
                             break
+                tail_rows = _extract_rows(head_lines)[:30]
+
+            if len(tail_rows) >= 2:
+                diffs: List[float] = []
+                for idx_r in range(len(tail_rows) - 1):
+                    s0, t0 = tail_rows[idx_r]
+                    s1, t1 = tail_rows[idx_r + 1]
+                    dt_raw = t1 - t0
+                    if dt_raw > 1e-12:
+                        ds = (s1 - s0) if (s0 is not None and s1 is not None and s1 > s0) else 1
+                        diffs.append(dt_raw / ds)
+                if diffs:
+                    med_dt = float(np.median(diffs))
+                    detected["dt"] = float(f"{med_dt:.8g}")
+                    sources.append(os.path.basename(out_path))
+                    break
     except Exception:
         pass
 

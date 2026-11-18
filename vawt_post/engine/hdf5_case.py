@@ -351,15 +351,27 @@ def inspect_hdf5_case(cas_path: str) -> CaseInspectionResult:
                         res.report_files[rf_name] = rfile
 
                     # Extract time step size if transient (Fluent legacy & 2024 R2 physical-time-step keys)
-                    m_dt = (
-                        re.search(rf'\(time-step-size\s+\.\s+({_NUM})\)', rv)
-                        or re.search(rf'\(physical-time-step\s+({_NUM})\)', rv)
+                    m_dt_explicit = re.search(rf'\(time-step-size\s+\.\s+({_NUM})\)', rv)
+                    m_dt_phys = (
+                        re.search(rf'\(physical-time-step\s+({_NUM})\)', rv)
                         or re.search(rf'\(physical-time-step-expr\s+"({_NUM})"\)', rv)
                     )
+                    m_dt = m_dt_explicit or m_dt_phys
                     if m_dt:
                         try:
                             dt_v = float(m_dt.group(1))
-                            if dt_v > 0:
+                            # Fluent Workbench Setup-Output / un-stepped cases store factory default 1.0 s
+                            # in (physical-time-step 1.); ignore that placeholder so report.xml / .out supply real dt.
+                            is_setup_placeholder = (
+                                (m_dt_explicit is None)
+                                and abs(dt_v - 1.0) <= 1e-9
+                                and (
+                                    "setup" in os.path.basename(cas_path).lower()
+                                    or bool(re.search(r'\(number-of-time-steps\s+0(?:\.0*)?\)', rv))
+                                    or bool(re.search(r'\(time-step\s+0(?:\.0*)?\)', rv))
+                                )
+                            )
+                            if dt_v > 0 and not is_setup_placeholder:
                                 res.time_step_s = dt_v
                                 res.confidence["time_step_s"] = "verified_from_case_settings"
                         except ValueError:

@@ -330,7 +330,7 @@ class LiveParamsEditDialog(ctk.CTkToplevel):
             self._update_derived_preview()
             messagebox.showinfo(
                 "Auto-Detection Successful",
-                f"Successfully loaded parameters from:\n{rf}\n\n" + "\n".join(f" • {x}" for x in applied),
+                f"Successfully loaded parameters from:\n{detect_dir}\n\n" + "\n".join(f" • {x}" for x in applied),
                 parent=self
             )
         except Exception as exc:

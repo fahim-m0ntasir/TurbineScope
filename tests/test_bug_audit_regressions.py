@@ -19,8 +19,9 @@ from vawt_post.engine.config import GENERIC_DEFAULTS, InputFiles, Params
 from vawt_post.engine.continuity import stitch_series_pair
 from vawt_post.engine.excel import _put, write_excel
 from vawt_post.engine.gci_engine import GridLevelData, compute_asme_gci, plot_gci_curve
+from vawt_post.engine.hdf5_case import inspect_hdf5_case
 from vawt_post.engine.live_monitor import LiveMonitorWorker
-from vawt_post.engine.parser import inspect_fluent_report, parse_report_filename_role
+from vawt_post.engine.parser import detect_folder_simulation_parameters, inspect_fluent_report, parse_report_filename_role
 
 
 # ---------------------------------------------------------------------------
@@ -141,6 +142,46 @@ def test_parser_hash_header_and_role_classification(tmp_path):
     assert parse_report_filename_role("total-moment-1-rfile.out")[0] == "total_moment"
     role_af, b_idx, _ = parse_report_filename_role("airfoil2-rfile.out", n_blades=3)
     assert role_af == "blade_moment" and b_idx == 2
+
+
+def test_hdf5_setup_placeholder_dt_and_multistage_tail_detection(tmp_path):
+    import h5py
+
+    # 1. Setup-Output.cas.h5 with Fluent factory default (physical-time-step 1.) must NOT return dt=1.0
+    setup_cas = tmp_path / "FFF-7-Setup-Output.cas.h5"
+    with h5py.File(setup_cas, "w") as hf:
+        grp = hf.create_group("settings")
+        tv = "((omega . 90.) (mrf-omega (constant . 90.)))"
+        rv = '((physical-time-step-expr "1") (physical-time-step 1.) (number-of-time-steps 0) (time-step 0))'
+        grp.create_dataset("Thread Variables", data=[tv.encode("utf-8")])
+        grp.create_dataset("Rampant Variables", data=[rv.encode("utf-8")])
+
+    h5_setup = inspect_hdf5_case(str(setup_cas))
+    assert h5_setup.time_step_s is None
+
+    # 2. Monitor file tail dt (Stage 2) takes precedence over Stage 1 / setup placeholder
+    lines = ['("Time Step" "moment" "flow-time")\n']
+    t = 0.0
+    for s in range(1, 20):
+        t += 0.0001939255
+        lines.append(f"{s} 0.5 {t:.10f}\n")
+    for s in range(20, 45):
+        t += 0.0000969627
+        lines.append(f"{s} 0.5 {t:.10f}\n")
+    (tmp_path / "moment-rfile.out").write_text("".join(lines), encoding="utf-8")
+
+    det = detect_folder_simulation_parameters(str(tmp_path))
+    assert det["dt"] == pytest.approx(9.69627e-05, rel=1e-4)
+
+    # 3. Real solved checkpoint .cas.h5 still extracts non-placeholder dt
+    solved_cas = tmp_path / "FFF-7-1-00360.cas.h5"
+    with h5py.File(solved_cas, "w") as hf:
+        grp = hf.create_group("settings")
+        rv2 = '((physical-time-step-expr "0.00019083") (physical-time-step 0.00019083) (time-step 360))'
+        grp.create_dataset("Rampant Variables", data=[rv2.encode("utf-8")])
+
+    h5_solved = inspect_hdf5_case(str(solved_cas))
+    assert h5_solved.time_step_s == pytest.approx(0.00019083)
 
 
 def test_config_validation_and_defaults():
