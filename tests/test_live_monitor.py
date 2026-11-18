@@ -542,10 +542,13 @@ def test_ui_folder_switch_and_live_subpolling(tmp_path, monkeypatch):
         assert app.v_prior_source.get() == ""
         assert os.path.normpath(app.v_out.get()) == os.path.normpath(os.path.join(sys2, "results"))
 
-        # LiveMonitorFrame decouples 2s light file check from 120s graph refresh
+        # LiveMonitorFrame sets 10s light file check when refresh > 10s, else 2s
         lm = app.live_monitor_frame
         assert lm.refresh_interval_s == 120.0
-        assert lm.file_check_interval_s == 2.0
+        assert lm.file_check_interval_s == 10.0
+        assert lm._compute_file_check_interval(15.0) == 10.0
+        assert lm._compute_file_check_interval(10.0) == 2.0
+        assert lm._compute_file_check_interval(5.0) == 2.0
 
         # Folder switch in Live Monitor clears old prior_source and resets graph state
         lm.custom_watch_folder = str(tmp_path / "Proj_files" / "dp0" / "FFF-1" / "Fluent")

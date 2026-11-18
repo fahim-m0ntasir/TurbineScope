@@ -440,6 +440,12 @@ class LiveParamsEditDialog(ctk.CTkToplevel):
 class LiveMonitorFrame(ctk.CTkFrame):
     """Full-page Live Monitoring dashboard for active simulations."""
 
+    @staticmethod
+    def _compute_file_check_interval(refresh_s: float) -> float:
+        """Use a 10s lightweight file check when refresh > 10s, else 2s."""
+        val = float(refresh_s)
+        return 10.0 if val > 10.0 else min(2.0, max(1.0, val))
+
     def __init__(self, master, app=None, **kwargs):
         super().__init__(master, fg_color="transparent", **kwargs)
         self.app = app
@@ -454,7 +460,7 @@ class LiveMonitorFrame(ctk.CTkFrame):
 
         # Timer & display configurations
         self.refresh_interval_s: float = 120.0  # Default 2 minutes
-        self.file_check_interval_s: float = 2.0  # Fast lightweight file/telemetry poll
+        self.file_check_interval_s: float = self._compute_file_check_interval(self.refresh_interval_s)
         self.window_mode: str = "All"
         self.grid_layout_mode: str = "2×2 Grid"
         self.focus_plot: str = PLOT_OPTIONS[0]
@@ -491,7 +497,7 @@ class LiveMonitorFrame(ctk.CTkFrame):
             try:
                 saved = self.app.config_mgr.get_live_settings()
                 self.refresh_interval_s = float(saved.get("refresh_interval_s", 120.0))
-                self.file_check_interval_s = min(2.0, max(1.0, self.refresh_interval_s))
+                self.file_check_interval_s = self._compute_file_check_interval(self.refresh_interval_s)
                 self.window_mode = str(saved.get("window_mode", "All"))
                 self.grid_layout_mode = str(saved.get("grid_layout", "2×2 Grid"))
                 self.focus_plot = str(saved.get("focus_plot", PLOT_OPTIONS[0]))
@@ -3681,7 +3687,7 @@ class LiveMonitorFrame(ctk.CTkFrame):
             secs = val * 60.0 if "minute" in unit else val
             secs = max(2.0, min(secs, 3600.0))
             self.refresh_interval_s = secs
-            self.file_check_interval_s = min(2.0, max(1.0, secs))
+            self.file_check_interval_s = self._compute_file_check_interval(secs)
             if self.time_until_refresh > secs:
                 self.time_until_refresh = secs
             if self.worker:
