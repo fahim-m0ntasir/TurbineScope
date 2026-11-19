@@ -81,22 +81,24 @@ def plot_per_azimuth_convergence(
             curves[az].append(val)
 
     fig, ax = plt.subplots(figsize=(10, 4.8), dpi=130)
-    for i, az in enumerate(target_azimuths):
-        color = PAL[i % len(PAL)]
-        ax.plot(ks, curves[az], "o-", label=f"θ = {az:.0f}°", color=color, lw=1.6, ms=4)
+    try:
+        for i, az in enumerate(target_azimuths):
+            color = PAL[i % len(PAL)]
+            ax.plot(ks, curves[az], "o-", label=f"θ = {az:.0f}°", color=color, lw=1.6, ms=4)
 
-    ax.set_xlabel("Complete Revolution (counted back from end)")
-    ax.set_ylabel("Instantaneous Cp at Azimuth")
-    ax.set_title("Per-Azimuth Convergence across Revolutions (Sector Stability & Drift)")
-    ax.set_xticks(ks)
-    ax.grid(True, alpha=0.3)
-    ax.legend(ncol=3, loc="best", fontsize=9)
+        ax.set_xlabel("Complete Revolution (counted back from end)")
+        ax.set_ylabel("Instantaneous Cp at Azimuth")
+        ax.set_title("Per-Azimuth Convergence across Revolutions (Sector Stability & Drift)")
+        ax.set_xticks(ks)
+        ax.grid(True, alpha=0.3)
+        ax.legend(ncol=3, loc="best", fontsize=9)
 
-    if outpath is None:
-        outpath = "13_per_azimuth_convergence.png"
-    os.makedirs(os.path.dirname(os.path.abspath(outpath)), exist_ok=True)
-    fig.savefig(outpath, bbox_inches="tight")
-    plt.close(fig)
+        if outpath is None:
+            outpath = "13_per_azimuth_convergence.png"
+        os.makedirs(os.path.dirname(os.path.abspath(outpath)), exist_ok=True)
+        fig.savefig(outpath, bbox_inches="tight")
+    finally:
+        plt.close(fig)
     return outpath
 
 
@@ -105,8 +107,9 @@ def plot_per_azimuth_convergence(
 # =============================================================================
 def plot_upwind_downwind_split(R: Dict[str, Any], outpath: Optional[str] = None) -> str:
     """Plot grouped bar chart of upwind (0°-180°) vs downwind (180°-360°) Cp per revolution."""
-    d, revs = R["data"], R["revs"]
+    p, d, revs = R["p"], R["data"], R["revs"]
     t = d["t"]
+    have_blades = bool(d.get("have_blades")) and bool(d.get("Cp_b")) and bool(d.get("TH"))
     th_deg = d["th1"] % 360.0
 
     ks = [r["k"] for r in revs]
@@ -115,14 +118,28 @@ def plot_upwind_downwind_split(R: Dict[str, Any], outpath: Optional[str] = None)
 
     for r in revs:
         m_win = (t >= r["a"]) & (t <= r["b"])
-        th_w = th_deg[m_win]
-        cp_w = d["Cp"][m_win]
-
-        m_up = (th_w >= 0.0) & (th_w < 180.0)
-        m_down = (th_w >= 180.0) & (th_w < 360.0)
-
-        cp_up = float(np.mean(cp_w[m_up])) if np.any(m_up) else 0.0
-        cp_down = float(np.mean(cp_w[m_down])) if np.any(m_down) else 0.0
+        if have_blades:
+            # Sum per-blade upwind/downwind sector contributions so multi-blade rotors
+            # reflect true upwind vs downwind aerodynamic extraction rather than Blade-1 phase gating.
+            nb = min(len(d["Cp_b"]), len(d["TH"]))
+            cp_up = 0.0
+            cp_down = 0.0
+            for b in range(nb):
+                th_b = d["TH"][b][m_win] % 360.0
+                cp_b = d["Cp_b"][b][m_win]
+                m_up_b = (th_b >= 0.0) & (th_b < 180.0)
+                m_dn_b = (th_b >= 180.0) & (th_b < 360.0)
+                if np.any(m_up_b):
+                    cp_up += float(np.mean(cp_b[m_up_b]))
+                if np.any(m_dn_b):
+                    cp_down += float(np.mean(cp_b[m_dn_b]))
+        else:
+            th_w = th_deg[m_win]
+            cp_w = d["Cp"][m_win]
+            m_up = (th_w >= 0.0) & (th_w < 180.0)
+            m_down = (th_w >= 180.0) & (th_w < 360.0)
+            cp_up = float(np.mean(cp_w[m_up])) if np.any(m_up) else 0.0
+            cp_down = float(np.mean(cp_w[m_down])) if np.any(m_down) else 0.0
 
         upwind_cps.append(cp_up)
         downwind_cps.append(cp_down)
@@ -152,7 +169,8 @@ def plot_upwind_downwind_split(R: Dict[str, Any], outpath: Optional[str] = None)
         ax.set_xticklabels([str(k) for k in ks])
         ax.set_xlabel("Revolution")
         ax.set_ylabel("Sector-Averaged Power Coefficient Cp")
-        ax.set_title(f"Upwind vs Downwind Power Extraction per Revolution ({share_txt})")
+        title_note = "" if (have_blades or (p.n_blades or 1) <= 1) else " [Total-Only Phase Split]"
+        ax.set_title(f"Upwind vs Downwind Power Extraction per Revolution ({share_txt}){title_note}")
         ax.grid(True, alpha=0.3)
         ax.legend(ncol=2, loc="upper right", fontsize=8.5)
 
@@ -183,30 +201,32 @@ def plot_cumulative_energy(R: Dict[str, Any], outpath: Optional[str] = None) -> 
         e_rot[i] = e_rot[i - 1] + 0.5 * (m_rot[i] + m_rot[i - 1]) * dth
 
     fig, ax = plt.subplots(figsize=(10, 4.8), dpi=130)
-    _azaxis(ax, upwind=True)
+    try:
+        _azaxis(ax, upwind=True)
 
-    ax.plot(th, e_rot, color="#1F4E79", lw=2.4, label=f"Total Rotor Energy (Net: {e_rot[-1]:.2f} J/m)")
+        ax.plot(th, e_rot, color="#1F4E79", lw=2.4, label=f"Total Rotor Energy (Net: {e_rot[-1]:.2f} J/m)")
 
-    if d["have_blades"] and "M_b_mean" in az:
-        for b_idx in range(p.n_blades):
-            mb = az["M_b_mean"][b_idx]
-            eb = np.zeros_like(th)
-            for i in range(1, len(th)):
-                dth = th_rad[i] - th_rad[i - 1]
-                eb[i] = eb[i - 1] + 0.5 * (mb[i] + mb[i - 1]) * dth
-            ax.plot(th, eb, lw=1.2, ls="--", color=PAL[(b_idx + 1) % len(PAL)], label=f"Blade {b_idx + 1} ({eb[-1]:.2f} J/m)")
+        if d["have_blades"] and "M_b_mean" in az:
+            for b_idx in range(p.n_blades):
+                mb = az["M_b_mean"][b_idx]
+                eb = np.zeros_like(th)
+                for i in range(1, len(th)):
+                    dth = th_rad[i] - th_rad[i - 1]
+                    eb[i] = eb[i - 1] + 0.5 * (mb[i] + mb[i - 1]) * dth
+                ax.plot(th, eb, lw=1.2, ls="--", color=PAL[(b_idx + 1) % len(PAL)], label=f"Blade {b_idx + 1} ({eb[-1]:.2f} J/m)")
 
-    ax.axhline(0, color="gray", lw=0.8, ls=":")
-    ax.set_ylabel("Cumulative Energy Extracted E(θ) [J per m depth]")
-    ax.set_title("Cumulative Energy Extraction vs Azimuth: E(θ) = ∫ M dθ (Positive Slope = Power Generation)")
-    ax.grid(True, alpha=0.3)
-    ax.legend(loc="upper left", fontsize=9)
+        ax.axhline(0, color="gray", lw=0.8, ls=":")
+        ax.set_ylabel("Cumulative Energy Extracted E(θ) [J per m depth]")
+        ax.set_title("Cumulative Energy Extraction vs Azimuth: E(θ) = ∫ M dθ (Positive Slope = Power Generation)")
+        ax.grid(True, alpha=0.3)
+        ax.legend(loc="upper left", fontsize=9)
 
-    if outpath is None:
-        outpath = "15_cumulative_energy.png"
-    os.makedirs(os.path.dirname(os.path.abspath(outpath)), exist_ok=True)
-    fig.savefig(outpath, bbox_inches="tight")
-    plt.close(fig)
+        if outpath is None:
+            outpath = "15_cumulative_energy.png"
+        os.makedirs(os.path.dirname(os.path.abspath(outpath)), exist_ok=True)
+        fig.savefig(outpath, bbox_inches="tight")
+    finally:
+        plt.close(fig)
     return outpath
 
 
@@ -215,7 +235,7 @@ def plot_cumulative_energy(R: Dict[str, Any], outpath: Optional[str] = None) -> 
 # =============================================================================
 def plot_load_rose(R: Dict[str, Any], outpath: Optional[str] = None) -> str:
     """Plot Fx-Fy structural load rose locus, azimuthal thrust/side-force, and harmonic spectra."""
-    p, d, az, res, sel = R["p"], R["data"], R["az"], R["res"], R["sel"]
+    p, d, az, sel = R["p"], R["data"], R["az"], R["sel"]
 
     fig, axs = plt.subplots(2, 2, figsize=(12, 9), dpi=130)
 
@@ -251,25 +271,36 @@ def plot_load_rose(R: Dict[str, Any], outpath: Optional[str] = None) -> str:
         ax2.set_title("Thrust and Side-Force vs Azimuth")
         ax2.legend(fontsize=8.5)
 
-        # Panel 3: Ct Spectrum
+        # Panel 3: Ct Spectrum (per-revolution uniform resampling so multi-stage / non-contiguous sel never distort FFT)
         ax3 = axs[1, 0]
-        # FFT of Ct over reported revs
-        t, Trev = d["t"], res["Trev"]
-        t_sel_mask = (t >= sel[0]["a"]) & (t <= sel[-1]["b"])
-        if np.any(t_sel_mask) and d["Ct"] is not None:
-            t_win = t[t_sel_mask]
-            ct_win = d["Ct"][t_sel_mask]
-            n_pts = len(ct_win)
-            pos_dt = np.diff(t_win)
-            pos_dt = pos_dt[pos_dt > 0]
-            if n_pts >= 4 and len(pos_dt) > 0:
-                dt_avg = float(np.median(pos_dt))
-                freqs = np.fft.rfftfreq(n_pts, d=dt_avg)
-                harmonics = freqs * Trev
-                amps = 2.0 * np.abs(np.fft.rfft(ct_win - np.mean(ct_win))) / n_pts
-                m_h = (harmonics >= 0) & (harmonics <= 12)
-                ax3.vlines(harmonics[m_h], 0, amps[m_h], color="#1F4E79", lw=1.4)
-                ax3.axvline(p.n_blades, color="#D1495B", ls="--", lw=1.2, label=f"{p.n_blades}x Blade Passing")
+        t = d["t"]
+        n_fft_grid = 1024
+
+        def _rev_avg_spectrum(sig: Optional[np.ndarray]) -> Tuple[np.ndarray, np.ndarray]:
+            if sig is None or len(t) < 4:
+                return np.array([], dtype=float), np.array([], dtype=float)
+            rev_specs: List[np.ndarray] = []
+            for r_s in sel:
+                m_r = (t >= r_s["a"] - 1e-9) & (t <= r_s["b"] + 1e-9)
+                if int(np.sum(m_r)) < 4:
+                    continue
+                t_r = t[m_r]
+                s_r = sig[m_r]
+                if t_r[-1] <= t_r[0]:
+                    continue
+                u_t = np.linspace(float(r_s["a"]), float(r_s["b"]), n_fft_grid, endpoint=False)
+                u_s = np.interp(u_t, t_r, s_r)
+                rev_specs.append(2.0 * np.abs(np.fft.rfft(u_s - np.mean(u_s))) / n_fft_grid)
+            if not rev_specs:
+                return np.array([], dtype=float), np.array([], dtype=float)
+            harm_idx = np.arange(len(rev_specs[0]), dtype=float)
+            return harm_idx, np.mean(rev_specs, axis=0)
+
+        h_ct, amps_ct = _rev_avg_spectrum(d["Ct"])
+        if len(h_ct) > 0:
+            m_h = (h_ct >= 0) & (h_ct <= 12)
+            ax3.vlines(h_ct[m_h], 0, amps_ct[m_h], color="#1F4E79", lw=1.4)
+            ax3.axvline(p.n_blades, color="#D1495B", ls="--", lw=1.2, label=f"{p.n_blades}x Blade Passing")
         ax3.set_xlabel("Harmonic Order (f / f_rotor)")
         ax3.set_ylabel("Ct Amplitude")
         ax3.set_title("Thrust Coefficient Ct Dynamic Spectrum")
@@ -279,20 +310,11 @@ def plot_load_rose(R: Dict[str, Any], outpath: Optional[str] = None) -> str:
 
         # Panel 4: Cy Spectrum
         ax4 = axs[1, 1]
-        if np.any(t_sel_mask) and d["Cy"] is not None:
-            t_win = t[t_sel_mask]
-            cy_win = d["Cy"][t_sel_mask]
-            n_pts = len(cy_win)
-            pos_dt = np.diff(t_win)
-            pos_dt = pos_dt[pos_dt > 0]
-            if n_pts >= 4 and len(pos_dt) > 0:
-                dt_avg = float(np.median(pos_dt))
-                freqs = np.fft.rfftfreq(n_pts, d=dt_avg)
-                harmonics = freqs * Trev
-                amps_y = 2.0 * np.abs(np.fft.rfft(cy_win - np.mean(cy_win))) / n_pts
-                m_h_y = (harmonics >= 0) & (harmonics <= 12)
-                ax4.vlines(harmonics[m_h_y], 0, amps_y[m_h_y], color="#D1495B", lw=1.4)
-                ax4.axvline(p.n_blades, color="#1F4E79", ls="--", lw=1.2, label=f"{p.n_blades}x Blade Passing")
+        h_cy, amps_cy = _rev_avg_spectrum(d["Cy"])
+        if len(h_cy) > 0:
+            m_h_y = (h_cy >= 0) & (h_cy <= 12)
+            ax4.vlines(h_cy[m_h_y], 0, amps_cy[m_h_y], color="#D1495B", lw=1.4)
+            ax4.axvline(p.n_blades, color="#1F4E79", ls="--", lw=1.2, label=f"{p.n_blades}x Blade Passing")
         ax4.set_xlabel("Harmonic Order (f / f_rotor)")
         ax4.set_ylabel("Cy Amplitude")
         ax4.set_title("Side-Force Coefficient Cy Dynamic Spectrum")
@@ -320,70 +342,74 @@ def plot_cp_spectrogram(R: Dict[str, Any], outpath: Optional[str] = None) -> str
     t, cp, Trev = d["t"], d["Cp"], res["Trev"]
 
     fig, ax = plt.subplots(figsize=(11, 5.0), dpi=130)
+    try:
+        # Pure NumPy STFT implementation
+        n_pts = len(t)
+        rendered_spec = False
+        if n_pts >= 128 and float(t[-1] - t[0]) > 0:
+            # Uniform resample for FFT
+            grid_n = min(n_pts, 8192)
+            t_unif = np.linspace(t[0], t[-1], grid_n)
+            dt_unif = (t[-1] - t[0]) / (grid_n - 1)
+            cp_unif = np.interp(t_unif, t, cp)
 
-    # Pure NumPy STFT implementation
-    n_pts = len(t)
-    if n_pts >= 128:
-        # Uniform resample for FFT
-        grid_n = min(n_pts, 8192)
-        t_unif = np.linspace(t[0], t[-1], grid_n)
-        dt_unif = (t[-1] - t[0]) / (grid_n - 1)
-        cp_unif = np.interp(t_unif, t, cp)
+            pts_per_rev = Trev / dt_unif
+            window_size = int(max(64, round(pts_per_rev * 2.0)))  # 2 revolutions per FFT window
+            step_size = max(8, window_size // 4)                 # 75% overlap
 
-        pts_per_rev = Trev / dt_unif
-        window_size = int(max(64, round(pts_per_rev * 2.0)))  # 2 revolutions per FFT window
-        step_size = max(8, window_size // 4)                 # 75% overlap
+            hann = np.hanning(window_size)
+            spec_cols = []
+            t_centers = []
 
-        hann = np.hanning(window_size)
-        spec_cols = []
-        t_centers = []
+            for start_idx in range(0, grid_n - window_size + 1, step_size):
+                segment = cp_unif[start_idx:start_idx + window_size]
+                seg_hann = (segment - np.mean(segment)) * hann
+                fft_vals = np.fft.rfft(seg_hann)
+                mag = (2.0 / window_size) * np.abs(fft_vals)
+                spec_cols.append(mag)
+                t_centers.append(t_unif[start_idx + window_size // 2])
 
-        for start_idx in range(0, grid_n - window_size + 1, step_size):
-            segment = cp_unif[start_idx:start_idx + window_size]
-            seg_hann = (segment - np.mean(segment)) * hann
-            fft_vals = np.fft.rfft(seg_hann)
-            mag = (2.0 / window_size) * np.abs(fft_vals)
-            spec_cols.append(mag)
-            t_centers.append(t_unif[start_idx + window_size // 2])
+            if spec_cols:
+                spec_matrix = np.column_stack(spec_cols)
+                freqs = np.fft.rfftfreq(window_size, d=dt_unif)
+                harmonics = freqs * Trev
 
-        if spec_cols:
-            spec_matrix = np.column_stack(spec_cols)
-            freqs = np.fft.rfftfreq(window_size, d=dt_unif)
-            harmonics = freqs * Trev
+                # Limit harmonic range to [0, 12]
+                m_h = harmonics <= 12.0
+                h_sub = harmonics[m_h]
+                mat_sub = spec_matrix[m_h, :]
 
-            # Limit harmonic range to [0, 12]
-            m_h = harmonics <= 12.0
-            h_sub = harmonics[m_h]
-            mat_sub = spec_matrix[m_h, :]
+                t_rev_centers = (np.array(t_centers) - t[0]) / Trev
 
-            t_rev_centers = (np.array(t_centers) - t[0]) / Trev
+                im = ax.pcolormesh(
+                    t_rev_centers, h_sub, mat_sub,
+                    shading="gouraud", cmap="inferno"
+                )
+                fig.colorbar(im, ax=ax, label="Cp Harmonic Amplitude")
 
-            im = ax.pcolormesh(
-                t_rev_centers, h_sub, mat_sub,
-                shading="gouraud", cmap="inferno"
-            )
-            fig.colorbar(im, ax=ax, label="Cp Harmonic Amplitude")
+                # Reference harmonic lines
+                ax.axhline(0.5, color="cyan", ls=":", lw=1.1, alpha=0.9, label="0.5x Subharmonic (Period-2)")
+                ax.axhline(1.0, color="lime", ls="--", lw=1.1, alpha=0.9, label="1.0x Rotor Frequency")
+                ax.axhline(p.n_blades, color="white", ls="-.", lw=1.3, alpha=0.95, label=f"{p.n_blades}x Blade Passing")
+                ax.axhline(2 * p.n_blades, color="orange", ls="--", lw=1.1, alpha=0.8, label=f"{2 * p.n_blades}x 2nd BPF")
 
-            # Reference harmonic lines
-            ax.axhline(0.5, color="cyan", ls=":", lw=1.1, alpha=0.9, label="0.5x Subharmonic (Period-2)")
-            ax.axhline(1.0, color="lime", ls="--", lw=1.1, alpha=0.9, label="1.0x Rotor Frequency")
-            ax.axhline(p.n_blades, color="white", ls="-.", lw=1.3, alpha=0.95, label=f"{p.n_blades}x Blade Passing")
-            ax.axhline(2 * p.n_blades, color="orange", ls="--", lw=1.1, alpha=0.8, label=f"{2 * p.n_blades}x 2nd BPF")
+                ax.set_ylim(0, 12)
+                ax.set_xlabel("Revolutions of Flow Time")
+                ax.set_ylabel("Frequency / Rotor Frequency (Harmonic Order)")
+                ax.set_title("Spectrogram of Rotor Cp across Simulation (Vortex Shedding & Transition Tracking)")
+                ax.legend(loc="upper right", fontsize=8.5, facecolor="#222", labelcolor="white")
+                rendered_spec = True
 
-            ax.set_ylim(0, 12)
-            ax.set_xlabel("Revolutions of Flow Time")
-            ax.set_ylabel("Frequency / Rotor Frequency (Harmonic Order)")
-            ax.set_title("Spectrogram of Rotor Cp across Simulation (Vortex Shedding & Transition Tracking)")
-            ax.legend(loc="upper right", fontsize=8.5, facecolor="#222", labelcolor="white")
-    else:
-        ax.text(0.5, 0.5, "Simulation duration insufficient for spectrogram analysis.", ha="center", va="center")
-        ax.axis("off")
+        if not rendered_spec:
+            ax.text(0.5, 0.5, "Simulation duration insufficient for spectrogram analysis.", ha="center", va="center")
+            ax.axis("off")
 
-    if outpath is None:
-        outpath = "17_cp_spectrogram.png"
-    os.makedirs(os.path.dirname(os.path.abspath(outpath)), exist_ok=True)
-    fig.savefig(outpath, bbox_inches="tight")
-    plt.close(fig)
+        if outpath is None:
+            outpath = "17_cp_spectrogram.png"
+        os.makedirs(os.path.dirname(os.path.abspath(outpath)), exist_ok=True)
+        fig.savefig(outpath, bbox_inches="tight")
+    finally:
+        plt.close(fig)
     return outpath
 
 
@@ -406,29 +432,31 @@ def plot_torque_ripple(R: Dict[str, Any], outpath: Optional[str] = None) -> str:
         ripples.append(tr)
 
     fig, ax = plt.subplots(figsize=(10, 4.6), dpi=130)
-    colors = [PAL[3] if r["selected"] else ("#9DB4C8" if r["stable"] else "#CFCFCF") for r in revs]
-    ax.bar(ks, ripples, color=colors, edgecolor="white", width=0.6)
+    try:
+        colors = [PAL[3] if r["selected"] else ("#9DB4C8" if r["stable"] else "#CFCFCF") for r in revs]
+        ax.bar(ks, ripples, color=colors, edgecolor="white", width=0.6)
 
-    for k_val, rip in zip(ks, ripples):
-        if not math.isnan(rip):
-            ax.text(k_val, rip, f"{rip:.2f}", ha="center", va="bottom", fontsize=8)
+        for k_val, rip in zip(ks, ripples):
+            if not math.isnan(rip):
+                ax.text(k_val, rip, f"{rip:.2f}", ha="center", va="bottom", fontsize=8)
 
-    mean_rip = res.get("ripple_pp", float("nan"))
-    if not math.isnan(mean_rip):
-        ax.axhline(mean_rip, color=PAL[1], ls="--", lw=1.2, label=f"Reported Mean Ripple = {mean_rip:.2f}")
+        mean_rip = res.get("ripple_pp", float("nan"))
+        if not math.isnan(mean_rip):
+            ax.axhline(mean_rip, color=PAL[1], ls="--", lw=1.2, label=f"Reported Mean Ripple = {mean_rip:.2f}")
 
-    ax.set_xticks(ks)
-    ax.set_xlabel("Complete Revolution")
-    ax.set_ylabel("Torque Ripple Factor TR = (Cp_max - Cp_min) / Cp_mean")
-    ax.set_title("Torque-Ripple Factor per Revolution (Dynamic Stall & Harmonic Oscillation Severity)")
-    ax.grid(True, alpha=0.3)
-    ax.legend(loc="upper right", fontsize=9)
+        ax.set_xticks(ks)
+        ax.set_xlabel("Complete Revolution")
+        ax.set_ylabel("Torque Ripple Factor TR = (Cp_max - Cp_min) / Cp_mean")
+        ax.set_title("Torque-Ripple Factor per Revolution (Dynamic Stall & Harmonic Oscillation Severity)")
+        ax.grid(True, alpha=0.3)
+        ax.legend(loc="upper right", fontsize=9)
 
-    if outpath is None:
-        outpath = "18_torque_ripple.png"
-    os.makedirs(os.path.dirname(os.path.abspath(outpath)), exist_ok=True)
-    fig.savefig(outpath, bbox_inches="tight")
-    plt.close(fig)
+        if outpath is None:
+            outpath = "18_torque_ripple.png"
+        os.makedirs(os.path.dirname(os.path.abspath(outpath)), exist_ok=True)
+        fig.savefig(outpath, bbox_inches="tight")
+    finally:
+        plt.close(fig)
     return outpath
 
 
@@ -439,6 +467,27 @@ def import_yplus_monitor(path: str) -> Dict[str, Any]:
     """Parse a Fluent wall y+ monitor file (max and/or mean y+ on blade walls)."""
     if not os.path.isfile(path):
         raise FileNotFoundError(f"y+ monitor file not found: {path}")
+
+    # Prefer structured Fluent report header parsing whenever an explicit flow-time column is present
+    try:
+        from vawt_post.engine.parser import inspect_fluent_report, read_fluent_report
+        meta = inspect_fluent_report(path)
+        if meta.get("time_col") is not None and meta.get("data_columns"):
+            rep = read_fluent_report(path)
+            st_arr = np.asarray(rep["step"], dtype=int)
+            yp_arr = np.asarray(rep["value"], dtype=float)
+            t_raw = rep.get("time")
+            t_arr = np.asarray(t_raw, dtype=float) if t_raw is not None else st_arr.astype(float)
+            fin = np.isfinite(yp_arr)
+            return {
+                "step": st_arr[fin],
+                "time": t_arr[fin],
+                "yplus": yp_arr[fin],
+                "max": float(np.max(yp_arr[fin])) if np.any(fin) else 0.0,
+                "mean": float(np.mean(yp_arr[fin])) if np.any(fin) else 0.0,
+            }
+    except Exception:
+        pass
 
     steps: List[int] = []
     times: List[float] = []
@@ -453,7 +502,7 @@ def import_yplus_monitor(path: str) -> Dict[str, Any]:
             if len(parts) >= 2:
                 try:
                     s = int(parts[0])
-                    # If 3 parts: step, time, yplus. If 2 parts: step, yplus
+                    # Headerless fallback: 3 parts -> (step, time, yplus); 2 parts -> (step, yplus)
                     if len(parts) >= 3:
                         t = float(parts[1])
                         yp = float(parts[2])
@@ -585,10 +634,10 @@ def create_animated_cp_wheel(
             # Blade positions
             blade_spacing_deg = 360.0 / n_blades
             for b in range(n_blades):
-                # theta = 0 at top (pi/2) moving CCW or CW
+                # With wind from left (+x): CCW starts at top (+90 deg) moving +theta;
+                # CW starts at bottom (-90 deg) moving -theta so upwind theta=90 deg stays on the left.
                 b_th_deg = (th_cur + b * blade_spacing_deg) % 360.0
-                # Cartesian angle: 0 deg azimuth is at top (x=0, y=R)
-                angle_rad = np.radians(90.0 - b_th_deg if p.rotation_dir == "cw" else 90.0 + b_th_deg)
+                angle_rad = np.radians(-90.0 - b_th_deg if p.rotation_dir == "cw" else 90.0 + b_th_deg)
                 bx = R_geom * np.cos(angle_rad)
                 by = R_geom * np.sin(angle_rad)
 

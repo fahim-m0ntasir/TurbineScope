@@ -437,6 +437,8 @@ class WorkbenchStudioFrame(ctk.CTkFrame):
         self.tsr_sweep_result = None
         self.comp_result = None
         self.current_plot_type = "none"
+        if hasattr(self, "v_tsr_benchmark"):
+            self.v_tsr_benchmark.set("")
         if hasattr(self, "txt_gci_output"):
             self.txt_gci_output.configure(state="normal")
             self.txt_gci_output.delete("1.0", "end")
@@ -477,6 +479,8 @@ class WorkbenchStudioFrame(ctk.CTkFrame):
     def _finish_scan_project(self, proj: Optional[WorkbenchProject], path: str, error_msg: Optional[str]):
         """Apply scanned Workbench project results back on the UI thread."""
         self._scan_in_progress = False
+        if getattr(self, "_is_closing", False) or getattr(self, "_is_destroyed", False):
+            return
         if error_msg is not None:
             self.lbl_proj_info.configure(text="Scan failed. Select a valid .wbpj project file.")
             messagebox.showerror("Workbench Scanner Error", f"Failed to parse Workbench project:\n{error_msg}")
@@ -716,7 +720,9 @@ class WorkbenchStudioFrame(ctk.CTkFrame):
             if s.velocity is not None:
                 self.app.v_U.set(str(s.velocity))
             if s.omega is not None:
-                self.app.v_omega.set(str(s.omega))
+                self.app.v_omega.set(str(abs(float(s.omega))))
+                if hasattr(self.app, "v_rot_dir"):
+                    self.app.v_rot_dir.set("cw" if float(s.omega) < 0 else "ccw")
             if s.rotor_radius is not None and s.rotor_radius > 0:
                 self.app.v_R.set(f"{s.rotor_radius:.6g}")
             if s.chord is not None and s.chord > 0:
@@ -788,15 +794,24 @@ class WorkbenchStudioFrame(ctk.CTkFrame):
             return
 
         from vawt_post.engine.config import Params
+        om_val: Optional[float] = None
+        rot_dir = "ccw"
+        if s.omega is not None:
+            om_f = float(s.omega)
+            if abs(om_f) > 0:
+                om_val = abs(om_f)
+                rot_dir = "cw" if om_f < 0 else "ccw"
         p = Params(
             U=float(s.velocity) if s.velocity is not None else 8.0,
-            omega=float(s.omega) if s.omega is not None else None,
+            omega=om_val,
+            tsr=None if om_val is not None else 3.5,
             R=float(s.rotor_radius) if s.rotor_radius is not None and s.rotor_radius > 0 else 0.5,
             chord=float(s.chord) if s.chord is not None and s.chord > 0 else 0.06,
             n_blades=min(8, max(1, len(s.blade_zones))) if s.blade_zones else 3,
             rho=float(s.density) if s.density is not None else 1.225,
             mu=float(s.viscosity) if s.viscosity is not None else 1.7894e-5,
             dt=float(s.time_step) if s.time_step is not None else None,
+            rotation_dir=rot_dir,
             stable_tol=5.0,
             n_stable=2,
         )
@@ -911,9 +926,14 @@ class WorkbenchStudioFrame(ctk.CTkFrame):
         meshed_systems.sort(key=lambda s: s.cell_count or 0, reverse=True)
 
         grids: List[GridLevelData] = []
+        skipped_ids: List[str] = []
         for s in meshed_systems:
             tq = _extract_system_converged_torque(s)
-            phi_val = float(tq["mean_torque"]) if tq.get("mean_torque") is not None else 0.0
+            mt = tq.get("mean_torque")
+            if mt is None:
+                skipped_ids.append(s.system_id)
+                continue
+            phi_val = float(mt)
 
             grids.append(GridLevelData(
                 name=f"System {s.system_id}",
@@ -926,6 +946,20 @@ class WorkbenchStudioFrame(ctk.CTkFrame):
                 turb_model=s.turb_model,
                 velocity=s.velocity,
             ))
+
+        if len(grids) < 2:
+            skip_note = f"\nSkipped systems without torque data: {', '.join(skipped_ids)}" if skipped_ids else ""
+            messagebox.showerror(
+                "Grid Study Error",
+                "At least 2 systems with valid mesh cell counts and torque monitor data are required for a grid dependency study."
+                + skip_note
+            )
+            return
+        if skipped_ids:
+            messagebox.showwarning(
+                "Grid Study Notice",
+                f"Excluded {len(skipped_ids)} system(s) with no readable torque monitor data: {', '.join(skipped_ids)}."
+            )
 
         dim = 2 if "2D" in self.v_gci_dim.get() else 3
         override = bool(self.v_gci_override_checks.get())
@@ -1062,7 +1096,7 @@ class WorkbenchStudioFrame(ctk.CTkFrame):
     def _copy_study_formatted(self):
         """Copy formatted text table of active study to clipboard."""
         txt = self.txt_gci_output.get("1.0", "end").strip()
-        if not txt:
+        if not txt or self.current_plot_type == "none":
             messagebox.showinfo("Clipboard", "Please run a study calculation first.")
             return
         self.clipboard_clear()
@@ -1072,7 +1106,7 @@ class WorkbenchStudioFrame(ctk.CTkFrame):
     def _copy_study_markdown(self):
         """Copy Markdown table of active study to clipboard."""
         md_txt = ""
-        mode = self.v_study_mode.get()
+        pt = self.current_plot_type
         def _fmt_num(v, unit: str) -> str:
             if v is None:
                 return "N/A"
@@ -1081,11 +1115,13 @@ class WorkbenchStudioFrame(ctk.CTkFrame):
             except Exception:
                 return f"{v} {unit}"
 
-        if ("Grid Dependency" in mode or self.current_plot_type == "multi_grid") and self.multi_grid_report:
+        if pt == "multi_grid" and self.multi_grid_report:
             md_txt = self.multi_grid_report.to_markdown_table()
-        elif ("TSR" in mode or self.current_plot_type == "tsr") and self.tsr_sweep_result:
+        elif pt == "gci" and self.gci_report:
+            md_txt = self.gci_report.to_markdown_table()
+        elif pt == "tsr" and self.tsr_sweep_result:
             md_txt = tsr_sweep_to_markdown_table(self.tsr_sweep_result)
-        elif ("Steady" in mode or self.current_plot_type == "steady") and self.current_system:
+        elif pt == "steady" and self.current_system:
             try:
                 data = evaluate_steady_convergence(self.current_system)
                 md_txt = (
@@ -1099,14 +1135,8 @@ class WorkbenchStudioFrame(ctk.CTkFrame):
                 )
             except Exception:
                 md_txt = ""
-        elif ("Compar" in mode or self.current_plot_type == "comp") and self.comp_result:
+        elif pt == "comp" and self.comp_result:
             md_txt = systems_comparison_to_markdown_table(self.comp_result)
-        elif self.comp_result:
-            md_txt = systems_comparison_to_markdown_table(self.comp_result)
-        elif self.multi_grid_report:
-            md_txt = self.multi_grid_report.to_markdown_table()
-        elif self.gci_report:
-            md_txt = self.gci_report.to_markdown_table()
 
         if not md_txt:
             messagebox.showinfo("Clipboard", "Please run a study calculation first.")
@@ -1118,10 +1148,10 @@ class WorkbenchStudioFrame(ctk.CTkFrame):
     def _copy_study_latex(self):
         """Copy LaTeX table snippet of active study to clipboard."""
         latex_txt = ""
-        mode = self.v_study_mode.get()
-        if ("Grid Dependency" in mode or self.current_plot_type == "multi_grid") and self.multi_grid_report:
+        pt = self.current_plot_type
+        if pt == "multi_grid" and self.multi_grid_report:
             latex_txt = self.multi_grid_report.to_latex_table()
-        elif self.gci_report:
+        elif pt == "gci" and self.gci_report:
             latex_txt = self.gci_report.to_latex_table()
 
         if not latex_txt:
@@ -1168,6 +1198,7 @@ class WorkbenchStudioFrame(ctk.CTkFrame):
 
     def shutdown(self) -> None:
         """Close active Matplotlib figures and clear study plot canvas on app exit."""
+        self._is_closing = True
         if self._active_mpl_fig is not None:
             try:
                 plt.close(self._active_mpl_fig)

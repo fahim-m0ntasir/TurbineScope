@@ -42,23 +42,28 @@ def read_external_csv(path: str) -> Dict[str, Any]:
             first = row[0].strip()
             if first.startswith("#"):
                 # Check for metadata line: # label: Danao et al. (2014)
-                if ":" in first:
-                    parts = first.lstrip("#").split(":", 1)
+                full_comment = ",".join(row).strip()
+                if ":" in full_comment:
+                    parts = full_comment.lstrip("#").split(":", 1)
                     if parts[0].strip().lower() == "label":
                         label = parts[1].strip()
+                continue
+
+            if len(row) < 2:
                 continue
 
             # Check if header line
             try:
                 x_val = float(row[0].strip().replace(",", "."))
                 y_val = float(row[1].strip().replace(",", "."))
+                if not (np.isfinite(x_val) and np.isfinite(y_val)):
+                    continue
                 x_vals.append(x_val)
                 y_vals.append(y_val)
             except ValueError:
                 # Text header
-                if len(row) >= 2:
-                    x_name = row[0].strip()
-                    y_name = row[1].strip()
+                x_name = row[0].strip()
+                y_name = row[1].strip()
                 continue
 
     if not x_vals:
@@ -87,8 +92,17 @@ def compute_agreement_metrics(
     is_periodic_azimuth: bool = True
 ) -> Dict[str, Any]:
     """Compute comprehensive agreement metrics between CFD and external reference data."""
+    cfd_x = np.asarray(cfd_x, dtype=float)
+    cfd_y = np.asarray(cfd_y, dtype=float)
+    ext_x = np.asarray(ext_x, dtype=float)
+    ext_y = np.asarray(ext_y, dtype=float)
     if len(cfd_x) < 2 or len(ext_x) < 2:
         raise ValueError("Insufficient points to compute agreement metrics.")
+
+    # Ensure CFD data is sorted ascending by cfd_x before interpolation
+    cfd_order = np.argsort(cfd_x)
+    cfd_x = cfd_x[cfd_order]
+    cfd_y = cfd_y[cfd_order]
 
     # Interpolate CFD results onto external measurement points
     period = 360.0 if is_periodic_azimuth else None
@@ -107,7 +121,7 @@ def compute_agreement_metrics(
     if std_cfd > 1e-9 and std_ext > 1e-9:
         corr_r = float(np.corrcoef(cfd_interp, ext_y)[0, 1])
     else:
-        corr_r = 1.0
+        corr_r = 1.0 if rms_error <= 1e-9 else 0.0
 
     # Peaks and peak shift
     idx_peak_cfd = int(np.argmax(cfd_y))
@@ -119,6 +133,10 @@ def compute_agreement_metrics(
 
     peak_diff = peak_cfd - peak_ext
     peak_x_shift = (x_peak_cfd - x_peak_ext)
+    if is_periodic_azimuth:
+        peak_x_shift = ((peak_x_shift + 180.0) % 360.0) - 180.0
+        if peak_x_shift <= -180.0:
+            peak_x_shift = 180.0
 
     # Point-by-point error table
     point_errors: List[Dict[str, Any]] = []
@@ -218,36 +236,37 @@ def plot_overlay_comparison(
     ext_label: str = "Experimental Data"
 ) -> str:
     """Render high-resolution overlay graph with agreement metrics annotation box."""
-    os.makedirs(os.path.dirname(filepath), exist_ok=True)
+    os.makedirs(os.path.dirname(os.path.abspath(filepath)), exist_ok=True)
     fig, ax = plt.subplots(figsize=(8, 5), dpi=300)
+    try:
+        # Plot CFD curve
+        ax.plot(cfd_x, cfd_y, "-", color="#1F3864", linewidth=2.0, label=cfd_label)
+        # Plot experimental markers
+        ax.plot(ext_x, ext_y, "o", color="#DC2626", markersize=6, markerfacecolor="white", markeredgewidth=1.8, label=ext_label)
 
-    # Plot CFD curve
-    ax.plot(cfd_x, cfd_y, "-", color="#1F3864", linewidth=2.0, label=cfd_label)
-    # Plot experimental markers
-    ax.plot(ext_x, ext_y, "o", color="#DC2626", markersize=6, markerfacecolor="white", markeredgewidth=1.8, label=ext_label)
+        # Annotate agreement metrics box
+        box_text = (
+            f"Agreement Metrics:\n"
+            f"• RMS Error: {metrics['rms_error']:.4f}\n"
+            f"• Correlation $R$: {metrics['correlation_r']:.3f} ($R^2={metrics['r_squared']:.3f}$)\n"
+            f"• Peak $\\Delta$: {metrics['peak_diff']:+.4f}\n"
+            f"• Peak Shift: {metrics['peak_x_shift']:+.1f}°\n"
+            f"• Mean Abs % Err: {metrics['mean_abs_pct_error']:.1f}%"
+        )
+        ax.text(
+            0.03, 0.96, box_text, transform=ax.transAxes,
+            fontsize=9, verticalalignment="top",
+            bbox=dict(boxstyle="round,pad=0.5", facecolor="#FFF2CC", edgecolor="#D97706", alpha=0.9)
+        )
 
-    # Annotate agreement metrics box
-    box_text = (
-        f"Agreement Metrics:\n"
-        f"• RMS Error: {metrics['rms_error']:.4f}\n"
-        f"• Correlation $R$: {metrics['correlation_r']:.3f} ($R^2={metrics['r_squared']:.3f}$)\n"
-        f"• Peak $\\Delta$: {metrics['peak_diff']:+.4f}\n"
-        f"• Peak Shift: {metrics['peak_x_shift']:+.1f}°\n"
-        f"• Mean Abs % Err: {metrics['mean_abs_pct_error']:.1f}%"
-    )
-    ax.text(
-        0.03, 0.96, box_text, transform=ax.transAxes,
-        fontsize=9, verticalalignment="top",
-        bbox=dict(boxstyle="round,pad=0.5", facecolor="#FFF2CC", edgecolor="#D97706", alpha=0.9)
-    )
+        ax.set_xlabel(xlabel, fontsize=11, fontweight="bold")
+        ax.set_ylabel(ylabel, fontsize=11, fontweight="bold")
+        ax.set_title(title, fontsize=12, fontweight="bold", pad=12)
+        ax.grid(True, linestyle="--", alpha=0.6)
+        ax.legend(loc="upper right", frameon=True, fontsize=10)
 
-    ax.set_xlabel(xlabel, fontsize=11, fontweight="bold")
-    ax.set_ylabel(ylabel, fontsize=11, fontweight="bold")
-    ax.set_title(title, fontsize=12, fontweight="bold", pad=12)
-    ax.grid(True, linestyle="--", alpha=0.6)
-    ax.legend(loc="upper right", frameon=True, fontsize=10)
-
-    plt.tight_layout()
-    fig.savefig(filepath)
-    plt.close(fig)
+        fig.tight_layout()
+        fig.savefig(filepath)
+    finally:
+        plt.close(fig)
     return filepath

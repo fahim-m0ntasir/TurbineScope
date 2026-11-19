@@ -416,12 +416,14 @@ class ResultsFrame(ctk.CTkFrame):
         dual_top.pack(fill="x", padx=8, pady=4)
 
         self.dual_left_var = ctk.StringVar(value="01. Power Coefficient (Cp) History")
-        ctk.CTkOptionMenu(dual_top, variable=self.dual_left_var, values=list(FIGURE_TITLES.values()), width=240, command=lambda _: self._render_dual()).pack(side="left", padx=4)
+        self.dual_left_menu = ctk.CTkOptionMenu(dual_top, variable=self.dual_left_var, values=list(FIGURE_TITLES.values()), width=240, command=lambda _: self._render_dual())
+        self.dual_left_menu.pack(side="left", padx=4)
 
         ctk.CTkButton(dual_top, text="⇄ Swap", width=60, height=26, command=self._swap_dual_figures).pack(side="left", padx=6)
 
         self.dual_right_var = ctk.StringVar(value="03. Rotor Cp vs Azimuth (Phase-Averaged)")
-        ctk.CTkOptionMenu(dual_top, variable=self.dual_right_var, values=list(FIGURE_TITLES.values()), width=240, command=lambda _: self._render_dual()).pack(side="left", padx=4)
+        self.dual_right_menu = ctk.CTkOptionMenu(dual_top, variable=self.dual_right_var, values=list(FIGURE_TITLES.values()), width=240, command=lambda _: self._render_dual())
+        self.dual_right_menu.pack(side="left", padx=4)
 
         self.dual_container = ctk.CTkFrame(self.dual_view_frame, fg_color="transparent")
         self.dual_container.pack(fill="both", expand=True, padx=4, pady=4)
@@ -795,6 +797,18 @@ class ResultsFrame(ctk.CTkFrame):
             chosen_k = default_key if (default_key and default_key in self.figs) else ("03_cp_vs_azimuth.png" if "03_cp_vs_azimuth.png" in self.figs else all_keys[0])
             self.current_fig_key = chosen_k
             self.fig_var.set(FIGURE_TITLES.get(chosen_k, chosen_k))
+            if hasattr(self, "dual_left_menu"):
+                self.dual_left_menu.configure(values=titles)
+                if self.dual_left_var.get() not in titles:
+                    self.dual_left_var.set(titles[0])
+            if hasattr(self, "dual_right_menu"):
+                self.dual_right_menu.configure(values=titles)
+                if self.dual_right_var.get() not in titles:
+                    self.dual_right_var.set(titles[min(1, len(titles) - 1)])
+        else:
+            self.current_fig_key = None
+            self.fig_menu.configure(values=["No figures available"])
+            self.fig_var.set("No figures available")
         if self.active_sub_tab == "📈 Graph Preview":
             self._render_current_figure()
 
@@ -854,7 +868,16 @@ class ResultsFrame(ctk.CTkFrame):
             default_k = "03_cp_vs_azimuth.png" if "03_cp_vs_azimuth.png" in self.figs else all_keys[0]
             self.current_fig_key = default_k
             self.fig_var.set(FIGURE_TITLES.get(default_k, default_k))
+            if hasattr(self, "dual_left_menu"):
+                self.dual_left_menu.configure(values=titles)
+                if self.dual_left_var.get() not in titles:
+                    self.dual_left_var.set(titles[0])
+            if hasattr(self, "dual_right_menu"):
+                self.dual_right_menu.configure(values=titles)
+                if self.dual_right_var.get() not in titles:
+                    self.dual_right_var.set(titles[min(1, len(titles) - 1)])
         else:
+            self.current_fig_key = None
             self.fig_menu.configure(values=["No figures available"])
             self.fig_var.set("No figures available")
 
@@ -1291,7 +1314,18 @@ class ResultsFrame(ctk.CTkFrame):
         self._hide_probe_markers(redraw=False)
         self.res_mpl_canvas.draw_idle()
 
+    def _clear_box_patch(self) -> None:
+        if self._box_patch is not None:
+            try:
+                self._box_patch.remove()
+            except Exception:
+                pass
+            self._box_patch = None
+        if self._drag_state is not None and self._drag_state.get("mode") == "box":
+            self._drag_state = None
+
     def _on_interact_tool_change(self, val: str) -> None:
+        self._clear_box_patch()
         if "Box" in val:
             self.interact_tool = "Box Zoom"
             self._last_hover_sig = None
@@ -1333,21 +1367,48 @@ class ResultsFrame(ctk.CTkFrame):
             return
         scale = 0.84 if event.button == "up" else (1.0 / 0.84)
         self._push_view_history(group)
+        # Snapshot transforms & limits across the entire group BEFORE mutating any axis
+        snapshots: List[Tuple[Any, bool, Tuple[float, float], Tuple[float, float], Optional[float], Optional[float]]] = []
         for ax in group:
-            if getattr(ax, "name", "") == "polar":
-                self._scale_axis_around(ax, None, None, scale)
+            is_polar = getattr(ax, "name", "") == "polar"
+            xl = ax.get_xlim()
+            yl = ax.get_ylim()
+            if is_polar:
+                snapshots.append((ax, True, xl, yl, None, None))
                 continue
             try:
-                sx, sy = ax.transData.inverted().transform((event.x, event.y))
+                sx_raw, sy_raw = ax.transData.inverted().transform((event.x, event.y))
+                sx, sy = float(sx_raw), float(sy_raw)
             except Exception:
                 sx, sy = None, None
-            self._scale_axis_around(ax, sx, sy, scale)
+            snapshots.append((ax, False, xl, yl, sx, sy))
+
+        scaled_x_axes: List[Any] = []
+        for ax, is_polar, (xl0, xl1), (yl0, yl1), sx, sy in snapshots:
+            if is_polar:
+                ax.set_ylim(yl0, yl0 + max(1e-6, (yl1 - yl0) * scale))
+                continue
+            shares_x = False
+            for prev_ax in scaled_x_axes:
+                try:
+                    if ax.get_shared_x_axes().joined(ax, prev_ax):
+                        shares_x = True
+                        break
+                except Exception:
+                    pass
+            if not shares_x:
+                cx = sx if (sx is not None and math.isfinite(sx)) else 0.5 * (xl0 + xl1)
+                ax.set_xlim(cx - (cx - xl0) * scale, cx + (xl1 - cx) * scale)
+                scaled_x_axes.append(ax)
+            cy = sy if (sy is not None and math.isfinite(sy)) else 0.5 * (yl0 + yl1)
+            ax.set_ylim(cy - (cy - yl0) * scale, cy + (yl1 - cy) * scale)
         self._hide_probe_markers(redraw=False)
         self._schedule_canvas_redraw(delay_ms=16)
 
     def _on_mpl_press(self, event: Any) -> None:
         if not self._interactive_active or event.inaxes is None:
             return
+        self._clear_box_patch()
         if event.button == 1 and getattr(event, "dblclick", False):
             self._reset_interactive_view()
             return
@@ -1643,8 +1704,18 @@ class ResultsFrame(ctk.CTkFrame):
                     y_hi_px = max(float(px_pts[0, 1]), float(px_pts[1, 1])) + 18.0
                     if dx_px < best_dist and y_lo_px <= my <= y_hi_px:
                         best_dist = dx_px
-                        xlbls = [t.get_text().replace("\n", " ") for t in ax.get_xticklabels()]
-                        x_tag = xlbls[b_idx] if b_idx < len(xlbls) and xlbls[b_idx] else f"{bx:g}"
+                        x_tag = f"{bx:g}"
+                        try:
+                            xticks = ax.get_xticks()
+                            xtlbls = ax.get_xticklabels()
+                            for tx, tl in zip(xticks, xtlbls):
+                                if abs(float(tx) - bx) < 1e-6:
+                                    cand = tl.get_text().replace("\n", " ").strip()
+                                    if cand:
+                                        x_tag = cand
+                                    break
+                        except Exception:
+                            pass
                         best = {
                             "ax": ax,
                             "series": ax.get_ylabel() or "Bar Value",
@@ -1692,12 +1763,26 @@ class ResultsFrame(ctk.CTkFrame):
                 im = ax.images[0]
                 if isinstance(im, AxesImage) and event.xdata is not None and event.ydata is not None:
                     arr = np.asarray(im.get_array(), dtype=float)
+                    if arr.ndim != 2 or arr.shape[0] <= 0 or arr.shape[1] <= 0:
+                        continue
                     ex0, ex1, ey0, ey1 = im.get_extent()
                     nrows, ncols = arr.shape[:2]
                     if ex0 <= event.xdata <= ex1 and min(ey0, ey1) <= event.ydata <= max(ey0, ey1):
                         ci = int(min(ncols - 1, max(0, (event.xdata - ex0) / max(1e-9, ex1 - ex0) * ncols)))
                         ri = int(min(nrows - 1, max(0, (event.ydata - ey0) / max(1e-9, ey1 - ey0) * nrows)))
                         val = float(arr[ri, ci])
+                        rev_tag = f"Rev={int(round(event.ydata))}"
+                        try:
+                            yticks = ax.get_yticks()
+                            ytlbls = ax.get_yticklabels()
+                            if len(yticks) > 0 and len(yticks) == len(ytlbls):
+                                nearest_j = int(np.argmin(np.abs(np.asarray(yticks, dtype=float) - float(event.ydata))))
+                                if abs(float(yticks[nearest_j]) - float(event.ydata)) <= 0.6:
+                                    cand_y = ytlbls[nearest_j].get_text().strip()
+                                    if cand_y:
+                                        rev_tag = cand_y if cand_y.lower().startswith("rev") else f"Rev={cand_y}"
+                        except Exception:
+                            pass
                         return {
                             "ax": ax,
                             "series": "Cp Heatmap Cell",
@@ -1705,7 +1790,7 @@ class ResultsFrame(ctk.CTkFrame):
                             "y": float(event.ydata),
                             "disp_x": float(event.xdata),
                             "heat_val": val,
-                            "extra": f"θ={event.xdata:.1f}°, Rev={int(round(event.ydata))}",
+                            "extra": f"θ={event.xdata:.1f}°, {rev_tag}",
                             "kind": "heatmap",
                         }
         return best
@@ -1949,7 +2034,11 @@ class ResultsFrame(ctk.CTkFrame):
                     self.dual_left_tk = ctk.CTkImage(light_image=thumb, dark_image=thumb, size=(nw, nh))
                     self.dual_left_label.configure(image=self.dual_left_tk, text="")
             except Exception:
-                pass
+                self.dual_left_tk = None
+                self.dual_left_label.configure(image=None, text="Figure not available")
+        else:
+            self.dual_left_tk = None
+            self.dual_left_label.configure(image=None, text="Figure not available")
 
         if p_right and os.path.isfile(p_right):
             try:
@@ -1960,7 +2049,11 @@ class ResultsFrame(ctk.CTkFrame):
                     self.dual_right_tk = ctk.CTkImage(light_image=thumb, dark_image=thumb, size=(nw, nh))
                     self.dual_right_label.configure(image=self.dual_right_tk, text="")
             except Exception:
-                pass
+                self.dual_right_tk = None
+                self.dual_right_label.configure(image=None, text="Figure not available")
+        else:
+            self.dual_right_tk = None
+            self.dual_right_label.configure(image=None, text="Figure not available")
 
     def _swap_dual_figures(self):
         l = self.dual_left_var.get()
@@ -2178,11 +2271,15 @@ class ResultsFrame(ctk.CTkFrame):
         """Append line to execution log console."""
         if self._raw_log_text is not None:
             self._raw_log_text += f"{message}\n"
-        self.log_text.insert("end", f"{message}\n", tag)
-        self.log_text.see("end")
+        query = self.log_search_var.get().strip().lower() if hasattr(self, "log_search_var") else ""
+        if not query or query in str(message).lower():
+            self.log_text.insert("end", f"{message}\n", tag)
+            self.log_text.see("end")
 
     def _clear_log(self):
         self._raw_log_text = None
+        if hasattr(self, "log_search_var"):
+            self.log_search_var.set("")
         self.log_text.delete("1.0", "end")
 
     def _copy_log_text(self):
@@ -2265,9 +2362,11 @@ class ResultsFrame(ctk.CTkFrame):
                     data = output.getvalue()[14:]
                     output.close()
                 win32clipboard.OpenClipboard()
-                win32clipboard.EmptyClipboard()
-                win32clipboard.SetClipboardData(win32clipboard.CF_DIB, data)
-                win32clipboard.CloseClipboard()
+                try:
+                    win32clipboard.EmptyClipboard()
+                    win32clipboard.SetClipboardData(win32clipboard.CF_DIB, data)
+                finally:
+                    win32clipboard.CloseClipboard()
                 messagebox.showinfo("Clipboard", "Figure copied to clipboard!")
                 return
         except Exception:

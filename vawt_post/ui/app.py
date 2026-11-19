@@ -8,12 +8,14 @@ parameter preset saving, worker threading, live logging, and responsive graph pr
 """
 from __future__ import annotations
 
+import dataclasses
 import glob
 import json
 import math
 import os
 import queue
 import re
+import subprocess
 import sys
 import threading
 import traceback
@@ -957,9 +959,12 @@ class VAWTPostApp(ctk.CTk, TkinterDnD.DnDWrapper):  # type: ignore
 
     def _switch_page(self, target: str, force: bool = False):
         """Switch active page instantaneously in a single atomic Win32 paint frame."""
-        target = target.lower()
-        if target not in ("input", "results", "live", "workbench"):
-            return
+        target = str(target or "").lower()
+        if target not in ("input", "results", "live", "workbench", "gci"):
+            if force:
+                target = "input"
+            else:
+                return
 
         is_wb = (target in ("workbench", "gci"))
         prev_page = getattr(self, "current_page", None)
@@ -1569,8 +1574,8 @@ class VAWTPostApp(ctk.CTk, TkinterDnD.DnDWrapper):  # type: ignore
             p = self._gather_params()
             f = self._gather_files()
             data = {
-                "params": p.__dict__,
-                "files": f.__dict__,
+                "params": dataclasses.asdict(p),
+                "files": dataclasses.asdict(f),
                 "out_dir": self.v_out.get(),
                 "prefix": self.v_prefix.get()
             }
@@ -1826,15 +1831,17 @@ class VAWTPostApp(ctk.CTk, TkinterDnD.DnDWrapper):  # type: ignore
         except Exception:
             def safe_f(v_str, default):
                 try:
-                    return float(v_str.strip().replace(",", "."))
+                    val = float(v_str.strip().replace(",", "."))
+                    return val if (math.isfinite(val) and val > 0) else default
                 except Exception:
                     return default
+            nb_v = safe_f(self.v_nb.get(), 3)
             p = Params(
                 U=safe_f(self.v_U.get(), 8.0),
                 tsr=safe_f(self.v_tsr.get(), 3.5),
                 R=safe_f(self.v_R.get(), 0.5),
                 chord=safe_f(self.v_chord.get(), 0.06),
-                n_blades=int(safe_f(self.v_nb.get(), 3)),
+                n_blades=max(1, min(8, int(round(nb_v)))),
             )
 
         def on_generated(inp_files: InputFiles, out_dir: str):
@@ -2044,7 +2051,8 @@ class VAWTPostApp(ctk.CTk, TkinterDnD.DnDWrapper):  # type: ignore
             self.results_frame._clear_log()
         else:
             self.log_text.delete("1.0", "end")
-        self._log(f"Starting VAWT Post-Processing: {p.n_blades}-blade turbine (R={p.R:g}m, c={p.chord:g}m, U={p.U:g}m/s)...")
+        c_str = f"{p.chord:g}m" if p.chord is not None else "n/a"
+        self._log(f"Starting VAWT Post-Processing: {p.n_blades}-blade turbine (R={p.R:g}m, c={c_str}, U={p.U:g}m/s)...")
 
         # Launch worker thread
         def worker():
@@ -2131,10 +2139,13 @@ class VAWTPostApp(ctk.CTk, TkinterDnD.DnDWrapper):  # type: ignore
                         lines.append("First 10 lines:")
                         for l in all_lines[:10]:
                             lines.append("  " + l.rstrip())
-                        if len(all_lines) > 10:
+                        if len(all_lines) > 15:
                             lines.append(f"... ({len(all_lines) - 15} lines omitted) ...")
                             lines.append("Last 5 lines:")
                             for l in all_lines[-5:]:
+                                lines.append("  " + l.rstrip())
+                        elif len(all_lines) > 10:
+                            for l in all_lines[10:]:
                                 lines.append("  " + l.rstrip())
                     except Exception as fe:
                         lines.append(f"  Error reading file: {fe}")
@@ -2269,9 +2280,9 @@ class VAWTPostApp(ctk.CTk, TkinterDnD.DnDWrapper):  # type: ignore
             if sys.platform.startswith("win"):
                 os.startfile(folder)  # type: ignore[attr-defined]
             elif sys.platform == "darwin":
-                os.system(f'open "{folder}"')
+                subprocess.Popen(["open", folder])
             else:
-                os.system(f'xdg-open "{folder}"')
+                subprocess.Popen(["xdg-open", folder])
         else:
             messagebox.showinfo("Output Folder", f"Output folder does not exist yet:\n{folder}")
 

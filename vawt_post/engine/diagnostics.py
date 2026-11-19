@@ -957,7 +957,7 @@ def run_file_health_diagnostics(
                 else:
                     omega_val = None
 
-                if omega_val is not None:
+                if omega_val is not None and omega_val > 0:
                     Trev = 2.0 * math.pi / omega_val
                     steps_per_rev = Trev / dt_median
                     deg_per_step = omega_val * dt_median * 180.0 / math.pi
@@ -1165,12 +1165,34 @@ def run_file_health_diagnostics(
 
             # 1. Total torque check: symmetric N-blade rotor exhibits spectral lines at k × N·f0
             if "total" in parsed_files and parsed_files["total"]["time"] is not None:
-                f_peak = _spectral_peak(parsed_files["total"]["time"], parsed_files["total"]["value"], 0.4 * f_bpf, 3.5 * f_bpf)
+                tot_t = np.asarray(parsed_files["total"]["time"], dtype=float)
+                tot_v = np.asarray(parsed_files["total"]["value"], dtype=float)
+                f_peak = _spectral_peak(tot_t, tot_v, 0.4 * f_bpf, 3.5 * f_bpf)
                 if f_peak is not None:
                     k_harmonic = max(1, int(round(f_peak / f_bpf)))
                     f_expected_k = k_harmonic * f_bpf
-                    rel_err = abs(f_peak - f_expected_k) / f_expected_k
-                    if rel_err > 0.10:
+                    rel_err = abs(f_peak - f_expected_k) / max(f_expected_k, 1e-12)
+                    has_fundamental = True
+                    if k_harmonic >= 2:
+                        try:
+                            vmask = np.isfinite(tot_t) & np.isfinite(tot_v)
+                            t_ok, v_ok = tot_t[vmask], tot_v[vmask]
+                            if len(t_ok) >= 100 and t_ok[-1] > t_ok[0]:
+                                gn = min(len(t_ok), 8192)
+                                tg = np.linspace(t_ok[0], t_ok[-1], gn)
+                                dtg = (t_ok[-1] - t_ok[0]) / (gn - 1)
+                                mz = np.interp(tg, t_ok, v_ok)
+                                mz = mz - np.mean(mz)
+                                mfft = np.abs(np.fft.rfft(mz))
+                                frq = np.fft.rfftfreq(gn, dtg)
+                                b_all = (frq >= 0.4 * f_bpf) & (frq <= 3.5 * f_bpf)
+                                b_fnd = (frq >= 0.9 * f_bpf) & (frq <= 1.1 * f_bpf)
+                                p_amp = float(np.max(mfft[b_all])) if b_all.any() else 0.0
+                                f_amp = float(np.max(mfft[b_fnd])) if b_fnd.any() else 0.0
+                                has_fundamental = (p_amp > 0 and f_amp >= 0.25 * p_amp)
+                        except Exception:
+                            pass
+                    if rel_err > 0.10 or not has_fundamental:
                         report.add(DiagnosticFinding(
                             severity="WARNING",
                             file="total",
@@ -1396,11 +1418,11 @@ def reconstruct_missing_blade(
         if times is not None:
             fh.write(f'("Time Step" "reconstructed_moment_blade_{missing_blade_idx + 1}" "flow-time")\n')
             for i in range(len(steps)):
-                fh.write(f"{steps[i]} {vals[i]:.6e} {times[i]:.6e}\n")
+                fh.write(f"{steps[i]} {vals[i]:.12g} {times[i]:.12g}\n")
         else:
             fh.write(f'("Time Step" "reconstructed_moment_blade_{missing_blade_idx + 1}")\n')
             for i in range(len(steps)):
-                fh.write(f"{steps[i]} {vals[i]:.6e}\n")
+                fh.write(f"{steps[i]} {vals[i]:.12g}\n")
 
     return out_path
 

@@ -152,9 +152,9 @@ def inspect_hdf5_case(cas_path: str) -> CaseInspectionResult:
                             dims = zt["dimension"][:]
                             res.dimension = int(dims[0]) if len(dims) > 0 else 2
                         if "minId" in zt and "maxId" in zt:
-                            min_ids = zt["minId"][:]
-                            max_ids = zt["maxId"][:]
-                            res.cell_count = int(np.sum(max_ids - min_ids + 1))
+                            min_ids = np.asarray(zt["minId"][:], dtype=np.int64)
+                            max_ids = np.asarray(zt["maxId"][:], dtype=np.int64)
+                            res.cell_count = int(np.sum(np.maximum(0, max_ids - min_ids + 1)))
 
                         if "name" in zt and "id" in zt:
                             raw_cn = zt["name"][0]
@@ -177,9 +177,9 @@ def inspect_hdf5_case(cas_path: str) -> CaseInspectionResult:
                     if "faces" in m and "zoneTopology" in m["faces"]:
                         zf = m["faces"]["zoneTopology"]
                         if "minId" in zf and "maxId" in zf:
-                            face_min_ids = zf["minId"][:]
-                            face_max_ids = zf["maxId"][:]
-                            res.face_count = int(np.sum(face_max_ids - face_min_ids + 1))
+                            face_min_ids = np.asarray(zf["minId"][:], dtype=np.int64)
+                            face_max_ids = np.asarray(zf["maxId"][:], dtype=np.int64)
+                            res.face_count = int(np.sum(np.maximum(0, face_max_ids - face_min_ids + 1)))
 
                         if "name" in zf and "id" in zf:
                             raw_fn = zf["name"][0]

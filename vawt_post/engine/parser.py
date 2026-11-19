@@ -87,14 +87,15 @@ def inspect_fluent_report(path: str) -> Dict[str, Any]:
     if names is None or (sample_widths and len(names) != width):
         names = [f"Col_{i + 1}" for i in range(width)]
 
-    i_step = 0
+    i_step_found: Optional[int] = None
     i_time = None
     low = [n.lower() for n in names]
     for i, n in enumerate(low):
-        if "flow-time" in n or n == "time" or "flow time" in n or "flow_time" in n:
+        if i_time is None and ("flow-time" in n or n == "time" or "flow time" in n or "flow_time" in n):
             i_time = i
-        elif "step" in n or "iteration" in n or "time step" in n:
-            i_step = i
+        elif i_step_found is None and ("step" in n or "iteration" in n or "time step" in n):
+            i_step_found = i
+    i_step: Optional[int] = i_step_found if i_step_found is not None else (None if i_time == 0 else 0)
 
     data_cols = [(i, names[i]) for i in range(len(names)) if i not in (i_step, i_time)]
 
@@ -220,7 +221,7 @@ def read_fluent_report(
             i_time = i
         elif i_step_found is None and ("step" in n or "iteration" in n or "time step" in n):
             i_step_found = i
-    i_step = i_step_found if i_step_found is not None else 0
+    i_step: Optional[int] = i_step_found if i_step_found is not None else (None if i_time == 0 else 0)
 
     available_data_cols = [i for i in range(width) if i not in (i_step, i_time)]
     data_col_names = [names[i] for i in available_data_cols]
@@ -261,13 +262,17 @@ def read_fluent_report(
     selected_col_name = names[i_val] if i_val < len(names) else f"Col_{i_val + 1}"
     sha256_hash = compute_file_sha256(path)
 
-    step_col = arr[:, i_step]
-    if not np.all(np.isfinite(step_col)):
-        fallback_steps = np.arange(len(step_col), dtype=float)
-        step_col = np.where(np.isfinite(step_col), step_col, fallback_steps)
+    if i_step is not None:
+        step_col = arr[:, i_step]
+        if not np.all(np.isfinite(step_col)):
+            fallback_steps = np.arange(len(step_col), dtype=float)
+            step_col = np.where(np.isfinite(step_col), step_col, fallback_steps)
+        step_arr = np.rint(step_col).astype(np.int64)
+    else:
+        step_arr = np.arange(1, len(arr) + 1, dtype=np.int64)
 
     return {
-        "step": np.rint(step_col).astype(np.int64),
+        "step": step_arr,
         "value": arr[:, i_val],
         "time": arr[:, i_time] if i_time is not None else None,
         "name": os.path.basename(path),
@@ -344,8 +349,13 @@ def parse_report_filename_role(filename: str, n_blades: int = 8) -> Tuple[str, O
     stem = os.path.splitext(low)[0]
     warnings: List[str] = []
 
-    # Check for coefficient notation
-    is_coeff = any(tok in stem for tok in ("-cd", "_cd", ".cd", "cd-", "drag-coeff", "lift-coeff", "-cl", "_cl", ".cl", "cl-", "coeff"))
+    # Check for coefficient notation (word/separator-bounded so cd_blade1.out / cl_blade1.out / cm_blade1.out match)
+    is_coeff = bool(
+        re.search(
+            r"(?:^|[._-])(cd|cl|cm|c_d|c_l|c_m|drag[_-]?coeff|lift[_-]?coeff|moment[_-]?coeff|coeff)(?:$|[._-])",
+            stem,
+        )
+    )
     if is_coeff:
         warnings.append(f"File '{filename}' appears to be a dimensionless coefficient (Cd/Cl/Cm) rather than dimensional force/moment.")
 
@@ -895,6 +905,20 @@ def _attach_workbench_mesh_and_setup(
         pass
 
 
+def _set_pos_float(detected: Dict[str, Any], key: str, raw: Any) -> bool:
+    """Assign a strictly positive finite float into `detected[key]` if not already set."""
+    if raw is None or key in detected:
+        return False
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        return False
+    if math.isfinite(val) and val > 0.0:
+        detected[key] = val
+        return True
+    return False
+
+
 def detect_folder_simulation_parameters(
     folder: str,
     hint_params: Optional[Dict[str, Any]] = None,
@@ -1001,12 +1025,8 @@ def detect_folder_simulation_parameters(
                         continue
             if "U" not in detected:
                 m_v = re.search(rf"\(reference-velocity\s+({_NUM})\)", c_text)
-                if m_v:
-                    try:
-                        detected["U"] = float(m_v.group(1))
-                        found_cas = True
-                    except ValueError:
-                        pass
+                if m_v and _set_pos_float(detected, "U", m_v.group(1)):
+                    found_cas = True
             if "turb_model" not in detected:
                 tm = detect_solver_model_from_text(c_text)
                 if tm:
@@ -1046,14 +1066,10 @@ def detect_folder_simulation_parameters(
                         detected["omega"] = abs(om_raw)
                         if om_raw < 0 and "rotation_dir" not in detected:
                             detected["rotation_dir"] = "cw"
-                if xml_data.get("velocity") is not None and "U" not in detected:
-                    detected["U"] = float(xml_data["velocity"])
-                if xml_data.get("time_step") is not None and "dt" not in detected:
-                    detected["dt"] = float(xml_data["time_step"])
-                if xml_data.get("density") is not None and "rho" not in detected:
-                    detected["rho"] = float(xml_data["density"])
-                if xml_data.get("viscosity") is not None and "mu" not in detected:
-                    detected["mu"] = float(xml_data["viscosity"])
+                _set_pos_float(detected, "U", xml_data.get("velocity"))
+                _set_pos_float(detected, "dt", xml_data.get("time_step"))
+                _set_pos_float(detected, "rho", xml_data.get("density"))
+                _set_pos_float(detected, "mu", xml_data.get("viscosity"))
                 if xml_data.get("max_iter_per_step") is not None and "iterations" not in detected:
                     detected["iterations"] = int(xml_data["max_iter_per_step"])
                 if xml_data.get("blade_zones") and "n_blades" not in detected:
@@ -1096,26 +1112,16 @@ def detect_folder_simulation_parameters(
                             break
                     except ValueError:
                         continue
-            if "U" not in detected:
-                m_v = re.findall(rf"\(reference-velocity\s+({_NUM})\)", content)
-                if m_v:
-                    detected["U"] = float(m_v[-1])
-                    found_set = True
-            if "rho" not in detected:
-                m_rho = re.findall(rf"\(reference-density\s+({_NUM})\)", content)
-                if m_rho:
-                    detected["rho"] = float(m_rho[-1])
-                    found_set = True
-            if "mu" not in detected:
-                m_mu = re.findall(rf"\(reference-viscosity\s+({_NUM})\)", content)
-                if m_mu:
-                    detected["mu"] = float(m_mu[-1])
-                    found_set = True
-            if "dt" not in detected:
-                m_dt = re.findall(rf"\(time-step-size\s+\.\s+({_NUM})\)", content)
-                if m_dt:
-                    detected["dt"] = float(m_dt[-1])
-                    found_set = True
+            for _k, _pat in (
+                ("U", rf"\(reference-velocity\s+({_NUM})\)"),
+                ("rho", rf"\(reference-density\s+({_NUM})\)"),
+                ("mu", rf"\(reference-viscosity\s+({_NUM})\)"),
+                ("dt", rf"\(time-step-size\s+\.\s+({_NUM})\)"),
+            ):
+                if _k not in detected:
+                    _hits = re.findall(_pat, content)
+                    if _hits and _set_pos_float(detected, _k, _hits[-1]):
+                        found_set = True
             if "turb_model" not in detected:
                 t_mod = detect_solver_model_from_text(content)
                 if t_mod:
@@ -1161,13 +1167,11 @@ def detect_folder_simulation_parameters(
                         found_trn = True
             if "U" not in detected:
                 m_vel = re.search(rf"Velocity Magnitude\s*\[m/s\]\s+({_NUM})", ttext)
-                if m_vel:
-                    detected["U"] = float(m_vel.group(1))
+                if m_vel and _set_pos_float(detected, "U", m_vel.group(1)):
                     found_trn = True
             if "dt" not in detected:
                 m_dt = re.search(rf"Time Step Size\s*\[s\]\s+({_NUM})", ttext)
-                if m_dt:
-                    detected["dt"] = float(m_dt.group(1))
+                if m_dt and _set_pos_float(detected, "dt", m_dt.group(1)):
                     found_trn = True
             if found_trn:
                 sources.append(os.path.basename(tf))

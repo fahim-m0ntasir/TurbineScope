@@ -36,9 +36,7 @@ class SimulationStage:
         return float(math.radians(1.0) / omega)
 
     def resolve_deg_per_step(self, omega: float) -> float:
-        """Resolve azimuthal shift per step (deg) from dt or deg_per_step."""
-        if self.deg_per_step is not None and self.deg_per_step > 0:
-            return float(self.deg_per_step)
+        """Resolve azimuthal shift per step (deg) consistently with resolve_dt."""
         dt_val = self.resolve_dt(omega)
         return float(math.degrees(omega * dt_val))
 
@@ -61,7 +59,7 @@ def make_fluent_file(
     times: Optional[np.ndarray] = None
 ) -> None:
     """Write synthetic series into ANSYS Fluent report monitor file format."""
-    os.makedirs(os.path.dirname(filepath), exist_ok=True)
+    os.makedirs(os.path.dirname(os.path.abspath(filepath)), exist_ok=True)
     with open(filepath, "w", encoding="utf-8") as f:
         if times is not None:
             f.write(f'("Time Step" "{header_name}" "flow-time")\n')
@@ -192,17 +190,21 @@ def generate_multistage_dataset(
     scale_amp = 1.0 / (nb * mean_s)
     g = lambda theta: blade_shape(theta) * scale_amp
 
-    # Blade offsets (even spacing)
+    # Blade offsets (even spacing) respecting azimuth zero/theta0 and rotation sign
+    from vawt_post.engine.azimuth_detect import compute_az_base, effective_moment_sign
+    az_base = compute_az_base(p)
+    raw_sign = effective_moment_sign(p)
+
     offsets = [360.0 * i / nb for i in range(nb)]
     mb = []
     for off in offsets:
-        th_b = np.mod(np.degrees(omega * t) + off, 360.0)
-        mb.append(Mrot_target * g(th_b))
+        th_b = np.mod(az_base + np.degrees(omega * t) + off, 360.0)
+        mb.append(raw_sign * Mrot_target * g(th_b))
 
     mtot = np.sum(mb, axis=0)
 
     # Aerodynamic forces
-    th_rot = np.mod(np.degrees(omega * t), 360.0)
+    th_rot = np.mod(az_base + np.degrees(omega * t), 360.0)
     Fx = ct_target * Fref * (1.0 + 0.12 * np.sin(nb * np.radians(th_rot)))
     Fy = 0.20 * Fref * np.cos(nb * np.radians(th_rot))
     Mshaft = 0.02 * mtot if include_shaft else None

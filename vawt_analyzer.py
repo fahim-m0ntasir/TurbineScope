@@ -22,9 +22,5 @@ warnings.warn(
 )
 
 if __name__ == "__main__":
-    if "--cli" in sys.argv:
-        from vawt_post.cli import main
-        main()
-    else:
-        from vawt_post.ui.app import main
-        main()
+    from vawt_post.cli import main
+    sys.exit(main())

@@ -149,13 +149,13 @@ def export_latex_snippet(
         r"\begin{figure}[htbp]",
         r"  \centering",
         r"  \includegraphics[width=0.88\textwidth]{08_alpha_w_re.png}",
-        r"  \caption{Kinematic variation of geometric angle of attack $\alpha$, relative velocity ratio $W/U_\\infty$, and chord Reynolds number $Re_c$ as a function of azimuthal angle $\theta$.}",
+        r"  \caption{Kinematic variation of geometric angle of attack $\alpha$, relative velocity ratio $W/U_\infty$, and chord Reynolds number $Re_c$ as a function of azimuthal angle $\theta$.}",
         r"  \label{fig:vawt_kinematics}",
         r"\end{figure}",
         r"",
     ]
 
-    os.makedirs(os.path.dirname(filepath), exist_ok=True)
+    os.makedirs(os.path.dirname(os.path.abspath(filepath)), exist_ok=True)
     with open(filepath, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
 

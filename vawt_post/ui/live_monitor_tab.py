@@ -1895,10 +1895,11 @@ class LiveMonitorFrame(ctk.CTkFrame):
         for ax, p_name in zip(self.axes, self.plot_names):
             had_lines_before = bool(ax.lines or ax.patches or ax.images)
             lim_key = f"{p_name}||{self.window_mode}"
-            if had_lines_before and not self.v_autoscale.get() and "Heatmap" not in p_name:
+            prev_lim_key = getattr(ax, "_rendered_lim_key", None)
+            if had_lines_before and prev_lim_key and not self.v_autoscale.get() and "Heatmap" not in p_name:
                 xl, yl = ax.get_xlim(), ax.get_ylim()
                 if xl != (0.0, 1.0) or yl != (0.0, 1.0):
-                    self._saved_axis_limits[lim_key] = (xl, yl)
+                    self._saved_axis_limits[prev_lim_key] = (xl, yl)
             ax.clear()
             ax.set_facecolor("#1A1A1A")
             ax.grid(True, linestyle="--", alpha=0.3, color=grid_col)
@@ -2148,6 +2149,7 @@ class LiveMonitorFrame(ctk.CTkFrame):
                 if is_azimuth_plot:
                     ax.set_xlim(0, 360)
                     ax.set_xticks([0, 60, 120, 180, 240, 300, 360])
+            setattr(ax, "_rendered_lim_key", lim_key)
 
             # Lock axes limits after plotting so hover probe artists never trigger autoscaling or shifting
             ax.set_autoscale_on(False)
@@ -3073,7 +3075,7 @@ class LiveMonitorFrame(ctk.CTkFrame):
             if not raw:
                 return
             tol_val = float(raw)
-            if tol_val <= 0:
+            if not math.isfinite(tol_val) or tol_val <= 0:
                 return
             p = self.live_params if self.live_params is not None else self._get_or_detect_params()
             if abs((p.stable_tol or 5.0) - tol_val) < 1e-9:
@@ -3234,12 +3236,12 @@ class LiveMonitorFrame(ctk.CTkFrame):
 
         nstable_val = self.live_params.n_stable if (self.live_params and self.live_params.n_stable is not None) else 2
         depth_val = self.live_params.depth if (self.live_params and self.live_params.depth is not None) else 1.0
-        rot_dir_val = det.get("rotation_dir") or (getattr(prev, "rotation_dir", None) if prev else None) or (getattr(self.live_params, "rotation_dir", "ccw") if self.live_params else "ccw")
+        rot_dir_val = det.get("rotation_dir") or (getattr(prev, "rotation_dir", None) if prev else None) or "ccw"
         theta0_val = det.get("theta0")
         if theta0_val is None:
             theta0_val = getattr(prev, "theta0", None) if prev else None
         if theta0_val is None:
-            theta0_val = getattr(self.live_params, "theta0", 0.0) if self.live_params else 0.0
+            theta0_val = 0.0
         bin_val = self.live_params.bin_deg if (self.live_params and self.live_params.bin_deg is not None) else 1.0
 
         p = Params(
@@ -3340,6 +3342,14 @@ class LiveMonitorFrame(ctk.CTkFrame):
             self.lbl_dt.configure(text="Δt: -")
         if hasattr(self, "lbl_stages_badge"):
             self.lbl_stages_badge.configure(text="Uniform Δt", text_color="gray")
+        if hasattr(self, "lbl_stages_content"):
+            self.lbl_stages_content.configure(text="Waiting for time-step telemetry...")
+        if hasattr(self, "lbl_checks_echo"):
+            self.lbl_checks_echo.configure(text="Checks: waiting for live data...")
+        if hasattr(self, "lbl_last_refresh"):
+            self.lbl_last_refresh.configure(text="Last Refresh: -")
+        if hasattr(self, "lbl_plot_stamp"):
+            self.lbl_plot_stamp.configure(text="Updated: -")
         if hasattr(self, "lbl_current_phase"):
             self.lbl_current_phase.configure(text="P1: -", text_color="gray")
         if hasattr(self, "lbl_dt") and hasattr(self.lbl_dt, "setToolTip"):
@@ -3506,6 +3516,10 @@ class LiveMonitorFrame(ctk.CTkFrame):
         if p is not None:
             self.live_params = p
             self._manual_params_override = True
+            self.detected_turb_model = None
+            self._last_detected_folder = self.custom_watch_folder
+            if hasattr(self, "v_live_tol") and p.stable_tol is not None:
+                self.v_live_tol.set(f"{p.stable_tol:g}")
         else:
             self._manual_params_override = False
             self.live_params = None
@@ -3703,7 +3717,7 @@ class LiveMonitorFrame(ctk.CTkFrame):
             if not val_str:
                 return
             val = float(val_str)
-            if val <= 0:
+            if not math.isfinite(val) or val <= 0:
                 return
             unit = self.interval_unit_var.get()
             secs = val * 60.0 if "minute" in unit else val

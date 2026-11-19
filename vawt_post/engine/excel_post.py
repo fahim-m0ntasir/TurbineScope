@@ -227,7 +227,7 @@ def _compute_quartile_shares(df_blade: pd.DataFrame, df_az: Optional[pd.DataFram
         src = df_az
         val_col = "cp"
     if src is None or len(src) == 0:
-        return {"pct_up": 25.0, "pct_lee": 25.0, "pct_down": 25.0, "pct_wind": 25.0}
+        return {"pct_up": 0.0, "pct_lee": 0.0, "pct_down": 0.0, "pct_wind": 0.0}
 
     th = np.asarray(src["theta"].values, dtype=float) % 360.0
     cp_b = np.asarray(src[val_col].values, dtype=float)
@@ -237,13 +237,14 @@ def _compute_quartile_shares(df_blade: pd.DataFrame, df_az: Optional[pd.DataFram
     s_wind = float(np.nansum(cp_b[(th >= 315.0) | (th < 45.0)]))
     tot = s_up + s_lee + s_down + s_wind
     if abs(tot) > 1e-9:
+        denom = abs(tot)
         return {
-            "pct_up": (s_up / tot) * 100.0,
-            "pct_lee": (s_lee / tot) * 100.0,
-            "pct_down": (s_down / tot) * 100.0,
-            "pct_wind": (s_wind / tot) * 100.0,
+            "pct_up": (s_up / denom) * 100.0,
+            "pct_lee": (s_lee / denom) * 100.0,
+            "pct_down": (s_down / denom) * 100.0,
+            "pct_wind": (s_wind / denom) * 100.0,
         }
-    return {"pct_up": 25.0, "pct_lee": 25.0, "pct_down": 25.0, "pct_wind": 25.0}
+    return {"pct_up": 0.0, "pct_lee": 0.0, "pct_down": 0.0, "pct_wind": 0.0}
 
 
 def generate_aeropost_figures(
@@ -271,350 +272,370 @@ def generate_aeropost_figures(
     figures: Dict[str, str] = {}
     figures_meta: List[Dict[str, Any]] = []
 
-    sns.set_theme(style="whitegrid", palette="deep")
-    plt.rcParams["font.family"] = "sans-serif"
-    plt.rcParams["font.size"] = 10
-    plt.rcParams["axes.labelsize"] = 11
-    plt.rcParams["axes.titlesize"] = 12
-    plt.rcParams["xtick.labelsize"] = 10
-    plt.rcParams["ytick.labelsize"] = 10
-    plt.rcParams["legend.fontsize"] = 10
-    plt.rcParams["figure.titlesize"] = 13
-    plt.rcParams["mathtext.fontset"] = "dejavusans"
+    rc_overrides: Dict[Any, Any] = {
+        "font.family": "sans-serif",
+        "font.size": 10,
+        "axes.labelsize": 11,
+        "axes.titlesize": 12,
+        "xtick.labelsize": 10,
+        "ytick.labelsize": 10,
+        "legend.fontsize": 10,
+        "figure.titlesize": 13,
+        "mathtext.fontset": "dejavusans",
+    }
 
-    # -------------------------------------------------------------------------
-    # 1. Power Contribution by Azimuthal Quartile (Bar Chart)
-    # -------------------------------------------------------------------------
-    df_blade = data.get("Blade_Azimuth", pd.DataFrame())
-    df_az_src = data.get("Azimuth_Cp", pd.DataFrame())
-    if df_blade.empty and not df_az_src.empty:
-        df_blade = pd.DataFrame({
-            "theta": df_az_src["theta"],
-            "t_blade_1": np.zeros(len(df_az_src)),
-            "cp_contrib": df_az_src["cp"],
+    with sns.axes_style("whitegrid"), plt.rc_context(rc_overrides):
+        # -------------------------------------------------------------------------
+        # 1. Power Contribution by Azimuthal Quartile (Bar Chart)
+        # -------------------------------------------------------------------------
+        df_blade = data.get("Blade_Azimuth", pd.DataFrame())
+        df_az_src = data.get("Azimuth_Cp", pd.DataFrame())
+
+        q_shares = _compute_quartile_shares(df_blade, df_az_src)
+        pct_up = q_shares["pct_up"]
+        pct_lee = q_shares["pct_lee"]
+        pct_down = q_shares["pct_down"]
+        pct_wind = q_shares["pct_wind"]
+
+        quartiles = [
+            "Upwind\n[45°–135°)",
+            "Leeward\n[135°–225°)",
+            "Downwind\n[225°–315°)",
+            "Windward\n[315°–45°)"
+        ]
+        pcts = [pct_up, pct_lee, pct_down, pct_wind]
+        colors = ["#1F4E79", "#D1495B", "#2A9D8F", "#E9A03B"]
+
+        f1_num = start_fig_num + 0
+        f1_filename = f"{f1_num:02d}_power_contribution_quartiles.png"
+        f1_path = os.path.join(output_dir, f1_filename)
+        fig1, ax1 = plt.subplots(figsize=(7.5, 4.8), dpi=dpi)
+        try:
+            bars = ax1.bar(quartiles, pcts, color=colors, width=0.55, edgecolor="#1A2530", linewidth=1.2, zorder=3)
+            ax1.axhline(0, color="#1A2530", linewidth=1.0, linestyle="-", zorder=2)
+            ax1.set_ylabel("Power Contribution Share [%]", fontweight="bold")
+            ax1.set_title(f"Figure {f1_num}: Power Contribution by Azimuthal Quartile", fontweight="bold", pad=12)
+            ymin = min(0.0, min(pcts) * 1.25) - 5.0
+            ymax = max(5.0, max(pcts) * 1.25 + 10.0)
+            ax1.set_ylim(ymin, ymax)
+
+            for bar, pct in zip(bars, pcts):
+                y_pos = bar.get_height() + (1.5 if bar.get_height() >= 0 else -3.5)
+                ax1.text(bar.get_x() + bar.get_width() / 2.0, y_pos, f"{pct:.1f}%", ha="center", va="bottom" if bar.get_height() >= 0 else "top", fontweight="bold", fontsize=10, color="#1F2937")
+
+            ax1.grid(True, linestyle="--", alpha=0.5, axis="y")
+            fig1.tight_layout()
+            fig1.savefig(f1_path, dpi=dpi)
+        finally:
+            plt.close(fig1)
+        figures[f1_filename] = f1_path
+        figures["01_power_contribution_quartiles.png"] = f1_path  # alias for backward-compatibility
+
+        dominant_sector = quartiles[int(np.argmax(pcts))].split("\n")[0]
+        figures_meta.append({
+            "id": f"Fig {f1_num:02d}",
+            "num": f1_num,
+            "file": f1_filename,
+            "title": "Power Contribution by Azimuthal Quartile",
+            "banner_title": f"Figure {f1_num}: Power Contribution by Azimuthal Quartile",
+            "caption": (
+                f"Figure {f1_num}: Sectoral aerodynamic power contribution across four rotation quadrants: "
+                f"Upwind [45°–135°] ({pct_up:.1f}%), Leeward [135°–225°] ({pct_lee:.1f}%), "
+                f"Downwind [225°–315°] ({pct_down:.1f}%), and Windward [315°–45°] ({pct_wind:.1f}%). "
+                f"Total power generation is dominated by the {dominant_sector} quadrant."
+            )
         })
 
-    q_shares = _compute_quartile_shares(df_blade, df_az_src)
-    pct_up = q_shares["pct_up"]
-    pct_lee = q_shares["pct_lee"]
-    pct_down = q_shares["pct_down"]
-    pct_wind = q_shares["pct_wind"]
+        # -------------------------------------------------------------------------
+        # 2. Cumulative Moment Distribution (Line Graph)
+        # -------------------------------------------------------------------------
+        df_az = data["Azimuth_Cp"].sort_values("theta").reset_index(drop=True)
+        th_az = df_az["theta"].values
+        cm_vals = df_az["cm"].values
 
-    quartiles = [
-        "Upwind\n[45°–135°)",
-        "Leeward\n[135°–225°)",
-        "Downwind\n[225°–315°)",
-        "Windward\n[315°–45°)"
-    ]
-    pcts = [pct_up, pct_lee, pct_down, pct_wind]
-    colors = ["#1F4E79", "#D1495B", "#2A9D8F", "#E9A03B"]
-
-    f1_num = start_fig_num + 0
-    fig1, ax1 = plt.subplots(figsize=(7.5, 4.8), dpi=dpi)
-    bars = ax1.bar(quartiles, pcts, color=colors, width=0.55, edgecolor="#1A2530", linewidth=1.2, zorder=3)
-    ax1.axhline(0, color="#1A2530", linewidth=1.0, linestyle="-", zorder=2)
-    ax1.set_ylabel("Power Contribution Share [%]", fontweight="bold")
-    ax1.set_title(f"Figure {f1_num}: Power Contribution by Azimuthal Quartile", fontweight="bold", pad=12)
-    ax1.set_ylim(min(0.0, min(pcts) * 1.25) - 5.0, max(pcts) * 1.25 + 10.0)
-
-    for bar, pct in zip(bars, pcts):
-        y_pos = bar.get_height() + (1.5 if bar.get_height() >= 0 else -3.5)
-        ax1.text(bar.get_x() + bar.get_width() / 2.0, y_pos, f"{pct:.1f}%", ha="center", va="bottom" if bar.get_height() >= 0 else "top", fontweight="bold", fontsize=10, color="#1F2937")
-
-    ax1.grid(True, linestyle="--", alpha=0.5, axis="y")
-    fig1.tight_layout()
-    f1_filename = f"{f1_num:02d}_power_contribution_quartiles.png"
-    f1_path = os.path.join(output_dir, f1_filename)
-    fig1.savefig(f1_path, dpi=dpi)
-    plt.close(fig1)
-    figures[f1_filename] = f1_path
-    figures["01_power_contribution_quartiles.png"] = f1_path  # alias for backward-compatibility
-
-    dominant_sector = quartiles[int(np.argmax(pcts))].split("\n")[0]
-    figures_meta.append({
-        "id": f"Fig {f1_num:02d}",
-        "num": f1_num,
-        "file": f1_filename,
-        "title": "Power Contribution by Azimuthal Quartile",
-        "banner_title": f"Figure {f1_num}: Power Contribution by Azimuthal Quartile",
-        "caption": (
-            f"Figure {f1_num}: Sectoral aerodynamic power contribution across four rotation quadrants: "
-            f"Upwind [45°–135°] ({pct_up:.1f}%), Leeward [135°–225°] ({pct_lee:.1f}%), "
-            f"Downwind [225°–315°] ({pct_down:.1f}%), and Windward [315°–45°] ({pct_wind:.1f}%). "
-            f"Total power generation is dominated by the {dominant_sector} quadrant."
-        )
-    })
-
-    # -------------------------------------------------------------------------
-    # 2. Cumulative Moment Distribution (Line Graph)
-    # -------------------------------------------------------------------------
-    df_az = data["Azimuth_Cp"].sort_values("theta").reset_index(drop=True)
-    th_az = df_az["theta"].values
-    cm_vals = df_az["cm"].values
-
-    cm_cum = np.cumsum(cm_vals)
-    if len(cm_cum) > 0:
-        max_accum = float(np.max(cm_cum))
-        min_accum = float(np.min(cm_cum))
-        accum_range = max_accum - min_accum if (max_accum - min_accum) > 1e-9 else 1.0
-        if max_accum > 1e-9:
-            cm_norm = (cm_cum / max_accum) * 100.0
+        cm_cum = np.cumsum(cm_vals)
+        if len(cm_cum) > 0:
+            max_accum = float(np.max(cm_cum))
+            min_accum = float(np.min(cm_cum))
+            accum_range = max_accum - min_accum if (max_accum - min_accum) > 1e-9 else 1.0
+            if max_accum > 1e-9:
+                cm_norm = (cm_cum / max_accum) * 100.0
+            else:
+                cm_norm = ((cm_cum - min_accum) / accum_range) * 100.0
         else:
-            cm_norm = ((cm_cum - min_accum) / accum_range) * 100.0
-    else:
-        cm_norm = np.array([], dtype=float)
+            cm_norm = np.array([], dtype=float)
 
-    f2_num = start_fig_num + 1
-    fig2, ax2 = plt.subplots(figsize=(7.5, 4.8), dpi=dpi)
-    ax2.plot(th_az, cm_norm, color="#1F4E79", linewidth=2.4, label=r"Normalized Cumulative Moment $\sum C_m$")
-    ax2.axhline(100.0, color="#10B981", linestyle="--", linewidth=1.2, alpha=0.8, label="100% Accumulated Torque")
-    ax2.axhline(50.0, color="#64748B", linestyle=":", linewidth=1.0, alpha=0.8, label="50% Median Threshold")
+        f2_num = start_fig_num + 1
+        f2_filename = f"{f2_num:02d}_cumulative_moment_distribution.png"
+        f2_path = os.path.join(output_dir, f2_filename)
+        fig2, ax2 = plt.subplots(figsize=(7.5, 4.8), dpi=dpi)
+        try:
+            ax2.plot(th_az, cm_norm, color="#1F4E79", linewidth=2.4, label=r"Normalized Cumulative Moment $\sum C_m$")
+            ax2.axhline(100.0, color="#10B981", linestyle="--", linewidth=1.2, alpha=0.8, label="100% Accumulated Torque")
+            ax2.axhline(50.0, color="#64748B", linestyle=":", linewidth=1.0, alpha=0.8, label="50% Median Threshold")
 
-    ax2.axvspan(0, 180, color="#EBF3FB", alpha=0.6, label="Upwind Half [0°–180°]")
-    ax2.axvspan(180, 360, color="#F8FAFC", alpha=0.4, label="Downwind Half [180°–360°]")
+            ax2.axvspan(0, 180, color="#EBF3FB", alpha=0.6, label="Upwind Half [0°–180°]")
+            ax2.axvspan(180, 360, color="#F8FAFC", alpha=0.4, label="Downwind Half [180°–360°]")
 
-    ax2.set_xlim(0, 360)
-    ax2.set_xticks(range(0, 361, 60))
-    ax2.set_xlabel(r"Rotor Azimuth Angle $\theta$ [deg]", fontweight="bold")
-    ax2.set_ylabel(r"Cumulative Moment Distribution [% of Max]", fontweight="bold")
-    ax2.set_title(f"Figure {f2_num}: Cumulative Moment Distribution vs. Azimuth", fontweight="bold", pad=12)
-    ax2.legend(loc="lower right", frameon=True, framealpha=0.92)
-    ax2.grid(True, linestyle="--", alpha=0.55)
-    fig2.tight_layout()
-    f2_filename = f"{f2_num:02d}_cumulative_moment_distribution.png"
-    f2_path = os.path.join(output_dir, f2_filename)
-    fig2.savefig(f2_path, dpi=dpi)
-    plt.close(fig2)
-    figures[f2_filename] = f2_path
-    figures["02_cumulative_moment_distribution.png"] = f2_path
+            ax2.set_xlim(0, 360)
+            ax2.set_xticks(range(0, 361, 60))
+            ax2.set_xlabel(r"Rotor Azimuth Angle $\theta$ [deg]", fontweight="bold")
+            ax2.set_ylabel(r"Cumulative Moment Distribution [% of Max]", fontweight="bold")
+            ax2.set_title(f"Figure {f2_num}: Cumulative Moment Distribution vs. Azimuth", fontweight="bold", pad=12)
+            ax2.legend(loc="lower right", frameon=True, framealpha=0.92)
+            ax2.grid(True, linestyle="--", alpha=0.55)
+            fig2.tight_layout()
+            fig2.savefig(f2_path, dpi=dpi)
+        finally:
+            plt.close(fig2)
+        figures[f2_filename] = f2_path
+        figures["02_cumulative_moment_distribution.png"] = f2_path
 
-    idx_50 = np.where(cm_norm >= 50.0)[0]
-    th_50 = float(th_az[idx_50[0]]) if len(idx_50) > 0 else 180.0
-    figures_meta.append({
-        "id": f"Fig {f2_num:02d}",
-        "num": f2_num,
-        "file": f2_filename,
-        "title": "Cumulative Moment Distribution",
-        "banner_title": f"Figure {f2_num}: Cumulative Moment Distribution (0° to 360°)",
-        "caption": (
-            f"Figure {f2_num}: Normalized cumulative aerodynamic moment coefficient Cm accumulated over a complete 360° "
-            f"rotor revolution (scaling 0% to 100%). Half-cycle accumulated torque reaches 50% of total cycle work at θ = {th_50:.1f}°."
-        )
-    })
+        idx_50 = np.where(cm_norm >= 50.0)[0]
+        th_50 = float(th_az[idx_50[0]]) if len(idx_50) > 0 else 180.0
+        figures_meta.append({
+            "id": f"Fig {f2_num:02d}",
+            "num": f2_num,
+            "file": f2_filename,
+            "title": "Cumulative Moment Distribution",
+            "banner_title": f"Figure {f2_num}: Cumulative Moment Distribution (0° to 360°)",
+            "caption": (
+                f"Figure {f2_num}: Normalized cumulative aerodynamic moment coefficient Cm accumulated over a complete 360° "
+                f"rotor revolution (scaling 0% to 100%). Half-cycle accumulated torque reaches 50% of total cycle work at θ = {th_50:.1f}°."
+            )
+        })
 
-    # -------------------------------------------------------------------------
-    # 3. Instantaneous Blade Tangential Load / Torque (Line Graph)
-    # -------------------------------------------------------------------------
-    t1_vals = np.asarray(df_blade["t_blade_1"].values, dtype=float)
-    th_b = np.asarray(df_blade["theta"].values, dtype=float)
-    has_t1 = len(t1_vals) > 0 and np.any(np.isfinite(t1_vals))
-    t_max_idx = int(np.nanargmax(t1_vals)) if has_t1 else 0
-    t_min_idx = int(np.nanargmin(t1_vals)) if has_t1 else 0
+        # -------------------------------------------------------------------------
+        # 3. Instantaneous Blade Tangential Load / Torque (Line Graph)
+        # -------------------------------------------------------------------------
+        if not df_blade.empty and "t_blade_1" in df_blade.columns and "theta" in df_blade.columns:
+            t1_vals = np.asarray(df_blade["t_blade_1"].values, dtype=float)
+            th_b = np.asarray(df_blade["theta"].values, dtype=float)
+        else:
+            t1_vals = np.array([], dtype=float)
+            th_b = np.array([], dtype=float)
+        has_t1 = len(t1_vals) > 0 and np.any(np.isfinite(t1_vals))
+        t_max_idx = int(np.nanargmax(t1_vals)) if has_t1 else 0
+        t_min_idx = int(np.nanargmin(t1_vals)) if has_t1 else 0
 
-    f3_num = start_fig_num + 2
-    fig3, ax3 = plt.subplots(figsize=(7.5, 4.8), dpi=dpi)
-    if has_t1:
-        ax3.plot(th_b, t1_vals, color="#2563EB", linewidth=2.2, label=r"Blade 1 Torque $T_{\mathrm{blade\,1}}$")
-    ax3.axhline(0, color="#1A2530", linestyle="--", linewidth=1.1, alpha=0.85, label="Zero Torque Baseline")
-    ax3.axvspan(0, 180, color="#EBF3FB", alpha=0.5, label="Upwind Sector")
+        f3_num = start_fig_num + 2
+        f3_filename = f"{f3_num:02d}_blade_tangential_load.png"
+        f3_path = os.path.join(output_dir, f3_filename)
+        fig3, ax3 = plt.subplots(figsize=(7.5, 4.8), dpi=dpi)
+        try:
+            if has_t1:
+                ax3.plot(th_b, t1_vals, color="#2563EB", linewidth=2.2, label=r"Blade 1 Torque $T_{\mathrm{blade\,1}}$")
+            ax3.axhline(0, color="#1A2530", linestyle="--", linewidth=1.1, alpha=0.85, label="Zero Torque Baseline")
+            ax3.axvspan(0, 180, color="#EBF3FB", alpha=0.5, label="Upwind Sector")
 
-    if has_t1:
-        ax3.plot(th_b[t_max_idx], t1_vals[t_max_idx], marker="o", color="#DC2626", markersize=6)
-        ax3.annotate(
-            f"Peak Load: {t1_vals[t_max_idx]:.3f} N·m\n@ {th_b[t_max_idx]:.1f}°",
-            xy=(th_b[t_max_idx], t1_vals[t_max_idx]),
-            xytext=(th_b[t_max_idx] + 15, t1_vals[t_max_idx] * 0.95),
-            arrowprops=dict(facecolor="#DC2626", shrink=0.08, width=1.0, headwidth=5),
-            fontweight="bold", fontsize=9, color="#991B1B"
-        )
+            if has_t1:
+                ax3.plot(th_b[t_max_idx], t1_vals[t_max_idx], marker="o", color="#DC2626", markersize=6)
+                ax3.annotate(
+                    f"Peak Load: {t1_vals[t_max_idx]:.3f} N·m\n@ {th_b[t_max_idx]:.1f}°",
+                    xy=(th_b[t_max_idx], t1_vals[t_max_idx]),
+                    xytext=(th_b[t_max_idx] + 15, t1_vals[t_max_idx] * 0.95),
+                    arrowprops=dict(facecolor="#DC2626", shrink=0.08, width=1.0, headwidth=5),
+                    fontweight="bold", fontsize=9, color="#991B1B"
+                )
+            else:
+                ax3.text(
+                    0.5, 0.5, "Individual blade torque data unavailable in this workbook.",
+                    transform=ax3.transAxes, ha="center", va="center", fontsize=10, color="#64748B"
+                )
 
-    ax3.set_xlim(0, 360)
-    ax3.set_xticks(range(0, 361, 60))
-    ax3.set_xlabel(r"Blade Azimuth Angle $\theta$ [deg]", fontweight="bold")
-    ax3.set_ylabel("Dimensional Torque (N·m)", fontweight="bold")
-    ax3.set_title(f"Figure {f3_num}: Instantaneous Blade Tangential Load / Torque vs. Azimuth", fontweight="bold", pad=12)
-    ax3.legend(loc="upper right", frameon=True, framealpha=0.92)
-    ax3.grid(True, linestyle="--", alpha=0.55)
-    fig3.tight_layout()
-    f3_filename = f"{f3_num:02d}_blade_tangential_load.png"
-    f3_path = os.path.join(output_dir, f3_filename)
-    fig3.savefig(f3_path, dpi=dpi)
-    plt.close(fig3)
-    figures[f3_filename] = f3_path
-    figures["03_blade_tangential_load.png"] = f3_path
+            ax3.set_xlim(0, 360)
+            ax3.set_xticks(range(0, 361, 60))
+            ax3.set_xlabel(r"Blade Azimuth Angle $\theta$ [deg]", fontweight="bold")
+            ax3.set_ylabel("Dimensional Torque (N·m)", fontweight="bold")
+            ax3.set_title(f"Figure {f3_num}: Instantaneous Blade Tangential Load / Torque vs. Azimuth", fontweight="bold", pad=12)
+            ax3.legend(loc="upper right", frameon=True, framealpha=0.92)
+            ax3.grid(True, linestyle="--", alpha=0.55)
+            fig3.tight_layout()
+            fig3.savefig(f3_path, dpi=dpi)
+        finally:
+            plt.close(fig3)
+        figures[f3_filename] = f3_path
+        figures["03_blade_tangential_load.png"] = f3_path
 
-    if has_t1:
-        f3_caption = (
-            f"Figure {f3_num}: Instantaneous tangential aerodynamic driving torque (N·m per m depth) on Blade 1 versus "
-            f"blade azimuth angle θ. Peak driving torque of {t1_vals[t_max_idx]:.3f} N·m occurs at θ = {th_b[t_max_idx]:.1f}°, "
-            f"with minimum torque of {t1_vals[t_min_idx]:.3f} N·m at θ = {th_b[t_min_idx]:.1f}° indicating dynamic stall recovery."
-        )
-    else:
-        f3_caption = (
-            f"Figure {f3_num}: Instantaneous tangential aerodynamic driving torque on Blade 1 versus blade azimuth angle θ "
-            f"(individual blade torque data unavailable in this workbook)."
-        )
-    figures_meta.append({
-        "id": f"Fig {f3_num:02d}",
-        "num": f3_num,
-        "file": f3_filename,
-        "title": "Instantaneous Blade Tangential Load",
-        "banner_title": f"Figure {f3_num}: Instantaneous Blade Tangential Load / Torque vs. Azimuth",
-        "caption": f3_caption
-    })
+        if has_t1:
+            f3_caption = (
+                f"Figure {f3_num}: Instantaneous tangential aerodynamic driving torque (N·m per m depth) on Blade 1 versus "
+                f"blade azimuth angle θ. Peak driving torque of {t1_vals[t_max_idx]:.3f} N·m occurs at θ = {th_b[t_max_idx]:.1f}°, "
+                f"with minimum torque of {t1_vals[t_min_idx]:.3f} N·m at θ = {th_b[t_min_idx]:.1f}° indicating dynamic stall recovery."
+            )
+        else:
+            f3_caption = (
+                f"Figure {f3_num}: Instantaneous tangential aerodynamic driving torque on Blade 1 versus blade azimuth angle θ "
+                f"(individual blade torque data unavailable in this workbook)."
+            )
+        figures_meta.append({
+            "id": f"Fig {f3_num:02d}",
+            "num": f3_num,
+            "file": f3_filename,
+            "title": "Instantaneous Blade Tangential Load",
+            "banner_title": f"Figure {f3_num}: Instantaneous Blade Tangential Load / Torque vs. Azimuth",
+            "caption": f3_caption
+        })
 
-    # -------------------------------------------------------------------------
-    # 4. Geometric Kinematics vs. Azimuth (Dual-Axis Line Graph with Mandatory Warning)
-    # -------------------------------------------------------------------------
-    df_alpha = data["Alpha_Re"].sort_values("theta").reset_index(drop=True)
-    th_k = df_alpha["theta"].values
-    aoa = df_alpha["alpha_geom"].values
-    w_u = df_alpha["w_over_u"].values
+        # -------------------------------------------------------------------------
+        # 4. Geometric Kinematics vs. Azimuth (Dual-Axis Line Graph with Mandatory Warning)
+        # -------------------------------------------------------------------------
+        df_alpha = data["Alpha_Re"].sort_values("theta").reset_index(drop=True)
+        th_k = df_alpha["theta"].values
+        aoa = df_alpha["alpha_geom"].values
+        w_u = df_alpha["w_over_u"].values
 
-    f4_num = start_fig_num + 3
-    fig4, ax4_1 = plt.subplots(figsize=(7.5, 4.8), dpi=dpi)
-    ax4_2 = ax4_1.twinx()
+        f4_num = start_fig_num + 3
+        f4_filename = f"{f4_num:02d}_geometric_kinematics.png"
+        f4_path = os.path.join(output_dir, f4_filename)
+        fig4, ax4_1 = plt.subplots(figsize=(7.5, 4.8), dpi=dpi)
+        try:
+            ax4_2 = ax4_1.twinx()
 
-    line1 = ax4_1.plot(th_k, aoa, color="#1F4E79", linewidth=2.2, label=r"Geometric Angle of Attack $\alpha_{\mathrm{geom}}$")
-    line2 = ax4_2.plot(th_k, w_u, color="#D97706", linewidth=2.0, linestyle="--", label=r"Normalized Relative Velocity $W / U_\infty$")
+            line1 = ax4_1.plot(th_k, aoa, color="#1F4E79", linewidth=2.2, label=r"Geometric Angle of Attack $\alpha_{\mathrm{geom}}$")
+            line2 = ax4_2.plot(th_k, w_u, color="#D97706", linewidth=2.0, linestyle="--", label=r"Normalized Relative Velocity $W / U_\infty$")
 
-    ax4_1.set_xlim(0, 360)
-    ax4_1.set_xticks(range(0, 361, 60))
-    ax4_1.set_xlabel(r"Blade Azimuth Angle $\theta$ [deg]", fontweight="bold")
-    ax4_1.set_ylabel(r"Geometric Angle of Attack $\alpha_{\mathrm{geom}}$ [deg]", color="#1F4E79", fontweight="bold")
-    ax4_2.set_ylabel(r"Normalized Relative Velocity $W / U_\infty$ [-]", color="#D97706", fontweight="bold")
-    ax4_1.tick_params(axis="y", labelcolor="#1F4E79")
-    ax4_2.tick_params(axis="y", labelcolor="#D97706")
+            ax4_1.set_xlim(0, 360)
+            ax4_1.set_xticks(range(0, 361, 60))
+            ax4_1.set_xlabel(r"Blade Azimuth Angle $\theta$ [deg]", fontweight="bold")
+            ax4_1.set_ylabel(r"Geometric Angle of Attack $\alpha_{\mathrm{geom}}$ [deg]", color="#1F4E79", fontweight="bold")
+            ax4_2.set_ylabel(r"Normalized Relative Velocity $W / U_\infty$ [-]", color="#D97706", fontweight="bold")
+            ax4_1.tick_params(axis="y", labelcolor="#1F4E79")
+            ax4_2.tick_params(axis="y", labelcolor="#D97706")
 
-    alert_text = "Notice: Geometric kinematics reflect theoretical inflow and ignore rotor flow deceleration/induction."
-    ax4_1.text(
-        0.5, 0.04, alert_text,
-        transform=ax4_1.transAxes, ha="center", va="bottom",
-        fontsize=8.5, fontweight="bold", color="#78350F",
-        bbox=dict(boxstyle="round,pad=0.4", facecolor="#FEF3C7", edgecolor="#F59E0B", alpha=0.92)
-    )
+            alert_text = "Notice: Geometric kinematics reflect theoretical inflow and ignore rotor flow deceleration/induction."
+            ax4_1.text(
+                0.5, 0.04, alert_text,
+                transform=ax4_1.transAxes, ha="center", va="bottom",
+                fontsize=8.5, fontweight="bold", color="#78350F",
+                bbox=dict(boxstyle="round,pad=0.4", facecolor="#FEF3C7", edgecolor="#F59E0B", alpha=0.92)
+            )
 
-    lines = line1 + line2
-    labels = [str(l.get_label()) for l in lines]
-    ax4_1.legend(lines, labels, loc="upper right", frameon=True, framealpha=0.92)
-    ax4_1.set_title(f"Figure {f4_num}: Geometric Kinematics vs. Azimuth (Analytical Inflow)", fontweight="bold", pad=12)
-    ax4_1.grid(True, linestyle="--", alpha=0.55)
-    fig4.tight_layout()
-    f4_filename = f"{f4_num:02d}_geometric_kinematics.png"
-    f4_path = os.path.join(output_dir, f4_filename)
-    fig4.savefig(f4_path, dpi=dpi)
-    plt.close(fig4)
-    figures[f4_filename] = f4_path
-    figures["04_geometric_kinematics.png"] = f4_path
+            lines = line1 + line2
+            labels = [str(l.get_label()) for l in lines]
+            ax4_1.legend(lines, labels, loc="upper right", frameon=True, framealpha=0.92)
+            ax4_1.set_title(f"Figure {f4_num}: Geometric Kinematics vs. Azimuth (Analytical Inflow)", fontweight="bold", pad=12)
+            ax4_1.grid(True, linestyle="--", alpha=0.55)
+            fig4.tight_layout()
+            fig4.savefig(f4_path, dpi=dpi)
+        finally:
+            plt.close(fig4)
+        figures[f4_filename] = f4_path
+        figures["04_geometric_kinematics.png"] = f4_path
 
-    aoa_min = float(np.min(aoa)) if len(aoa) > 0 else 0.0
-    aoa_max = float(np.max(aoa)) if len(aoa) > 0 else 0.0
-    wu_min = float(np.min(w_u)) if len(w_u) > 0 else 0.0
-    wu_max = float(np.max(w_u)) if len(w_u) > 0 else 0.0
-    figures_meta.append({
-        "id": f"Fig {f4_num:02d}",
-        "num": f4_num,
-        "file": f4_filename,
-        "title": "Geometric Kinematics vs. Azimuth",
-        "banner_title": f"Figure {f4_num}: Geometric Kinematics vs. Azimuth (Inflow Deceleration Notice)",
-        "caption": (
-            f"Figure {f4_num}: Theoretical blade inflow conditions versus blade azimuth angle θ: geometric angle of attack "
-            f"α_geom (extrema [{aoa_min:.1f}°, {aoa_max:.1f}°]) and normalized relative velocity W/U_inf (range [{wu_min:.2f}, {wu_max:.2f}]). "
-            f"Notice: Kinematic analytical values do not account for rotor induction flow deceleration."
-        )
-    })
+        aoa_min = float(np.min(aoa)) if len(aoa) > 0 else 0.0
+        aoa_max = float(np.max(aoa)) if len(aoa) > 0 else 0.0
+        wu_min = float(np.min(w_u)) if len(w_u) > 0 else 0.0
+        wu_max = float(np.max(w_u)) if len(w_u) > 0 else 0.0
+        figures_meta.append({
+            "id": f"Fig {f4_num:02d}",
+            "num": f4_num,
+            "file": f4_filename,
+            "title": "Geometric Kinematics vs. Azimuth",
+            "banner_title": f"Figure {f4_num}: Geometric Kinematics vs. Azimuth (Inflow Deceleration Notice)",
+            "caption": (
+                f"Figure {f4_num}: Theoretical blade inflow conditions versus blade azimuth angle θ: geometric angle of attack "
+                f"α_geom (extrema [{aoa_min:.1f}°, {aoa_max:.1f}°]) and normalized relative velocity W/U_inf (range [{wu_min:.2f}, {wu_max:.2f}]). "
+                f"Notice: Kinematic analytical values do not account for rotor induction flow deceleration."
+            )
+        })
 
-    # -------------------------------------------------------------------------
-    # 5. Global Rotor Performance Coefficients (Line Graph)
-    # -------------------------------------------------------------------------
-    f5_num = start_fig_num + 4
-    fig5, ax5 = plt.subplots(figsize=(7.5, 4.8), dpi=dpi)
-    ax5.plot(th_az, df_az["cp"].values, color="#1E3A8A", linewidth=2.3, linestyle="-", label=r"Power Coefficient $C_p(\theta)$")
-    ax5.plot(th_az, df_az["cm"].values, color="#059669", linewidth=2.0, linestyle="-.", label=r"Moment Coefficient $C_m(\theta)$")
+        # -------------------------------------------------------------------------
+        # 5. Global Rotor Performance Coefficients (Line Graph)
+        # -------------------------------------------------------------------------
+        f5_num = start_fig_num + 4
+        f5_filename = f"{f5_num:02d}_global_rotor_coefficients.png"
+        f5_path = os.path.join(output_dir, f5_filename)
+        fig5, ax5 = plt.subplots(figsize=(7.5, 4.8), dpi=dpi)
+        try:
+            ax5.plot(th_az, df_az["cp"].values, color="#1E3A8A", linewidth=2.3, linestyle="-", label=r"Power Coefficient $C_p(\theta)$")
+            ax5.plot(th_az, df_az["cm"].values, color="#059669", linewidth=2.0, linestyle="-.", label=r"Moment Coefficient $C_m(\theta)$")
 
-    if df_az["ct"] is not None and not df_az["ct"].isna().all():
-        ax5.plot(th_az, df_az["ct"].values, color="#DC2626", linewidth=1.8, linestyle="--", label=r"Thrust Coefficient $C_t(\theta)$")
-    if df_az["cy"] is not None and not df_az["cy"].isna().all():
-        ax5.plot(th_az, df_az["cy"].values, color="#7C3AED", linewidth=1.8, linestyle=":", label=r"Lateral Force Coefficient $C_y(\theta)$")
+            if df_az["ct"] is not None and not df_az["ct"].isna().all():
+                ax5.plot(th_az, df_az["ct"].values, color="#DC2626", linewidth=1.8, linestyle="--", label=r"Thrust Coefficient $C_t(\theta)$")
+            if df_az["cy"] is not None and not df_az["cy"].isna().all():
+                ax5.plot(th_az, df_az["cy"].values, color="#7C3AED", linewidth=1.8, linestyle=":", label=r"Lateral Force Coefficient $C_y(\theta)$")
 
-    ax5.axhline(0, color="#1A2530", linestyle="-", linewidth=0.9, alpha=0.7)
-    ax5.set_xlim(0, 360)
-    ax5.set_xticks(range(0, 361, 60))
-    ax5.set_xlabel(r"Rotor Azimuth Angle $\theta$ [deg]", fontweight="bold")
-    ax5.set_ylabel(r"Dimensionless Aerodynamic Coefficient [-]", fontweight="bold")
-    ax5.set_title(f"Figure {f5_num}: Global Rotor Performance Coefficients (Cp, Cm, Ct, Cy)", fontweight="bold", pad=12)
-    ax5.legend(loc="upper right", frameon=True, framealpha=0.92)
-    ax5.grid(True, linestyle="--", alpha=0.55)
-    fig5.tight_layout()
-    f5_filename = f"{f5_num:02d}_global_rotor_coefficients.png"
-    f5_path = os.path.join(output_dir, f5_filename)
-    fig5.savefig(f5_path, dpi=dpi)
-    plt.close(fig5)
-    figures[f5_filename] = f5_path
-    figures["05_global_rotor_coefficients.png"] = f5_path
+            ax5.axhline(0, color="#1A2530", linestyle="-", linewidth=0.9, alpha=0.7)
+            ax5.set_xlim(0, 360)
+            ax5.set_xticks(range(0, 361, 60))
+            ax5.set_xlabel(r"Rotor Azimuth Angle $\theta$ [deg]", fontweight="bold")
+            ax5.set_ylabel(r"Dimensionless Aerodynamic Coefficient [-]", fontweight="bold")
+            ax5.set_title(f"Figure {f5_num}: Global Rotor Performance Coefficients (Cp, Cm, Ct, Cy)", fontweight="bold", pad=12)
+            ax5.legend(loc="upper right", frameon=True, framealpha=0.92)
+            ax5.grid(True, linestyle="--", alpha=0.55)
+            fig5.tight_layout()
+            fig5.savefig(f5_path, dpi=dpi)
+        finally:
+            plt.close(fig5)
+        figures[f5_filename] = f5_path
+        figures["05_global_rotor_coefficients.png"] = f5_path
 
-    ct_mean_val = np.mean(df_az["ct"].dropna().values) if df_az["ct"] is not None and not df_az["ct"].isna().all() else None
-    cy_mean_val = np.mean(df_az["cy"].dropna().values) if df_az["cy"] is not None and not df_az["cy"].isna().all() else None
-    ct_str = f"{ct_mean_val:.4f}" if ct_mean_val is not None else "n/a"
-    cy_str = f"{cy_mean_val:.4f}" if cy_mean_val is not None else "n/a"
+        ct_mean_val = np.mean(df_az["ct"].dropna().values) if df_az["ct"] is not None and not df_az["ct"].isna().all() else None
+        cy_mean_val = np.mean(df_az["cy"].dropna().values) if df_az["cy"] is not None and not df_az["cy"].isna().all() else None
+        ct_str = f"{ct_mean_val:.4f}" if ct_mean_val is not None else "n/a"
+        cy_str = f"{cy_mean_val:.4f}" if cy_mean_val is not None else "n/a"
 
-    figures_meta.append({
-        "id": f"Fig {f5_num:02d}",
-        "num": f5_num,
-        "file": f5_filename,
-        "title": "Global Rotor Performance Coefficients",
-        "banner_title": f"Figure {f5_num}: Global Rotor Performance Coefficients (Cp, Cm, Ct, Cy)",
-        "caption": (
-            f"Figure {f5_num}: Simultaneous evolution of macroscopic rotor aerodynamic coefficients across rotor azimuth θ: "
-            f"power coefficient Cp (mean = {np.mean(df_az['cp'].values):.4f}), moment coefficient Cm (mean = {np.mean(df_az['cm'].values):.4f}), "
-            f"thrust coefficient Ct (mean = {ct_str}), and lateral force coefficient Cy (mean = {cy_str})."
-        )
-    })
+        figures_meta.append({
+            "id": f"Fig {f5_num:02d}",
+            "num": f5_num,
+            "file": f5_filename,
+            "title": "Global Rotor Performance Coefficients",
+            "banner_title": f"Figure {f5_num}: Global Rotor Performance Coefficients (Cp, Cm, Ct, Cy)",
+            "caption": (
+                f"Figure {f5_num}: Simultaneous evolution of macroscopic rotor aerodynamic coefficients across rotor azimuth θ: "
+                f"power coefficient Cp (mean = {np.mean(df_az['cp'].values):.4f}), moment coefficient Cm (mean = {np.mean(df_az['cm'].values):.4f}), "
+                f"thrust coefficient Ct (mean = {ct_str}), and lateral force coefficient Cy (mean = {cy_str})."
+            )
+        })
 
-    # -------------------------------------------------------------------------
-    # 6. Cp Convergence History (Line Graph)
-    # -------------------------------------------------------------------------
-    df_rev = data["Revolutions"].dropna(subset=["mean_cp"]).reset_index(drop=True)
-    rev_nums = df_rev["rev"].values
-    cp_revs = df_rev["mean_cp"].values
+        # -------------------------------------------------------------------------
+        # 6. Cp Convergence History (Line Graph)
+        # -------------------------------------------------------------------------
+        df_rev = data["Revolutions"].dropna(subset=["mean_cp"]).reset_index(drop=True)
+        rev_nums = df_rev["rev"].values
+        cp_revs = df_rev["mean_cp"].values
+        tol_pct = float(data.get("stable_tol_pct", 5.0) or 5.0)
 
-    f6_num = start_fig_num + 5
-    fig6, ax6 = plt.subplots(figsize=(7.5, 4.8), dpi=dpi)
-    ax6.plot(rev_nums, cp_revs, marker="o", color="#2563EB", linewidth=2.0, markersize=5.5, label=r"Revolution-Averaged $\overline{C}_p$")
+        f6_num = start_fig_num + 5
+        f6_filename = f"{f6_num:02d}_cp_convergence_history.png"
+        f6_path = os.path.join(output_dir, f6_filename)
+        cp_extrap = None
+        fig6, ax6 = plt.subplots(figsize=(7.5, 4.8), dpi=dpi)
+        try:
+            ax6.plot(rev_nums, cp_revs, marker="o", color="#2563EB", linewidth=2.0, markersize=5.5, label=r"Revolution-Averaged $\overline{C}_p$")
 
-    rep_mask = df_rev["reported"].str.upper().str.contains("REPORTED")
-    if rep_mask.any():
-        ax6.plot(rev_nums[rep_mask], cp_revs[rep_mask], marker="s", color="#D97706", linestyle="none", markersize=7.5, label="Reported Revolutions")
+            rep_mask = df_rev["reported"].str.upper().str.contains("REPORTED")
+            if rep_mask.any():
+                ax6.plot(rev_nums[rep_mask], cp_revs[rep_mask], marker="s", color="#D97706", linestyle="none", markersize=7.5, label="Reported Revolutions")
 
-    cp_extrap = None
-    if len(cp_revs) >= 3:
-        p0, p1, p2 = float(cp_revs[-3]), float(cp_revs[-2]), float(cp_revs[-1])
-        denom = p2 - 2.0 * p1 + p0
-        if abs(denom) > 1e-6 and abs(p1 - p0) > 1e-12:
-            ratio_a = (p2 - p1) / (p1 - p0)
-            cand = p2 - ((p2 - p1) ** 2) / denom
-            if 0.0 < ratio_a < 0.9 and np.isfinite(cand) and abs(cand - p2) <= max(1.0, abs(p2) * 2.0):
-                cp_extrap = cand
-                ax6.axhline(cp_extrap, color="#10B981", linestyle="--", linewidth=1.5, label=f"Aitken Asymptotic limit $C_{{p,\\infty}} = {cp_extrap:.4f}$")
+            if len(cp_revs) >= 3:
+                p0, p1, p2 = float(cp_revs[-3]), float(cp_revs[-2]), float(cp_revs[-1])
+                denom = p2 - 2.0 * p1 + p0
+                if abs(denom) > 1e-6 and abs(p1 - p0) > 1e-12:
+                    ratio_a = (p2 - p1) / (p1 - p0)
+                    cand = p2 - ((p2 - p1) ** 2) / denom
+                    if 0.0 < ratio_a < 0.9 and np.isfinite(cand) and abs(cand - p2) <= max(1.0, abs(p2) * 2.0):
+                        cp_extrap = cand
+                        ax6.axhline(cp_extrap, color="#10B981", linestyle="--", linewidth=1.5, label=f"Aitken Asymptotic limit $C_{{p,\\infty}} = {cp_extrap:.4f}$")
 
-    last_cp = cp_revs[-1] if len(cp_revs) > 0 else 0.0
-    ax6.axhspan(last_cp * 0.99, last_cp * 1.01, color="#10B981", alpha=0.15, label="±1% Convergence Band")
+            last_cp = float(cp_revs[-1]) if len(cp_revs) > 0 else 0.0
+            band_half = abs(last_cp) * (tol_pct / 100.0)
+            ax6.axhspan(last_cp - band_half, last_cp + band_half, color="#10B981", alpha=0.15, label=f"±{tol_pct:g}% Convergence Band")
 
-    ax6.set_xlabel("Revolution Number [-]", fontweight="bold")
-    ax6.set_ylabel(r"Mean Rotor Power Coefficient $\overline{C}_p$ [-]", fontweight="bold")
-    ax6.set_title(f"Figure {f6_num}: Rotor Power Coefficient (Cp) Convergence History", fontweight="bold", pad=12)
-    ax6.legend(loc="best", frameon=True, framealpha=0.92)
-    ax6.grid(True, linestyle="--", alpha=0.55)
-    fig6.tight_layout()
-    f6_filename = f"{f6_num:02d}_cp_convergence_history.png"
-    f6_path = os.path.join(output_dir, f6_filename)
-    fig6.savefig(f6_path, dpi=dpi)
-    plt.close(fig6)
-    figures[f6_filename] = f6_path
-    figures["06_cp_convergence_history.png"] = f6_path
+            ax6.set_xlabel("Revolution Number [-]", fontweight="bold")
+            ax6.set_ylabel(r"Mean Rotor Power Coefficient $\overline{C}_p$ [-]", fontweight="bold")
+            ax6.set_title(f"Figure {f6_num}: Rotor Power Coefficient (Cp) Convergence History", fontweight="bold", pad=12)
+            ax6.legend(loc="best", frameon=True, framealpha=0.92)
+            ax6.grid(True, linestyle="--", alpha=0.55)
+            fig6.tight_layout()
+            fig6.savefig(f6_path, dpi=dpi)
+        finally:
+            plt.close(fig6)
+        figures[f6_filename] = f6_path
+        figures["06_cp_convergence_history.png"] = f6_path
 
-    n_revs = len(cp_revs)
-    tol_pct = float(data.get("stable_tol_pct", 5.0) or 5.0)
+        n_revs = len(cp_revs)
     last_dcp = float(abs(cp_revs[-1] - cp_revs[-2]) / abs(cp_revs[-2])) if n_revs >= 2 and abs(cp_revs[-2]) > 1e-6 else 0.0
     is_stable = (last_dcp < (tol_pct / 100.0)) if n_revs >= 2 else False
     aitken_str = f"{cp_extrap:.4f}" if cp_extrap is not None else "n/a"

@@ -167,7 +167,8 @@ def calculate_gci(
     runs: List[Dict[str, Any]],
     key_metric: str = "cp_reported_mean",
     study_type: str = "mesh",  # "mesh" or "timestep"
-    labels: Optional[List[str]] = None
+    labels: Optional[List[str]] = None,
+    dimension: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Calculate Grid Convergence Index (GCI) from 3 simulation runs.
 
@@ -246,7 +247,14 @@ def calculate_gci(
             cells = r.get("case_metadata", {}).get("mesh_cells")
             if not cells or cells <= 0:
                 raise ValueError(f"Run '{labels[i]}' is missing a valid positive mesh_cells metadata field for GCI study.")
-            h = 1.0 / math.sqrt(float(cells))
+            dim = int(dimension) if dimension in (2, 3) else int(
+                r.get("mesh_info", {}).get("mesh", {}).get("dimension")
+                or r.get("case_metadata", {}).get("dimension")
+                or 2
+            )
+            if dim not in (2, 3):
+                dim = 2
+            h = 1.0 / (float(cells) ** (1.0 / float(dim)))
         else:
             dt = r.get("case_metadata", {}).get("time_step_s") or r.get("parameters", {}).get("dt")
             if not dt or dt <= 0:
@@ -273,13 +281,13 @@ def calculate_gci(
     eps21 = phi2 - phi1
     eps32 = phi3 - phi2
 
-    if abs(eps21) < 1e-12 or abs(eps32) < 1e-12:
+    if abs(eps21) < 1e-12:
         return {
             "status": "CONVERGED_EXACT",
             "study_type": study_type,
             "key_metric": key_metric,
             "fine_label": lbl1, "medium_label": lbl2, "coarse_label": lbl3,
-            "message": "Solution difference between grids is negligible; numerical discretization error is already below machine precision.",
+            "message": "Solution difference between fine and medium grids is negligible; numerical discretization error is already below machine precision.",
             "phi1": phi1, "phi2": phi2, "phi3": phi3,
             "h1": h1, "h2": h2, "h3": h3,
             "r21": r21, "r32": r32,
@@ -287,6 +295,22 @@ def calculate_gci(
             "gci_fine_pct": 0.0,
             "observed_order_p": 2.0,
             "phi_ext": phi1
+        }
+    if abs(eps32) < 1e-12:
+        return {
+            "status": "DIVERGENT",
+            "study_type": study_type,
+            "key_metric": key_metric,
+            "fine_label": lbl1, "medium_label": lbl2, "coarse_label": lbl3,
+            "message": "Medium and coarse grid solutions are identical while the fine grid diverges (eps32 == 0, eps21 != 0); GCI cannot be computed.",
+            "phi1": phi1, "phi2": phi2, "phi3": phi3,
+            "h1": h1, "h2": h2, "h3": h3,
+            "r21": r21, "r32": r32,
+            "r_warning": r_warning,
+            "gci_fine_pct": None,
+            "observed_order_p": None,
+            "phi_ext": None,
+            "convergence_mode": "Divergence",
         }
 
     R_ratio = eps21 / eps32
@@ -378,6 +402,7 @@ def calculate_gci(
         "h1": h1, "h2": h2, "h3": h3,
         "phi1": phi1, "phi2": phi2, "phi3": phi3,
         "r21": r21, "r32": r32,
+        "r_warning": r_warning,
         "observed_order_p": p,
         "phi_ext": phi_ext,
         "ea21_pct": ea21_pct,
@@ -403,59 +428,63 @@ def plot_comparison_figures(
 
     # Figure 1: Cp per revolution comparison
     fig, ax = plt.subplots(figsize=(8, 4.5), dpi=300)
-    for i, r in enumerate(runs):
-        revs = r.get("revolutions", [])
-        if revs:
-            k_vals = [rev["k"] for rev in revs]
-            cp_vals = [rev["cp"] for rev in revs]
-            ax.plot(k_vals, cp_vals, marker="o", label=labels[i], linewidth=1.8, markersize=5)
-    ax.set_xlabel("Rotor Revolution Number $k$", fontsize=11, fontweight="bold")
-    ax.set_ylabel("Revolution-Averaged Power Coefficient $C_p$", fontsize=11, fontweight="bold")
-    ax.set_title("Convergence Trajectory Comparison Across Runs", fontsize=12, fontweight="bold", pad=12)
-    ax.grid(True, linestyle="--", alpha=0.6)
-    ax.legend(frameon=True, fontsize=10)
-    plt.tight_layout()
-    f1 = os.path.join(outdir, f"{prefix}_cp_revolutions.png")
-    fig.savefig(f1)
-    plt.close(fig)
+    try:
+        for i, r in enumerate(runs):
+            revs = r.get("revolutions", [])
+            if revs:
+                k_vals = [rev["k"] for rev in revs]
+                cp_vals = [rev["cp"] for rev in revs]
+                ax.plot(k_vals, cp_vals, marker="o", label=labels[i], linewidth=1.8, markersize=5)
+        ax.set_xlabel("Rotor Revolution Number $k$", fontsize=11, fontweight="bold")
+        ax.set_ylabel("Revolution-Averaged Power Coefficient $C_p$", fontsize=11, fontweight="bold")
+        ax.set_title("Convergence Trajectory Comparison Across Runs", fontsize=12, fontweight="bold", pad=12)
+        ax.grid(True, linestyle="--", alpha=0.6)
+        ax.legend(frameon=True, fontsize=10)
+        fig.tight_layout()
+        f1 = os.path.join(outdir, f"{prefix}_cp_revolutions.png")
+        fig.savefig(f1)
+    finally:
+        plt.close(fig)
     figs["cp_revolutions"] = f1
 
     # Figure 2: Cm vs Azimuth Overlay & Difference Plot
     if comp["has_azimuth"]:
         fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(8.5, 6.5), dpi=300, sharex=True, gridspec_kw={"height_ratios": [2, 1]})
-        th_ref = runs[0]["azimuth_curves"]["theta"]
-        cm_ref = runs[0]["azimuth_curves"]["cm_mean"]
+        try:
+            th_ref = runs[0]["azimuth_curves"]["theta"]
+            cm_ref = runs[0]["azimuth_curves"]["cm_mean"]
 
-        for i, r in enumerate(runs):
-            th = r["azimuth_curves"]["theta"]
-            cm = r["azimuth_curves"]["cm_mean"]
-            ax1.plot(th, cm, label=labels[i], linewidth=1.8)
+            for i, r in enumerate(runs):
+                th = r["azimuth_curves"]["theta"]
+                cm = r["azimuth_curves"]["cm_mean"]
+                ax1.plot(th, cm, label=labels[i], linewidth=1.8)
 
-        ax1.set_ylabel("Moment Coefficient $C_m$", fontsize=11, fontweight="bold")
-        ax1.set_title("Phase-Averaged $C_m(\\theta)$ Profile Comparison", fontsize=12, fontweight="bold")
-        ax1.grid(True, linestyle="--", alpha=0.6)
-        ax1.legend(frameon=True, fontsize=9)
+            ax1.set_ylabel("Moment Coefficient $C_m$", fontsize=11, fontweight="bold")
+            ax1.set_title("Phase-Averaged $C_m(\\theta)$ Profile Comparison", fontsize=12, fontweight="bold")
+            ax1.grid(True, linestyle="--", alpha=0.6)
+            ax1.legend(frameon=True, fontsize=9)
 
-        # Difference subplot vs run 1
-        for i in range(1, len(runs)):
-            th = np.array(runs[i]["azimuth_curves"]["theta"])
-            cm = np.array(runs[i]["azimuth_curves"]["cm_mean"])
-            if not np.array_equal(th_ref, th):
-                cm = np.interp(th_ref, th, cm, period=360.0)
-            diff = cm - np.array(cm_ref)
-            ax2.plot(th_ref, diff, label=f"{labels[i]} - {labels[0]}", linewidth=1.5)
+            # Difference subplot vs run 1
+            for i in range(1, len(runs)):
+                th = np.array(runs[i]["azimuth_curves"]["theta"])
+                cm = np.array(runs[i]["azimuth_curves"]["cm_mean"])
+                if not np.array_equal(th_ref, th):
+                    cm = np.interp(th_ref, th, cm, period=360.0)
+                diff = cm - np.array(cm_ref)
+                ax2.plot(th_ref, diff, label=f"{labels[i]} - {labels[0]}", linewidth=1.5)
 
-        ax2.axhline(0, color="black", linestyle=":", alpha=0.7)
-        ax2.set_xlabel("Rotor Azimuth $\\theta$ (deg)", fontsize=11, fontweight="bold")
-        ax2.set_ylabel("$\\Delta C_m$ vs Baseline", fontsize=10, fontweight="bold")
-        ax2.set_xlim(0, 360)
-        ax2.grid(True, linestyle="--", alpha=0.6)
-        ax2.legend(frameon=True, fontsize=8)
+            ax2.axhline(0, color="black", linestyle=":", alpha=0.7)
+            ax2.set_xlabel("Rotor Azimuth $\\theta$ (deg)", fontsize=11, fontweight="bold")
+            ax2.set_ylabel("$\\Delta C_m$ vs Baseline", fontsize=10, fontweight="bold")
+            ax2.set_xlim(0, 360)
+            ax2.grid(True, linestyle="--", alpha=0.6)
+            ax2.legend(frameon=True, fontsize=8)
 
-        plt.tight_layout()
-        f2 = os.path.join(outdir, f"{prefix}_cm_azimuth_overlay.png")
-        fig.savefig(f2)
-        plt.close(fig)
+            fig.tight_layout()
+            f2 = os.path.join(outdir, f"{prefix}_cm_azimuth_overlay.png")
+            fig.savefig(f2)
+        finally:
+            plt.close(fig)
         figs["cm_azimuth_overlay"] = f2
 
     return figs
@@ -545,10 +574,13 @@ def export_comparison_excel(
         ws_kpi.cell(row=r_num, column=1, value=kpi["metric"]).font = F_B
         ws_kpi.cell(row=r_num, column=2, value=kpi["unit"]).font = F_N
         for col_idx, val in enumerate(kpi["values"]):
-            c = ws_kpi.cell(row=r_num, column=3 + col_idx, value=val)
+            cell_val = val
+            if isinstance(val, float) and not math.isfinite(val):
+                cell_val = "n/a"
+            c = ws_kpi.cell(row=r_num, column=3 + col_idx, value=cell_val)
             c.font = F_N
-            if isinstance(val, float):
-                c.number_format = "0.0000" if abs(val) < 10 else "0.00"
+            if isinstance(cell_val, float):
+                c.number_format = "0.0000" if abs(cell_val) < 10 else "0.00"
 
     ws_kpi.column_dimensions["A"].width = 36
     ws_kpi.column_dimensions["B"].width = 12

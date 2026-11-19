@@ -113,21 +113,27 @@ def write_excel(
         return f"=AVERAGE({refs})"
 
     tol_pct = float(getattr(p, "stable_tol", 5.0) or 5.0)
-    tol_rel = tol_pct / 100.0
-    if len(revs) >= 2 and abs(revs[-2]["cp"]) > 1e-6:
+    is_contiguous_revs = len(revs) >= 2 and (revs[-1]["k"] - revs[-2]["k"] == 1)
+    if is_contiguous_revs and abs(revs[-2]["cp"]) > 1e-6:
         last_dcp_rel = float(abs(revs[-1]["cp"] - revs[-2]["cp"]) / abs(revs[-2]["cp"]))
     else:
         last_dcp_rel = abs(float(res.get("cp_last_change") or 0.0))
+
+    is_stable_flag = bool(res.get("is_stable", False))
+    cp_blades_disp = res["cp_blades_only"] if res.get("cp_blades_only") is not None else "n/a"
+    cp_total_disp = res["cp_total_file"] if res.get("cp_total_file") is not None else "n/a"
+    aitken_disp = res["cp_extrapolated_aitken"] if res.get("cp_extrapolated_aitken") is not None else "n/a"
+    extra_revs_disp = res["extra_revs_to_converge"] if res.get("extra_revs_to_converge") is not None else "n/a"
 
     is_custom_revs = bool(getattr(p, "custom_revs", None) and str(p.custom_revs).strip())
 
     if is_custom_revs:
         rows = [
             ("Mean Cp of reported revolutions", _sel_avg_formula("D"), "-", "Live Excel formula averaging selected revolution(s)", "0.0000"),
-            ("Convergence stability flag", "PERIODIC STABLE" if last_dcp_rel < tol_rel else "TRANSIENT/UNSTABLE", "-", f"Relative ΔCp = {last_dcp_rel * 100:.2f}% (< {tol_pct:g}% threshold)", None),
+            ("Convergence stability flag", "PERIODIC STABLE" if is_stable_flag else "TRANSIENT/UNSTABLE", "-", f"Relative ΔCp = {last_dcp_rel * 100:.2f}% (< {tol_pct:g}% threshold)", None),
             ("Period-2 sub-harmonic oscillation", "DETECTED (Sub-harmonic instability)" if res.get("has_period_2") else "None (Period-1 synchronized)", "-", f"Spectral amplitude at 0.5x rotor freq: {res.get('period_2_ratio', 0.0) * 100:.1f}%", None),
-            ("Cp (blades only)", res.get("cp_blades_only", "n/a"), "-", "Isolated aerodynamic blade torque power coefficient", "0.0000" if isinstance(res.get("cp_blades_only"), (int, float)) else None),
-            ("Cp (total file)", res.get("cp_total_file", "n/a"), "-", "Total rotor moment file power coefficient", "0.0000" if isinstance(res.get("cp_total_file"), (int, float)) else None),
+            ("Cp (blades only)", cp_blades_disp, "-", "Isolated aerodynamic blade torque power coefficient", "0.0000" if isinstance(cp_blades_disp, (int, float)) else None),
+            ("Cp (total file)", cp_total_disp, "-", "Total rotor moment file power coefficient", "0.0000" if isinstance(cp_total_disp, (int, float)) else None),
             ("Reported revolutions", ", ".join(str(r["k"]) for r in sel), "", "Custom selected revolution(s)", None),
             ("Convergence status", "STABLE" if res["is_stable"] else "NOT YET STABLE", "", f"Criteria: selected {len(sel)} revolution(s) satisfy stability", None),
             ("Last revolution Cp change (ΔCp)", res["cp_last_change"], "", "Relative change versus preceding revolution", "0.00%"),
@@ -151,12 +157,12 @@ def write_excel(
             ("Mean Cp of reported revolutions", _sel_avg_formula("D"), "-", "Live Excel formula averaging reported revolutions", "0.0000"),
             ("Mean Cp of trailing stable revolutions", res.get("cp_trailing_stable_mean", res["cp_mean"]), "-", f"Average over consecutive stable revs ({', '.join(str(k) for k in res.get('stable_revs', []))})", "0.0000"),
             ("Mean Cp of all complete revolutions", f"=AVERAGE(Revolutions!D5:D{len(revs)+4})", "-", f"Whole-analysis average across all {res['n_full']} complete revolutions", "0.0000"),
-            ("Estimated converged Cp (Aitken extrapolation)", res.get("cp_extrapolated_aitken", "n/a"), "-", "Asymptotic limit from geometric progression of rev differences", "0.0000" if isinstance(res.get("cp_extrapolated_aitken"), (int, float)) else None),
-            ("Extra revolutions needed to converge", res.get("extra_revs_to_converge", "0"), "revs", "Estimated revolutions to reach stability tolerance", "0" if isinstance(res.get("extra_revs_to_converge"), (int, float)) else None),
-            ("Convergence stability flag", "PERIODIC STABLE" if last_dcp_rel < tol_rel else "TRANSIENT/UNSTABLE", "-", f"Last 2 revs relative ΔCp = {last_dcp_rel * 100:.2f}% (< {tol_pct:g}% threshold)", None),
+            ("Estimated converged Cp (Aitken extrapolation)", aitken_disp, "-", "Asymptotic limit from geometric progression of rev differences", "0.0000" if isinstance(aitken_disp, (int, float)) else None),
+            ("Extra revolutions needed to converge", extra_revs_disp, "revs", "Estimated revolutions to reach stability tolerance", "0" if isinstance(extra_revs_disp, (int, float)) else None),
+            ("Convergence stability flag", "PERIODIC STABLE" if is_stable_flag else "TRANSIENT/UNSTABLE", "-", f"Last 2 revs relative ΔCp = {last_dcp_rel * 100:.2f}% (< {tol_pct:g}% threshold)", None),
             ("Period-2 sub-harmonic oscillation", "DETECTED (Sub-harmonic instability)" if res.get("has_period_2") else "None (Period-1 synchronized)", "-", f"Spectral amplitude at 0.5x rotor freq: {res.get('period_2_ratio', 0.0) * 100:.1f}%", None),
-            ("Cp (blades only)", res.get("cp_blades_only", "n/a"), "-", "Isolated aerodynamic blade torque power coefficient", "0.0000" if isinstance(res.get("cp_blades_only"), (int, float)) else None),
-            ("Cp (total file)", res.get("cp_total_file", "n/a"), "-", "Total rotor moment file power coefficient", "0.0000" if isinstance(res.get("cp_total_file"), (int, float)) else None),
+            ("Cp (blades only)", cp_blades_disp, "-", "Isolated aerodynamic blade torque power coefficient", "0.0000" if isinstance(cp_blades_disp, (int, float)) else None),
+            ("Cp (total file)", cp_total_disp, "-", "Total rotor moment file power coefficient", "0.0000" if isinstance(cp_total_disp, (int, float)) else None),
             ("Reported revolutions", ", ".join(str(r["k"]) for r in sel), "", "Counted back from simulation end", None),
             ("Convergence status", "STABLE" if res["is_stable"] else "NOT YET STABLE", "", f"Criteria: last {len(sel)} revolutions satisfy multi-criteria stability", None),
             ("Trailing stable revolutions", res["stable_n"], "", "Count of consecutive stable trailing revs", "0"),
@@ -238,9 +244,10 @@ def write_excel(
     s_wind = float(_np.nansum(cp_q[(th_q >= 315.0) | (th_q < 45.0)]))
     tot_q = s_up + s_lee + s_down + s_wind
     if abs(tot_q) > 1e-9:
-        q_up, q_lee, q_down, q_wind = s_up / tot_q, s_lee / tot_q, s_down / tot_q, s_wind / tot_q
+        denom_q = abs(tot_q)
+        q_up, q_lee, q_down, q_wind = s_up / denom_q, s_lee / denom_q, s_down / denom_q, s_wind / denom_q
     else:
-        q_up = q_lee = q_down = q_wind = 0.25
+        q_up = q_lee = q_down = q_wind = 0.0
     rows += [
         ("Power share: Upwind sector [45°–135°]", q_up, "%", "Rotor front quadrant power extraction", "0.0%"),
         ("Power share: Leeward sector [135°–225°]", q_lee, "%", "Leeward dynamic wake transition quadrant", "0.0%"),

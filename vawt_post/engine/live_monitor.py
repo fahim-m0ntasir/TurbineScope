@@ -669,69 +669,77 @@ class LiveMonitorEngine:
         """Lightweight tick: read new bytes and check file statuses without heavy computations."""
         self._check_late_files()
         new_data_found = False
+        restarted_files: List[Tuple[str, str]] = []
         for role, reader in self.readers.items():
             count, _, _, _ = reader.read_new_chunk()
             if count > 0:
                 new_data_found = True
             if getattr(reader, "restart_detected", False):
                 reader.restart_detected = False
-                self.run_segment += 1
-                # Start new run segment cleanly; never silently merge disjoint runs
-                self.steps = np.array([], dtype=np.int64)
-                self.times = np.array([], dtype=float)
-                self.Mrot = np.array([], dtype=float)
-                self.Mb = [np.array([], dtype=float) for _ in range(self.p.n_blades or 3)]
-                self.Fx = None
-                self.Fy = None
-                self.Cp = np.array([], dtype=float)
-                self.Cm = np.array([], dtype=float)
-                self.Ct = None
-                self.Cy = None
-                self.rev_history.clear()
-                self.completed_revs_count = 0
-                self.last_rev_end_time = 0.0
-                self.last_step_processed = -1
-                self.last_step_count = 0
-                self.stable_reached_notified = False
-                self.heat_map = None
-                self.spectrum = {}
-                self.blade_torques = {}
-                self.forces_az = {}
-                self.last_stage_count = 1
-                self.start_azimuth_info = None
-                self.blade_phasing_info = None
-                self._az_checked_rev = -1
-                self._stall_alert_active = False
-                self._last_aitken_alert_rev = -1
-                for k_clear in (
-                    "conv_stable", "rotor_speed_mismatch", "dt_mismatch",
-                    "midspin_detected", "midspin_flowtime", "theta0_verified",
-                    "blade_phasing", "dt_res_initial", "coarse_az_res",
-                    "cp_physical_range", "continuity_stitch",
-                ):
-                    self.logged_alert_keys.discard(k_clear)
-                self._prefix_by_role.clear()
-                self._prefix_cutoff_step.clear()
-                self._role_continuity_info.clear()
-                self._prefix_refined_for_gap = False
-                self.continuity_summary = None
-                self.recovered_mask = np.array([], dtype=bool)
-                self._live_tip_step = None
-                self._live_tip_time = None
-                self._live_base_time = None
-                self._force_reprocess = True
-                self.add_alert(
-                    "WARNING",
-                    f"Simulation restart or truncation detected in '{os.path.basename(reader.path)}': "
-                    f"started new run segment #{self.run_segment}. Previous run preserved without silent merging.",
-                    key=f"restart_{role}_{time.time()}"
-                )
+                restarted_files.append((role, os.path.basename(reader.path)))
             if reader.has_missing_col_error:
                 self.add_alert(
                     "ERROR",
                     f"File '{os.path.basename(reader.path)}' ({role}) lacks a value column! Only 'Time Step' and 'flow-time' exist.",
                     key=f"missing_col_{role}"
                 )
+
+        if restarted_files:
+            self.run_segment += 1
+            # Start new run segment cleanly; never silently merge disjoint runs
+            self.steps = np.array([], dtype=np.int64)
+            self.times = np.array([], dtype=float)
+            self.Mrot = np.array([], dtype=float)
+            self.Mb = [np.array([], dtype=float) for _ in range(self.p.n_blades or 3)]
+            self.Fx = None
+            self.Fy = None
+            self.Cp = np.array([], dtype=float)
+            self.Cm = np.array([], dtype=float)
+            self.Ct = None
+            self.Cy = None
+            self.rev_history.clear()
+            self.completed_revs_count = 0
+            self.last_rev_end_time = 0.0
+            self.last_step_processed = -1
+            self.last_step_count = 0
+            self.stable_reached_notified = False
+            self.heat_map = None
+            self.spectrum = {}
+            self.blade_torques = {}
+            self.forces_az = {}
+            self.last_stage_count = 1
+            self.start_azimuth_info = None
+            self.blade_phasing_info = None
+            self._az_checked_rev = -1
+            self._stall_alert_active = False
+            self._last_aitken_alert_rev = -1
+            for k_clear in (
+                "conv_stable", "rotor_speed_mismatch", "dt_mismatch",
+                "midspin_detected", "midspin_flowtime", "theta0_verified",
+                "blade_phasing", "dt_res_initial", "coarse_az_res",
+                "cp_physical_range", "continuity_stitch",
+            ):
+                self.logged_alert_keys.discard(k_clear)
+            self._prefix_by_role.clear()
+            self._prefix_cutoff_step.clear()
+            self._role_continuity_info.clear()
+            self._prefix_refined_for_gap = False
+            self.continuity_summary = None
+            self.recovered_mask = np.array([], dtype=bool)
+            self._live_tip_step = None
+            self._live_tip_time = None
+            self._live_base_time = None
+            self._stages_cache_key = None
+            self._force_reprocess = True
+            names_str = ", ".join(f"'{fn}'" for _, fn in restarted_files[:4])
+            if len(restarted_files) > 4:
+                names_str += f" (+{len(restarted_files) - 4} more)"
+            self.add_alert(
+                "WARNING",
+                f"Simulation restart or truncation detected in {names_str}: "
+                f"started new run segment #{self.run_segment}. Previous run preserved without silent merging.",
+                key=f"restart_seg_{self.run_segment}"
+            )
 
         # Continually compute speed metrics and lightweight live step/time tip during light ticks
         now = time.time()
@@ -741,7 +749,7 @@ class LiveMonitorEngine:
             tip_step = min(int(rd._steps_buf[-1]) for rd in valid_light.values())
             pref_rd = next((rd for rd in valid_light.values() if rd.time_col is not None), next(iter(valid_light.values())))
             s_buf = pref_rd._steps_buf
-            idx_tip = len(s_buf) - 1
+            idx_tip = 0
             for j in range(len(s_buf) - 1, -1, -1):
                 if int(s_buf[j]) <= tip_step:
                     idx_tip = j
@@ -1074,7 +1082,7 @@ class LiveMonitorEngine:
         self.recovered_mask = aligned_rec
 
         # Physics derivation
-        omega_val = self.p.omega_val() if (self.p.omega or (self.p.tsr and self.p.U and self.p.R)) else 1.0
+        omega_val = self._safe_omega()
         A = 2.0 * (self.p.R or 0.5) * self.p.depth
         Pref = 0.5 * self.p.rho * ((self.p.U or 8.0) ** 3) * A
         Fref = 0.5 * self.p.rho * ((self.p.U or 8.0) ** 2) * A
@@ -1226,7 +1234,7 @@ class LiveMonitorEngine:
 
         # 2. Time-step angular resolution telemetry
         if len(self.times) >= 5 and omega_val > 0 and Trev > 0:
-            dts = np.diff(self.times[-min(len(self.times), 200):])
+            dts = self._per_step_dts(max_tail=200)
             pos_dts = dts[dts > 1e-12]
             if len(pos_dts) > 0:
                 dt_now = float(np.median(pos_dts))
@@ -1285,9 +1293,51 @@ class LiveMonitorEngine:
                         key="cp_physical_range",
                     )
 
+    def _safe_omega(self) -> float:
+        try:
+            if (self.p.omega is not None and self.p.omega > 0) or (
+                self.p.tsr is not None and self.p.U is not None and self.p.R is not None
+                and self.p.tsr > 0 and self.p.U > 0 and self.p.R > 0
+            ):
+                om = float(self.p.omega_val())
+                if om > 0 and math.isfinite(om):
+                    return om
+        except Exception:
+            pass
+        return 1.0
+
+    def _per_step_dts(self, max_tail: Optional[int] = None) -> np.ndarray:
+        if len(self.times) < 2:
+            return np.array([], dtype=float)
+        if max_tail is not None and len(self.times) > max_tail:
+            t_slice = self.times[-max_tail:]
+            s_slice = self.steps[-max_tail:] if len(self.steps) == len(self.times) else None
+        else:
+            t_slice = self.times
+            s_slice = self.steps if len(self.steps) == len(self.times) else None
+        dts_raw = np.diff(t_slice)
+        if s_slice is not None and len(s_slice) == len(t_slice):
+            dsteps = np.maximum(np.diff(s_slice), 1)
+            return dts_raw / dsteps
+        return dts_raw
+
     def update_params(self, new_p: Params, target_revs: Optional[float] = None) -> LiveMonitorSnapshot:
         """Update simulation parameters dynamically and recompute accumulated physics & convergence."""
+        prev_nb = self.p.n_blades or 0
         self.p = copy.deepcopy(new_p)
+        new_nb = self.p.n_blades or 0
+        if new_nb != prev_nb:
+            for r_key in list(self.readers.keys()):
+                if r_key.startswith("blade "):
+                    try:
+                        b_idx = int(r_key.split()[1])
+                        if b_idx > new_nb:
+                            self.readers.pop(r_key, None)
+                    except Exception:
+                        pass
+            if len(self.f.blades) > new_nb:
+                self.f.blades = list(self.f.blades[:new_nb])
+            self._last_late_check_time = 0.0
         for reader in self.readers.values():
             reader.dt_fallback = self.p.dt
         self.steps = np.array([], dtype=np.int64)
@@ -1320,6 +1370,7 @@ class LiveMonitorEngine:
         self._role_continuity_info.clear()
         self._prefix_refined_for_gap = False
         self.continuity_summary = None
+        self._stages_cache_key = None
         self.logged_alert_keys.clear()
         self._force_reprocess = True
         self._load_prior_if_needed()
@@ -1469,13 +1520,18 @@ class LiveMonitorEngine:
         if self._stages_cache_key == ck:
             return self._stages_cache_val
 
-        dts = np.diff(self.times)
+        dts = self._per_step_dts()
         n_dts = len(dts)
         stages: List[Dict[str, Any]] = []
         if n_dts:
             start = 0
             while start < n_dts:
                 ref_dt = float(dts[start])
+                if start + 2 < n_dts:
+                    d1, d2 = float(dts[start + 1]), float(dts[start + 2])
+                    if abs(d2 - d1) / max(abs(d1), 1e-12) <= STAGE_DT_CHANGE_REL_TOL:
+                        if abs(ref_dt - d1) / max(abs(d1), 1e-12) > STAGE_DT_CHANGE_REL_TOL:
+                            ref_dt = float(np.median([d1, d2]))
                 denom = max(abs(ref_dt), 1e-12)
                 if start + 1 < n_dts:
                     # Find first index > start exceeding tolerance (vectorized C scan)
@@ -1534,7 +1590,7 @@ class LiveMonitorEngine:
     def get_snapshot(self, target_revs: Optional[float] = None, is_full_refresh: bool = True) -> LiveMonitorSnapshot:
         """Produce an immutable snapshot for thread-safe consumption by GUI."""
         now = time.time()
-        omega_val = self.p.omega_val() if (self.p.omega or (self.p.tsr and self.p.U and self.p.R)) else 1.0
+        omega_val = self._safe_omega()
         Trev = 2.0 * math.pi / omega_val
 
         from vawt_post.engine.azimuth_detect import compute_az_base
@@ -1557,7 +1613,7 @@ class LiveMonitorEngine:
         # Wall-clock ETA calculation: convert remaining revolutions -> remaining steps -> wall-clock seconds
         eta_s = None
         if target_revs and target_revs > tot_revs and self.steps_per_sec > 0:
-            recent_dts = np.diff(self.times[-min(len(self.times), 100):]) if len(self.times) > 1 else np.array([], dtype=float)
+            recent_dts = self._per_step_dts(max_tail=100)
             dt_est = float(np.median(recent_dts)) if len(recent_dts) > 0 else (float(self.p.dt) if self.p.dt else 0.0)
             if dt_est > 0 and Trev > 0:
                 revs_left = target_revs - tot_revs
@@ -1725,7 +1781,8 @@ class LiveMonitorEngine:
             )
             self.last_stage_count = len(stages)
 
-        curr_dt = stages[-1]["dt"] if stages else (float(np.median(np.diff(self.times))) if len(self.times) > 1 else (float(self.p.dt) if self.p.dt else None))
+        all_dts_norm = self._per_step_dts()
+        curr_dt = stages[-1]["dt"] if stages else (float(np.median(all_dts_norm)) if len(all_dts_norm) > 0 else (float(self.p.dt) if self.p.dt else None))
 
         # Parameter checks (entered vs detected)
         omega_det = getattr(self, "detected_omega", None)

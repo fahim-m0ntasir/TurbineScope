@@ -416,7 +416,8 @@ def _recover_gap_values(
                 m_pre = np.ones(len(b_times), dtype=bool)
             m_post = c_times <= (float(c_times[0]) + 1.0 * Trev)
             if int(np.sum(m_post)) == 0 and len(c_times) > 0:
-                m_post = np.ones(min(len(c_times), 5), dtype=bool)
+                m_post = np.zeros(len(c_times), dtype=bool)
+                m_post[:min(len(c_times), 5)] = True
 
             tp = b_times[m_pre]
             yp = b_vals[m_pre]
@@ -698,16 +699,19 @@ def stitch_series_pair(
 
         prefer_backup = (mode == "prefer_backup")
         if prefer_backup and int(c_step[-1]) > b_end:
-            keep_c = c_step > b_end
-            m_step = np.concatenate([b_step, c_step[keep_c]])
-            m_time = np.concatenate([b_time, c_time[keep_c]])
-            m_val = np.concatenate([b_val, c_val[keep_c]])
-            splice_idx = len(b_step) if np.any(keep_c) else len(b_step) - 1
+            keep_c_pre = c_step < int(b_step[0])
+            keep_c_post = c_step > b_end
+            m_step = np.concatenate([c_step[keep_c_pre], b_step, c_step[keep_c_post]])
+            m_time = np.concatenate([c_time[keep_c_pre], b_time, c_time[keep_c_post]])
+            m_val = np.concatenate([c_val[keep_c_pre], b_val, c_val[keep_c_post]])
+            n_pre = int(np.sum(keep_c_pre))
+            splice_idx = (n_pre + len(b_step)) if np.any(keep_c_post) else (n_pre + len(b_step) - 1)
         elif prefer_backup:
-            m_step = b_step.copy()
-            m_time = b_time.copy()
-            m_val = b_val.copy()
-            splice_idx = len(b_step) - 1
+            keep_c_pre = c_step < int(b_step[0])
+            m_step = np.concatenate([c_step[keep_c_pre], b_step])
+            m_time = np.concatenate([c_time[keep_c_pre], b_time])
+            m_val = np.concatenate([c_val[keep_c_pre], b_val])
+            splice_idx = int(np.sum(keep_c_pre)) + len(b_step) - 1
         else:
             keep_b = b_step < c_start
             # Never append backup rows beyond c_step[-1]: a predecessor backup must not extend past current.
@@ -763,13 +767,18 @@ def stitch_series_pair(
             # Uniformly bridge flow-time endpoints across missing steps
             t_grid = np.linspace(float(b_time[-1]), float(c_time[0]), n_miss + 2, dtype=float)
             g_times = t_grid[1:-1]
+            has_phys_t = bool(
+                (prior_s.get("time") is not None)
+                or (curr_s.get("time") is not None)
+                or (dt_fb is not None and dt_fb > 0)
+            )
             rec_res = _recover_gap_values(
                 b_times=b_time,
                 b_vals=b_val,
                 c_times=c_time,
                 c_vals=c_val,
                 g_times=g_times,
-                omega=omega,
+                omega=(omega if has_phys_t else None),
                 n_blades=nb,
                 run_validation=True,
             )
@@ -793,9 +802,10 @@ def stitch_series_pair(
             info["val_mae"] = rec_res["val_mae"]
             info["val_nrmse_pct"] = rec_res["val_nrmse_pct"]
 
+    has_time_col = bool((prior_s.get("time") is not None) or (curr_s.get("time") is not None))
     out = dict(curr_s)
     out["step"] = m_step
-    out["time"] = m_time
+    out["time"] = m_time if (has_time_col or (dt_fb is not None and dt_fb > 0)) else None
     out["value"] = m_val
     out["recovered_mask"] = rec_mask
     out["continuity_info"] = info
@@ -1025,14 +1035,17 @@ def write_fluent_report_file(
     """Write a Fluent-compatible 3-line header report file (.out) from stitched/recovered arrays."""
     os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
     title = report_title or os.path.splitext(os.path.basename(out_path))[0]
+    has_t = time_arr is not None and len(time_arr) == len(step)
     with open(out_path, "w", encoding="utf-8", newline="\n") as fh:
         fh.write(f'"{title}"\n')
-        fh.write(f'"Time Step" "{column_name}" "flow-time"\n')
-        fh.write(f'("Time Step" "{column_name}" "flow-time")\n')
-        if time_arr is not None and len(time_arr) == len(step):
+        if has_t and time_arr is not None:
+            fh.write(f'"Time Step" "{column_name}" "flow-time"\n')
+            fh.write(f'("Time Step" "{column_name}" "flow-time")\n')
             for s, v, t in zip(step, value, time_arr):
                 fh.write(f"{int(s)} {float(v):.12g} {float(t):.12g}\n")
         else:
+            fh.write(f'"Time Step" "{column_name}"\n')
+            fh.write(f'("Time Step" "{column_name}")\n')
             for s, v in zip(step, value):
                 fh.write(f"{int(s)} {float(v):.12g}\n")
 

@@ -1266,13 +1266,24 @@ class QtWidgetBase:
         pass
 
     def after(self, ms: int, func: Optional[Callable[..., Any]] = None, *args: Any) -> str:
-        if func is None:
+        if func is None or getattr(self, "_is_destroyed", False):
             return "after_noop"
         self._after_counter += 1
         tid = f"after_{id(self)}_{self._after_counter}"
         delay_ms = max(1, int(ms))
+        if not hasattr(self, "_pending_after_ids"):
+            self._pending_after_ids: set = set()
+        self._pending_after_ids.add(tid)
 
         def _schedule_on_gui() -> None:
+            pending = getattr(self, "_pending_after_ids", None)
+            if isinstance(pending, set):
+                pending.discard(tid)
+            if getattr(self, "_is_destroyed", False):
+                cancelled = getattr(self, "_cancelled_after_ids", None)
+                if isinstance(cancelled, set):
+                    cancelled.discard(tid)
+                return
             cancelled = getattr(self, "_cancelled_after_ids", None)
             if isinstance(cancelled, set) and tid in cancelled:
                 cancelled.discard(tid)
@@ -1282,6 +1293,8 @@ class QtWidgetBase:
 
             def _fire() -> None:
                 self._after_timers.pop(tid, None)
+                if getattr(self, "_is_destroyed", False):
+                    return
                 try:
                     func(*args)
                 except Exception:
@@ -1311,9 +1324,11 @@ class QtWidgetBase:
             timer.stop()
             timer.deleteLater()
         else:
-            if not hasattr(self, "_cancelled_after_ids"):
-                self._cancelled_after_ids: set = set()
-            self._cancelled_after_ids.add(tid_s)
+            pending = getattr(self, "_pending_after_ids", None)
+            if isinstance(pending, set) and tid_s in pending:
+                if not hasattr(self, "_cancelled_after_ids"):
+                    self._cancelled_after_ids: set = set()
+                self._cancelled_after_ids.add(tid_s)
 
     def bind(self, sequence: str, func: Callable[..., Any], add: Any = None) -> None:
         seq = str(sequence)
@@ -1325,6 +1340,7 @@ class QtWidgetBase:
 
         if isinstance(self, QWidget):
             qt_seq: Optional[str] = None
+            is_arrow = False
             if seq.startswith("<Control-") and seq.endswith(">"):
                 key_part = seq[len("<Control-"):-1]
                 if key_part.startswith("Key-"):
@@ -1334,6 +1350,7 @@ class QtWidgetBase:
                 qt_seq = f"Ctrl+{key_part}"
             elif seq in ("<Left>", "<Right>", "<Up>", "<Down>"):
                 qt_seq = seq[1:-1]
+                is_arrow = True
             elif seq == "<Escape>" and isinstance(self, QDialog):
                 qt_seq = "Esc"
             elif seq == "<Return>" and isinstance(self, QDialog):
@@ -1349,13 +1366,31 @@ class QtWidgetBase:
                     except Exception:
                         pass
                 sc = QShortcut(QKeySequence(qt_seq), self)
-                sc.activated.connect(lambda _f=func: _f(None))
+                if is_arrow:
+                    sc.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+
+                    def _fire_arrow(_f: Callable[..., Any] = func) -> None:
+                        fw = QApplication.focusWidget()
+                        if isinstance(fw, (QLineEdit, QTextEdit)):
+                            return
+                        _f(None)
+
+                    sc.activated.connect(_fire_arrow)
+                else:
+                    sc.activated.connect(lambda _f=func: _f(None))
                 self._qt_shortcuts.setdefault(qt_seq, []).append(sc)
 
     def bind_all(self, sequence: str, func: Callable[..., Any], add: Any = None) -> None:
         self.bind(sequence, func, add=add)
 
     def destroy(self) -> None:
+        self._is_destroyed = True
+        pending = getattr(self, "_pending_after_ids", None)
+        if isinstance(pending, set):
+            pending.clear()
+        cancelled = getattr(self, "_cancelled_after_ids", None)
+        if isinstance(cancelled, set):
+            cancelled.clear()
         if isinstance(self, QWidget):
             for qt in self.findChildren(QTimer):
                 try:
@@ -1590,6 +1625,9 @@ class CTkScrollableFrame(QScrollArea, QtWidgetBase):
         vp.setVisible(True)
         self._parent_canvas = self
         self._scroll_sync_pending: bool = False
+        self._scroll_sync_timer = QTimer(self)
+        self._scroll_sync_timer.setSingleShot(True)
+        self._scroll_sync_timer.timeout.connect(self._sync_scroll_content_now)
         self._apply_qss()
         self._on_theme_refresh()
 
@@ -1610,15 +1648,25 @@ class CTkScrollableFrame(QScrollArea, QtWidgetBase):
 
     def _sync_scroll_content_now(self) -> None:
         self._scroll_sync_pending = False
-        if self._viewport_widget is not None and self._viewport_widget._qt_layout is not None:
-            sh = self._viewport_widget._qt_layout.sizeHint()
-            self._viewport_widget.setMinimumHeight(max(60, sh.height() + 12))
-            self._viewport_widget._qt_layout.setGeometry(self._viewport_widget.rect())
+        if getattr(self, "_is_destroyed", False):
+            return
+        try:
+            if self._viewport_widget is not None and self._viewport_widget._qt_layout is not None:
+                sh = self._viewport_widget._qt_layout.sizeHint()
+                self._viewport_widget.setMinimumHeight(max(60, sh.height() + 12))
+                self._viewport_widget._qt_layout.setGeometry(self._viewport_widget.rect())
+        except RuntimeError:
+            pass
 
     def _notify_scroll_content_changed(self) -> None:
+        if getattr(self, "_is_destroyed", False):
+            return
         if not self._scroll_sync_pending:
             self._scroll_sync_pending = True
-            QTimer.singleShot(0, self._sync_scroll_content_now)
+            try:
+                self._scroll_sync_timer.start(0)
+            except RuntimeError:
+                self._scroll_sync_pending = False
 
     def resizeEvent(self, event: QResizeEvent) -> None:
         super().resizeEvent(event)
@@ -1693,8 +1741,27 @@ class CTkLabel(QLabel, QtWidgetBase):
             else:
                 v_align = Qt.AlignmentFlag.AlignVCenter
             self.setAlignment(h_align | v_align)
+        if "cursor" in kwargs:
+            cur = str(kwargs["cursor"] or "").strip().lower()
+            if cur in ("hand2", "hand", "pointinghand"):
+                self.setCursor(Qt.CursorShape.PointingHandCursor)
+            else:
+                self.unsetCursor()
         if any(k in kwargs for k in self._QSS_STYLE_KEYS):
             self._apply_qss()
+
+    def mousePressEvent(self, event: Any) -> None:
+        super().mousePressEvent(event)
+        try:
+            if event is not None and event.button() == Qt.MouseButton.LeftButton:
+                if "<Button-1>" in self._bound_handlers:
+                    for cb in list(self._bound_handlers["<Button-1>"]):
+                        try:
+                            cb(event)
+                        except Exception:
+                            pass
+        except Exception:
+            pass
 
     def _update_image_pixmap(self) -> None:
         img = self._ctk_image
@@ -1858,13 +1925,17 @@ class CTkEntry(QLineEdit, QtWidgetBase):
                     pass
 
     def _on_return_pressed(self) -> None:
-        for seq in ("<Return>", "<FocusOut>"):
-            if seq in self._bound_handlers:
-                for cb in list(self._bound_handlers[seq]):
-                    try:
-                        cb(None)
-                    except Exception:
-                        pass
+        if "<Return>" in self._bound_handlers and self._bound_handlers["<Return>"]:
+            handlers = list(self._bound_handlers["<Return>"])
+        elif "<FocusOut>" in self._bound_handlers:
+            handlers = list(self._bound_handlers["<FocusOut>"])
+        else:
+            handlers = []
+        for cb in handlers:
+            try:
+                cb(None)
+            except Exception:
+                pass
 
     def focusOutEvent(self, event: Any) -> None:
         super().focusOutEvent(event)
@@ -3022,10 +3093,13 @@ class CTk(QMainWindow, QtWidgetBase):
     def geometry(self, spec: Optional[str] = None) -> str:  # type: ignore[override]
         if spec:
             try:
-                dims = str(spec).split("+")[0]
-                w_s, h_s = dims.lower().split("x")
-                self.resize(int(w_s), int(h_s))
-                self.update_idletasks()
+                m = re.fullmatch(r"\s*(?:(\d+)[xX](\d+))?(?:([+-]\d+)([+-]\d+))?\s*", str(spec))
+                if m:
+                    if m.group(1) and m.group(2):
+                        self.resize(int(m.group(1)), int(m.group(2)))
+                    if m.group(3) and m.group(4):
+                        self.move(int(m.group(3)), int(m.group(4)))
+                    self.update_idletasks()
             except Exception:
                 pass
         return f"{self.width()}x{self.height()}"
@@ -3051,8 +3125,20 @@ class CTk(QMainWindow, QtWidgetBase):
         if sys.platform.startswith("win") and self.testAttribute(Qt.WidgetAttribute.WA_WState_Created):
             try:
                 from vawt_post.icon_assets import apply_native_win32_icon
-                self._destroy_win32_hicons()
-                self._win32_hicons = apply_native_win32_icon(int(self.winId()), self._win_ico_path)
+                old_icons = getattr(self, "_win32_hicons", (0, 0))
+                new_icons = apply_native_win32_icon(int(self.winId()), self._win_ico_path)
+                if any(new_icons):
+                    self._win32_hicons = new_icons
+                    if any(old_icons):
+                        try:
+                            import ctypes
+                            windll = getattr(ctypes, "windll", None)
+                            if windll is not None:
+                                for h in old_icons:
+                                    if h:
+                                        windll.user32.DestroyIcon(ctypes.c_void_p(h))
+                        except Exception:
+                            pass
             except Exception:
                 pass
 
@@ -3200,14 +3286,13 @@ class CTkToplevel(QDialog, QtWidgetBase):
     def geometry(self, spec: Optional[str] = None) -> str:  # type: ignore[override]
         if spec:
             try:
-                parts = str(spec).split("+")
-                dims = parts[0]
-                if "x" in dims.lower():
-                    w_s, h_s = dims.lower().split("x")
-                    self.resize(int(w_s), int(h_s))
-                if len(parts) >= 3:
-                    self.move(int(parts[1]), int(parts[2]))
-                self.update_idletasks()
+                m = re.fullmatch(r"\s*(?:(\d+)[xX](\d+))?(?:([+-]\d+)([+-]\d+))?\s*", str(spec))
+                if m:
+                    if m.group(1) and m.group(2):
+                        self.resize(int(m.group(1)), int(m.group(2)))
+                    if m.group(3) and m.group(4):
+                        self.move(int(m.group(3)), int(m.group(4)))
+                    self.update_idletasks()
             except Exception:
                 pass
         return f"{self.width()}x{self.height()}"
@@ -3274,8 +3359,8 @@ class _QtFileDialogProxy:
 
     @staticmethod
     def askopenfilename(**kwargs: Any) -> str:
-        import tkinter.filedialog as tk_fd
-        if _QtFileDialogProxy._is_mocked(tk_fd.askopenfilename):
+        tk_fd = sys.modules.get("tkinter.filedialog")
+        if tk_fd is not None and _QtFileDialogProxy._is_mocked(getattr(tk_fd, "askopenfilename", None)):
             return tk_fd.askopenfilename(**kwargs)
         title = kwargs.get("title", "Select File")
         init_dir = kwargs.get("initialdir", "")
@@ -3285,8 +3370,8 @@ class _QtFileDialogProxy:
 
     @staticmethod
     def askopenfilenames(**kwargs: Any) -> List[str]:
-        import tkinter.filedialog as tk_fd
-        if _QtFileDialogProxy._is_mocked(tk_fd.askopenfilenames):
+        tk_fd = sys.modules.get("tkinter.filedialog")
+        if tk_fd is not None and _QtFileDialogProxy._is_mocked(getattr(tk_fd, "askopenfilenames", None)):
             return list(tk_fd.askopenfilenames(**kwargs))
         title = kwargs.get("title", "Select Files")
         init_dir = kwargs.get("initialdir", "")
@@ -3296,8 +3381,8 @@ class _QtFileDialogProxy:
 
     @staticmethod
     def askdirectory(**kwargs: Any) -> str:
-        import tkinter.filedialog as tk_fd
-        if _QtFileDialogProxy._is_mocked(tk_fd.askdirectory):
+        tk_fd = sys.modules.get("tkinter.filedialog")
+        if tk_fd is not None and _QtFileDialogProxy._is_mocked(getattr(tk_fd, "askdirectory", None)):
             return tk_fd.askdirectory(**kwargs)
         title = kwargs.get("title", "Select Folder")
         init_dir = kwargs.get("initialdir", "")
@@ -3306,8 +3391,8 @@ class _QtFileDialogProxy:
 
     @staticmethod
     def asksaveasfilename(**kwargs: Any) -> str:
-        import tkinter.filedialog as tk_fd
-        if _QtFileDialogProxy._is_mocked(tk_fd.asksaveasfilename):
+        tk_fd = sys.modules.get("tkinter.filedialog")
+        if tk_fd is not None and _QtFileDialogProxy._is_mocked(getattr(tk_fd, "asksaveasfilename", None)):
             return tk_fd.asksaveasfilename(**kwargs)
         title = kwargs.get("title", "Save File As")
         init_dir = kwargs.get("initialdir", "")
@@ -3333,36 +3418,40 @@ class _QtMessageBoxProxy:
         return hasattr(fn, "_mock_name") or "Mock" in type(fn).__name__
 
     @staticmethod
+    def _parent_win() -> Optional[QWidget]:
+        return QApplication.activeWindow()
+
+    @staticmethod
     def showinfo(title: str = "Info", message: str = "", **kwargs: Any) -> str:
-        import tkinter.messagebox as tk_mb
-        if _QtMessageBoxProxy._is_mocked(tk_mb.showinfo):
+        tk_mb = sys.modules.get("tkinter.messagebox")
+        if tk_mb is not None and _QtMessageBoxProxy._is_mocked(getattr(tk_mb, "showinfo", None)):
             return tk_mb.showinfo(title, message, **kwargs)
-        QMessageBox.information(None, str(title), str(message))
+        QMessageBox.information(_QtMessageBoxProxy._parent_win(), str(title), str(message))
         return "ok"
 
     @staticmethod
     def showwarning(title: str = "Warning", message: str = "", **kwargs: Any) -> str:
-        import tkinter.messagebox as tk_mb
-        if _QtMessageBoxProxy._is_mocked(tk_mb.showwarning):
+        tk_mb = sys.modules.get("tkinter.messagebox")
+        if tk_mb is not None and _QtMessageBoxProxy._is_mocked(getattr(tk_mb, "showwarning", None)):
             return tk_mb.showwarning(title, message, **kwargs)
-        QMessageBox.warning(None, str(title), str(message))
+        QMessageBox.warning(_QtMessageBoxProxy._parent_win(), str(title), str(message))
         return "ok"
 
     @staticmethod
     def showerror(title: str = "Error", message: str = "", **kwargs: Any) -> str:
-        import tkinter.messagebox as tk_mb
-        if _QtMessageBoxProxy._is_mocked(tk_mb.showerror):
+        tk_mb = sys.modules.get("tkinter.messagebox")
+        if tk_mb is not None and _QtMessageBoxProxy._is_mocked(getattr(tk_mb, "showerror", None)):
             return tk_mb.showerror(title, message, **kwargs)
-        QMessageBox.critical(None, str(title), str(message))
+        QMessageBox.critical(_QtMessageBoxProxy._parent_win(), str(title), str(message))
         return "ok"
 
     @staticmethod
     def askyesno(title: str = "Confirm", message: str = "", **kwargs: Any) -> bool:
-        import tkinter.messagebox as tk_mb
-        if _QtMessageBoxProxy._is_mocked(tk_mb.askyesno):
+        tk_mb = sys.modules.get("tkinter.messagebox")
+        if tk_mb is not None and _QtMessageBoxProxy._is_mocked(getattr(tk_mb, "askyesno", None)):
             return bool(tk_mb.askyesno(title, message, **kwargs))
         ans = QMessageBox.question(
-            None,
+            _QtMessageBoxProxy._parent_win(),
             str(title),
             str(message),
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,

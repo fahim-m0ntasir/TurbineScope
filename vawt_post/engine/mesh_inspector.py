@@ -869,12 +869,16 @@ def inspect_workbench_setup_and_mesh(
 
     rp = dict(rotor_params or {})
     if case_res and case_res.is_valid:
-        rp.setdefault("U", case_res.velocity_m_s)
-        rp.setdefault("omega", abs(case_res.omega_rad_s) if case_res.omega_rad_s is not None else None)
-        rp.setdefault("R", case_res.rotor_radius_m)
-        rp.setdefault("chord", case_res.chord_m)
-        rp.setdefault("rho", case_res.density_kg_m3)
-        rp.setdefault("mu", case_res.viscosity_pa_s)
+        for _k, _v in (
+            ("U", case_res.velocity_m_s),
+            ("omega", abs(case_res.omega_rad_s) if case_res.omega_rad_s is not None else None),
+            ("R", case_res.rotor_radius_m),
+            ("chord", case_res.chord_m),
+            ("rho", case_res.density_kg_m3),
+            ("mu", case_res.viscosity_pa_s),
+        ):
+            if _v is not None and not rp.get(_k):
+                rp[_k] = _v
     if xml_setup:
         if xml_setup.get("velocity") is not None and not rp.get("U"):
             rp["U"] = xml_setup["velocity"]
@@ -929,10 +933,10 @@ def inspect_workbench_setup_and_mesh(
         notes.append("Artifacts found: " + " | ".join(art_labels))
 
     if mesh_quality.get("available"):
-        cc = mesh_quality.get("cell_count", 0)
-        nc = mesh_quality.get("node_count", 0)
-        fc = mesh_quality.get("face_count", 0)
-        dim = mesh_quality.get("dimension", 2)
+        cc = int(mesh_quality.get("cell_count") or 0)
+        nc = int(mesh_quality.get("node_count") or 0)
+        fc = int(mesh_quality.get("face_count") or 0)
+        dim = int(mesh_quality.get("dimension") or 2)
         notes.append(f"Mesh topology ({dim}D): {cc:,} cells, {fc:,} faces, {nc:,} nodes")
 
         dom = mesh_quality.get("domain", {})
@@ -959,7 +963,10 @@ def inspect_workbench_setup_and_mesh(
             if q_parts:
                 notes.append("Mesh quality: " + ", ".join(q_parts))
 
-        wl = [w for w in mesh_quality.get("wall_layers", []) if "blade" in w["zone"].lower()]
+        wl = [
+            w for w in mesh_quality.get("wall_layers", [])
+            if any(tok in w["zone"].lower() for tok in ("blade", "airfoil"))
+        ]
         if wl:
             y1_vals = [w["y1_mean_mm"] for w in wl if w.get("y1_mean_mm") is not None]
             yp_vals = [w["yplus_peak_est"] for w in wl if w.get("yplus_peak_est") is not None]

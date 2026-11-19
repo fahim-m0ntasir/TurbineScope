@@ -249,16 +249,29 @@ def detect_start_azimuth(
     Trev = (2.0 * math.pi / omega) if omega > 0 else 0.0
     sign = effective_moment_sign(p) if apply_moment_sign else 1.0
 
-    # Clean finite time / step series
+    # Clean finite time / step series (deduplicated & sorted by step if provided)
     t_arr: Optional[np.ndarray] = None
     step_arr: Optional[np.ndarray] = None
+    b1_arr: Optional[np.ndarray] = None
     if t is not None:
         raw_t = np.asarray(t, dtype=float)
         mask_t = np.isfinite(raw_t)
         if mask_t.any():
             t_arr = raw_t[mask_t]
+            if m_b1 is not None and len(m_b1) == len(raw_t):
+                b1_arr = np.asarray(m_b1, dtype=float)[mask_t]
             if step is not None and len(step) == len(raw_t):
                 step_arr = np.asarray(step, dtype=np.int64)[mask_t]
+                # Keep last occurrence per step and sort ascending by step
+                if len(step_arr) > 1 and (np.any(np.diff(step_arr) <= 0)):
+                    _, rev_idx = np.unique(step_arr[::-1], return_index=True)
+                    keep_idx = (len(step_arr) - 1) - rev_idx
+                    order = np.argsort(step_arr[keep_idx], kind="stable")
+                    keep_idx = keep_idx[order]
+                    step_arr = step_arr[keep_idx]
+                    t_arr = t_arr[keep_idx]
+                    if b1_arr is not None:
+                        b1_arr = b1_arr[keep_idx]
     if step_arr is None and step is not None and len(step) > 0:
         step_arr = np.asarray(step, dtype=np.int64)
 
@@ -323,12 +336,11 @@ def detect_start_azimuth(
         n_win = min(4, n_full)
         t_win_start = float(t_arr[-1]) - n_win * Trev
 
-        if m_b1 is not None and t is not None and len(m_b1) == len(t):
-            raw_b1 = np.asarray(m_b1, dtype=float)
-            valid_pair = np.isfinite(np.asarray(t, dtype=float)) & np.isfinite(raw_b1)
+        if b1_arr is not None and len(b1_arr) == len(t_arr):
+            valid_pair = np.isfinite(t_arr) & np.isfinite(b1_arr)
             if int(np.sum(valid_pair)) >= 24:
-                tp = np.asarray(t, dtype=float)[valid_pair]
-                vp = sign * raw_b1[valid_pair]
+                tp = t_arr[valid_pair]
+                vp = sign * b1_arr[valid_pair]
                 win = tp >= t_win_start - 1e-9
                 if int(np.sum(win)) >= 24:
                     th_cur = np.mod(az_base + np.degrees(omega * tp[win]), 360.0)

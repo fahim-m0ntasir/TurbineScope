@@ -9,6 +9,7 @@ Results Graph Preview workspace.
 from __future__ import annotations
 
 import datetime
+import math
 import os
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -67,6 +68,8 @@ def generate_captions(R: Dict[str, Any]) -> Dict[str, str]:
     sel_lab = ", ".join(f"rev {r['k']}" for r in sel)
     ct_str = f"{res['ct_mean']:.3f}" if res.get("ct_mean") is not None else "n/a"
     cy_str = f"{res['cy_mean']:.3f}" if res.get("cy_mean") is not None else "n/a"
+    ait_raw = res.get("cp_extrapolated_aitken")
+    ait_str = f"{float(ait_raw):.4f}" if isinstance(ait_raw, (int, float)) and math.isfinite(float(ait_raw)) else "n/a"
     caps: Dict[str, str] = {
         "01_cp_history.png": (
             f"Figure 1: Evolution of instantaneous and revolution-averaged power coefficient Cp "
@@ -140,7 +143,7 @@ def generate_captions(R: Dict[str, Any]) -> Dict[str, str]:
         ),
         "18_cp_convergence_history.png": (
             f"Figure 18: Rotor power coefficient Cp convergence history across {len(revs)} revolutions with "
-            f"asymptotic Aitken extrapolation limit ({res.get('cp_extrapolated_aitken', 'n/a')}) and ±{p.stable_tol:g}% stability tolerance band."
+            f"asymptotic Aitken extrapolation limit ({ait_str}) and ±{p.stable_tol:g}% stability tolerance band."
         ),
     }
     return caps
@@ -558,7 +561,7 @@ def _plot_04_blade_torque(R: Dict[str, Any], st: Dict[str, Any], dpi: int, targe
 
 
 def _plot_05_polar_cp(R: Dict[str, Any], st: Dict[str, Any], dpi: int, target_fig: Optional[Figure]) -> Figure:
-    d, az = R["data"], R["az"]
+    p, d, az = R["p"], R["data"], R["az"]
     th = az["theta"]
     pal = st["pal"]
 
@@ -570,8 +573,9 @@ def _plot_05_polar_cp(R: Dict[str, Any], st: Dict[str, Any], dpi: int, target_fi
         ax_polar.tick_params(colors=st["fg"])
         return fig
 
-    ax_polar.set_theta_zero_location("N")
-    ax_polar.set_theta_direction(1)
+    is_cw = getattr(p, "rotation_dir", "ccw") == "cw"
+    ax_polar.set_theta_zero_location("S" if is_cw else "N")
+    ax_polar.set_theta_direction(-1 if is_cw else 1)
     r_ = np.radians(np.append(th, th[0]))
     v = np.append(az["Cp_blade_eq"], az["Cp_blade_eq"][0])
 
@@ -758,8 +762,9 @@ def _plot_10_convergence(R: Dict[str, Any], st: Dict[str, Any], dpi: int, target
     _style_cartesian_ax(ax, st)
 
     if len(revs) > 1:
-        kk = [r["k"] for r in revs[1:]]
-        dv = [100.0 * (r["dcp"] or 0.0) for r in revs[1:]]
+        revs_plot = revs if (revs[0]["k"] > 1 and revs[0].get("dcp") is not None) else revs[1:]
+        kk = [r["k"] for r in revs_plot]
+        dv = [100.0 * (r["dcp"] or 0.0) for r in revs_plot]
     else:
         kk = [revs[0]["k"]]
         dv = [100.0 * (revs[0].get("dcp") or 0.0)]
@@ -895,13 +900,13 @@ def _plot_13_quartiles(R: Dict[str, Any], st: Dict[str, Any], dpi: int, target_f
     mask_wind = (th_deg >= 315.0) | (th_deg < 45.0)
 
     sums = [
-        float(np.sum(cp_for_quartiles[mask_up])),
-        float(np.sum(cp_for_quartiles[mask_lee])),
-        float(np.sum(cp_for_quartiles[mask_down])),
-        float(np.sum(cp_for_quartiles[mask_wind])),
+        float(np.nansum(cp_for_quartiles[mask_up])),
+        float(np.nansum(cp_for_quartiles[mask_lee])),
+        float(np.nansum(cp_for_quartiles[mask_down])),
+        float(np.nansum(cp_for_quartiles[mask_wind])),
     ]
     total_q = sum(sums)
-    quartile_pcts = [(s / total_q) * 100.0 for s in sums] if abs(total_q) > 1e-9 else [0.0, 0.0, 0.0, 0.0]
+    quartile_pcts = [(s / abs(total_q)) * 100.0 for s in sums] if abs(total_q) > 1e-9 else [0.0, 0.0, 0.0, 0.0]
     quartile_labels = ["Upwind\n[45°–135°)", "Leeward\n[135°–225°)", "Downwind\n[225°–315°)", "Windward\n[315°–45°)"]
     pal = st["pal"]
     q_colors = [pal[0], pal[1], pal[2], pal[3]]
@@ -1078,9 +1083,10 @@ def _plot_18_cp_convergence(R: Dict[str, Any], st: Dict[str, Any], dpi: int, tar
     else:
         ax.axhspan(band_lo, band_hi, color=pal[2], alpha=0.15, label=f"±{tol_pct:g}% Stability Tolerance Band")
 
+    is_contiguous = len(rev_nums) >= 2 and (rev_nums[-1] - rev_nums[-2] == 1)
     last_dcp = (
         float(abs(rev_cps[-1] - rev_cps[-2]) / abs(rev_cps[-2]))
-        if len(rev_cps) >= 2 and abs(rev_cps[-2]) > 1e-6
+        if is_contiguous and abs(rev_cps[-2]) > 1e-6
         else abs(float(res.get("cp_last_change") or 0.0))
     )
     is_st = bool(res.get("is_stable", False))

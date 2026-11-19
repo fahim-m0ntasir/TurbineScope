@@ -114,7 +114,8 @@ class GCIReport:
             "convergence_type": (
                 "Monotonic Convergence" if self.is_monotonic_convergence else
                 "Oscillatory Convergence" if self.is_oscillatory_convergence else
-                "Monotonic Divergence"
+                "Monotonic Divergence" if self.is_divergent else
+                "Exact / Numerically Identical"
             )
         }
 
@@ -162,7 +163,7 @@ class GCIReport:
             "=" * 84,
             f"Target Quantity (phi): {self.metric_name}",
             f"Analysis Mode:         {'Temporal GCI (Time-Step Convergence)' if self.is_temporal_gci else 'Spatial GCI (Grid Convergence)'}",
-            f"Convergence Mode:      {'Monotonic Convergence' if self.is_monotonic_convergence else ('Oscillatory Convergence (Heuristic Error)' if self.is_oscillatory_convergence else 'Monotonic Divergence')}",
+            f"Convergence Mode:      {'Monotonic Convergence' if self.is_monotonic_convergence else ('Oscillatory Convergence (Heuristic Error)' if self.is_oscillatory_convergence else ('Monotonic Divergence' if self.is_divergent else 'Exact / Numerically Identical'))}",
             "-" * 84,
             f"{'PARAMETER':<30} {'NOTATION / FORMULA':<24} {'VALUE':<16} {'UNITS':<10}",
             "-" * 84,
@@ -314,6 +315,7 @@ def validate_gci_comparability(
     r32: float,
     asymptotic_range: float,
     is_temporal: bool = False,
+    is_divergent: bool = False,
 ) -> Tuple[bool, List[str]]:
     """
     Apply ASME V&V 20 / Celik et al. guardrails:
@@ -378,8 +380,12 @@ def validate_gci_comparability(
         if v_mean > 1e-12 and (max(vels) - min(vels)) / v_mean > 0.005:
             failed_checks.append("Inflow velocity mismatch across systems. Spatial GCI requires identical operating parameters.")
 
-    # 6. Asymptotic range ratio check (0.90 <= AR <= 1.10)
-    if not (0.90 <= asymptotic_range <= 1.10):
+    # 6. Divergence & asymptotic range ratio check (0.90 <= AR <= 1.10)
+    if is_divergent:
+        failed_checks.append(
+            "Monotonic divergence detected (|eps21| >= |eps32| with same sign): Richardson extrapolation and GCI are not valid."
+        )
+    elif not (0.90 <= asymptotic_range <= 1.10):
         failed_checks.append(
             f"Asymptotic range check AR = {asymptotic_range:.4f} is outside [0.90, 1.10]. "
             "Grids may not be asymptotically converged."
@@ -506,7 +512,7 @@ def compute_asme_gci(
     notes: List[str] = []
     if abs(eps21) <= 1e-12 and abs(eps32) <= 1e-12:
         p = 1.0
-        is_monotonic_conv = False
+        is_monotonic_conv = True
         is_oscillatory_conv = False
         is_divergent = False
         phi_ext_21 = phi1
@@ -561,7 +567,11 @@ def compute_asme_gci(
     else:
         asymptotic_range = 1.0
 
-    in_asymptotic_range = (0.90 <= asymptotic_range <= 1.10)
+    in_asymptotic_range = (
+        (not is_divergent)
+        and (not is_oscillatory_conv)
+        and (0.90 <= asymptotic_range <= 1.10)
+    )
 
     # 8. Comparability Guardrails
     is_valid, failed_checks = validate_gci_comparability(
@@ -570,6 +580,7 @@ def compute_asme_gci(
         r32=r32,
         asymptotic_range=asymptotic_range,
         is_temporal=is_temporal,
+        is_divergent=is_divergent,
     )
 
     # Combined spatial-temporal uncertainty calculation

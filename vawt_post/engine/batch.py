@@ -10,6 +10,7 @@ Processes multiple tip speed ratios (TSR) to generate:
 """
 from __future__ import annotations
 
+import copy
 import csv
 import datetime as _dt
 import json
@@ -243,9 +244,8 @@ def run_batch_analysis(
         if p_base is None:
             p_base = Params(U=8.0, R=0.5, n_blades=3)
 
-        # Clone and assign TSR
-        p = Params(**{k: v for k, v in p_base.__dict__.items() if k != "metadata"})
-        p.metadata = p_base.metadata
+        # Deep-clone per TSR point so metadata/applied_repairs/param_sources never bleed across runs
+        p = copy.deepcopy(p_base)
         p.tsr = tsr
         p.omega = None  # derive from TSR
 

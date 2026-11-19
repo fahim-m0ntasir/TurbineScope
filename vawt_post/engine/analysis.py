@@ -293,6 +293,14 @@ def analyze(
             warnings.append(f"Run continuity notice: {c_sum}")
 
     step, t, S = align_series(series, p.dt)
+    # Guard against NaN/Inf timestamps in t before any revolution/phase math
+    bad_t = ~np.isfinite(t)
+    if np.any(bad_t):
+        finite_t = ~bad_t
+        if int(np.sum(finite_t)) < 2:
+            raise ValueError("Aligned time series has fewer than 2 finite timestamps.")
+        warnings.append(f"Flow-time series contains {int(np.sum(bad_t))} NaN/Inf values; sanitized via linear interpolation.")
+        t = np.interp(np.arange(len(t)), np.where(finite_t)[0], t[finite_t])
     n = len(t)
     log(f"Aligned {n} common time steps, flow time range: {t[0]:.5f} to {t[-1]:.5f} s")
 
@@ -455,12 +463,18 @@ def analyze(
     th1 = np.mod(az_base + np.degrees(omega * t), 360.0)
     TH = [np.mod(th1 + o, 360.0) for o in offs] if have_blades else [th1]
 
+    sample_src_path = next(
+        (pth for pth in [f.total, f.shaft, f.fx, f.fy, *f.blades] if pth and os.path.isfile(str(pth))),
+        None,
+    )
+    src_folder = os.path.dirname(os.path.abspath(str(sample_src_path))) if sample_src_path else None
     start_az_res = detect_start_azimuth(
         p,
         t=t,
         step=step,
         m_b1=(Mb[0] if have_blades else None),
         m_total=Mrot,
+        folder=src_folder,
         apply_moment_sign=False,
     )
     if start_az_res.needs_correction and start_az_res.recommended_theta0_deg is not None and start_az_res.confidence in ("high", "medium"):
@@ -691,6 +705,12 @@ def analyze(
     except Exception:
         pass
 
+    # Preserve pre-slice full arrays for spectral/autocorrelation/QA checks even if custom_rev_indices slices data
+    step_full = step
+    t_full = t
+    Mrot_full = Mrot
+    Mb_full = list(Mb)
+
     if custom_rev_indices:
         # Strict isolation for specific revolution(s): keep ONLY the selected revolution(s)
         revs = sel
@@ -903,7 +923,7 @@ def analyze(
         "n_steps": n,
         "t0": float(t[0]),
         "t1": float(t[-1]),
-        "total_revs": float((t[-1] - t[0]) / Trev),
+        "total_revs": float(len(sel)) if custom_rev_indices else float((t[-1] - t[0]) / Trev),
         "sign": sign,
         "offsets": offs if have_blades else None,
         "alpha_max": float(np.max(az["alpha"])),
@@ -934,14 +954,14 @@ def analyze(
 
     # Rotor speed BPF check and torque autocorrelation check (Tier 1.5 / Check 12)
     dominant_harmonic_ratio = 1.0
-    if len(t) >= 100:
+    if len(t_full) >= 100 and float(t_full[-1] - t_full[0]) > 0:
         try:
             f0 = omega / (2.0 * math.pi)
             f_bpf = p.n_blades * f0
-            grid_n = min(len(t), 8192)
-            t_grid = np.linspace(t[0], t[-1], grid_n)
-            dt_grid = (t[-1] - t[0]) / (grid_n - 1)
-            m_interp = np.interp(t_grid, t, Mrot)
+            grid_n = min(len(t_full), 8192)
+            t_grid = np.linspace(t_full[0], t_full[-1], grid_n)
+            dt_grid = (t_full[-1] - t_full[0]) / (grid_n - 1)
+            m_interp = np.interp(t_grid, t_full, Mrot_full)
             m_zero = m_interp - m_interp.mean()
             m_fft = np.abs(np.fft.rfft(m_zero))
             freqs = np.fft.rfftfreq(grid_n, dt_grid)
@@ -977,11 +997,13 @@ def analyze(
                         f"Note: This spectral check cannot detect an incorrect free-stream velocity U."
                     )
 
-            if have_blades and len(Mb) > 0:
-                mb1 = Mb[0]
-                mb1_interp = np.interp(t_grid, t, mb1)
-                mb1_zero = mb1_interp - mb1_interp.mean()
-                mb1_fft = np.abs(np.fft.rfft(mb1_zero))
+            mb1_zero: Optional[np.ndarray] = None
+            if have_blades and len(Mb_full) > 0:
+                mb1 = Mb_full[0]
+                mb1_interp = np.interp(t_grid, t_full, mb1)
+                mb1_z = mb1_interp - mb1_interp.mean()
+                mb1_zero = mb1_z
+                mb1_fft = np.abs(np.fft.rfft(mb1_z))
                 fb_band = (freqs >= 0.4 * f0) & (freqs <= 2.2 * f0)
                 if fb_band.any():
                     fb_peak = float(freqs[fb_band][np.argmax(mb1_fft[fb_band])])
@@ -998,15 +1020,36 @@ def analyze(
                                 f"Note: This spectral check cannot detect an incorrect free-stream velocity U."
                             )
 
-            # Autocorrelation period check
-            norm_m = np.sum(m_zero ** 2)
-            if norm_m > 1e-12:
-                autocorr = np.correlate(m_zero, m_zero, mode="full")[len(m_zero) - 1:] / norm_m
+            # Autocorrelation period check: prefer Blade 1 (true 1x Trev period even for N >= 4 blades);
+            # otherwise use unbiased normalization on Mrot (checking T_bpf = Trev/N when N >= 4 so harmonics don't beat Trev).
+            if mb1_zero is not None and float(np.sum(mb1_zero ** 2)) > 1e-12:
+                ac_sig = mb1_zero
+                check_bpf = False
+            else:
+                ac_sig = m_zero
+                check_bpf = (p.n_blades >= 4)
+            norm_ac = float(np.sum(ac_sig ** 2))
+            if norm_ac > 1e-12:
+                raw_ac = np.correlate(ac_sig, ac_sig, mode="full")[len(ac_sig) - 1:]
+                unbiased_counts = np.maximum(len(ac_sig) - np.arange(len(ac_sig)), 1).astype(float)
+                autocorr = (raw_ac / unbiased_counts) / (norm_ac / len(ac_sig))
                 lags_t = np.arange(len(autocorr)) * dt_grid
-                lag_win = (lags_t >= 0.75 * Trev) & (lags_t <= 1.25 * Trev)
-                if lag_win.any():
-                    idx_peak = np.argmax(autocorr[lag_win])
-                    autocorr_period = float(lags_t[lag_win][idx_peak])
+                if check_bpf:
+                    T_bpf = Trev / max(1, p.n_blades)
+                    lag_win = (lags_t >= 0.75 * T_bpf) & (lags_t <= 1.25 * T_bpf)
+                    if lag_win.any():
+                        idx_peak = int(np.argmax(autocorr[lag_win]))
+                        autocorr_period = float(lags_t[lag_win][idx_peak]) * max(1, p.n_blades)
+                    else:
+                        autocorr_period = None
+                else:
+                    lag_win = (lags_t >= 0.75 * Trev) & (lags_t <= 1.25 * Trev)
+                    if lag_win.any():
+                        idx_peak = int(np.argmax(autocorr[lag_win]))
+                        autocorr_period = float(lags_t[lag_win][idx_peak])
+                    else:
+                        autocorr_period = None
+                if autocorr_period is not None:
                     autocorr_error_pct = abs(autocorr_period - Trev) / Trev * 100.0
                     res["autocorr_period"] = autocorr_period
                     res["autocorr_error_pct"] = autocorr_error_pct
@@ -1044,8 +1087,8 @@ def analyze(
         p=p,
         f=f,
         raw_series=series,
-        aligned_step=step,
-        aligned_t=t,
+        aligned_step=step_full,
+        aligned_t=t_full,
         res=res,
         az_cnt_empty=az_cnt_empty,
         az_cnt_total=max(1, az_cnt_total)

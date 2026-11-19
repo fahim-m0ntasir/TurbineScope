@@ -153,9 +153,10 @@ def parse_fluent_report_xml(xml_path: str) -> Dict[str, Any]:
                 elif "steady" in v_low:
                     results["time_formulation"] = "Steady"
 
+        _NUM = r"[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?"
+
         # 2. Moving Mesh Rotation Speed [rad/s]
-        # Pattern: Moving Mesh Rotation Speed [rad/s]\s+([0-9.+-eE]+)
-        m_omega = re.search(r"Moving Mesh Rotation Speed\s*\[rad/s\]\s+([0-9.+-eE]+)", content)
+        m_omega = re.search(rf"Moving Mesh Rotation Speed\s*\[rad/s\]\s+({_NUM})", content)
         if m_omega:
             try:
                 results["omega"] = float(m_omega.group(1))
@@ -163,8 +164,7 @@ def parse_fluent_report_xml(xml_path: str) -> Dict[str, Any]:
                 pass
 
         # 3. Velocity Magnitude [m/s]
-        # Pattern: Velocity Magnitude [m/s]\s+([0-9.+-eE]+)
-        m_vel = re.search(r"Velocity Magnitude\s*\[m/s\]\s+([0-9.+-eE]+)", content)
+        m_vel = re.search(rf"Velocity Magnitude\s*\[m/s\]\s+({_NUM})", content)
         if m_vel:
             try:
                 results["velocity"] = float(m_vel.group(1))
@@ -172,7 +172,7 @@ def parse_fluent_report_xml(xml_path: str) -> Dict[str, Any]:
                 pass
 
         # 4. Time Step Size [s]
-        m_dt = re.search(r"Time Step Size\s*\[s\]\s+([0-9.+-eE]+)", content)
+        m_dt = re.search(rf"Time Step Size\s*\[s\]\s+({_NUM})", content)
         if m_dt:
             try:
                 results["time_step"] = float(m_dt.group(1))
@@ -197,7 +197,7 @@ def parse_fluent_report_xml(xml_path: str) -> Dict[str, Any]:
 
         # 7. Air Density & Viscosity
         # Density kg/m^3 constant 1.225
-        m_dens = re.search(r"Density\s+kg/m\^3\s+constant\s+([0-9.+-eE]+)", content)
+        m_dens = re.search(rf"Density\s+kg/m\^3\s+constant\s+({_NUM})", content)
         if m_dens:
             try:
                 results["density"] = float(m_dens.group(1))
@@ -205,7 +205,7 @@ def parse_fluent_report_xml(xml_path: str) -> Dict[str, Any]:
                 pass
 
         # Viscosity kg/(m s) constant 1.7894e-05
-        m_visc = re.search(r"Viscosity\s+kg/\(m s\)\s+constant\s+([0-9.+-eE]+)", content)
+        m_visc = re.search(rf"Viscosity\s+kg/\(m s\)\s+constant\s+({_NUM})", content)
         if m_visc:
             try:
                 results["viscosity"] = float(m_visc.group(1))
@@ -890,9 +890,15 @@ def workbench_system_to_config(
     if u is not None:
         param_sources["U"] = "Fluent case setup (velocity inlet)"
 
-    omega = system.omega
-    if omega is not None:
-        param_sources["omega"] = "Fluent case setup (moving mesh)"
+    omega_raw = system.omega
+    rot_dir = "ccw"
+    omega = None
+    if omega_raw is not None:
+        if float(omega_raw) < 0:
+            rot_dir = "cw"
+        omega = abs(float(omega_raw)) if abs(float(omega_raw)) > 0 else None
+        if omega is not None:
+            param_sources["omega"] = "Fluent case setup (moving mesh)"
 
     if system.time_step is not None:
         param_sources["dt"] = "Fluent case setup (time step)"
@@ -926,6 +932,7 @@ def workbench_system_to_config(
         rho=system.density if system.density is not None else FLUENT_DEFAULTS["rho"],
         mu=system.viscosity if system.viscosity is not None else FLUENT_DEFAULTS["mu"],
         dt=system.time_step,
+        rotation_dir=rot_dir,
         write_timeseries=True,
         metadata=case_meta,
         param_sources=param_sources
@@ -1061,12 +1068,14 @@ def load_benchmark_curve(benchmark_path: str) -> List[Dict[str, Any]]:
         if ext in (".xlsx", ".xlsm"):
             import openpyxl
             wb = openpyxl.load_workbook(benchmark_path, data_only=True, read_only=True)
-            ws = wb.active
-            if ws is not None:
-                for r in ws.iter_rows(values_only=True):
-                    if any(v is not None for v in r):
-                        rows_raw.append(list(r))
-            wb.close()
+            try:
+                ws = wb.active
+                if ws is not None:
+                    for r in ws.iter_rows(values_only=True):
+                        if any(v is not None for v in r):
+                            rows_raw.append(list(r))
+            finally:
+                wb.close()
         else:
             import csv
             with open(benchmark_path, "r", encoding="utf-8", errors="ignore") as f:
