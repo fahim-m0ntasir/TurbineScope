@@ -2717,7 +2717,17 @@ class LiveMonitorFrame(ctk.CTkFrame):
         cfg(self.lbl_step, text=f"Step: {snap.current_step:,}")
         cfg(self.lbl_time, text=f"Time: {snap.current_time:.4f} s")
         cfg(self.lbl_revs, text=f"Revs: {snap.total_revs:.2f}")
-        cfg(self.lbl_azimuth, text=f"θ: {snap.current_azimuth:.1f}°")
+        th0_cur = float(getattr(self.live_params, "theta0", 0.0) or 0.0) % 360.0 if self.live_params is not None else 0.0
+        if 0.5 < th0_cur < 359.5:
+            cfg(self.lbl_azimuth, text=f"θ: {snap.current_azimuth:.1f}° (θ₀ {th0_cur:.1f}°)")
+        else:
+            cfg(self.lbl_azimuth, text=f"θ: {snap.current_azimuth:.1f}°")
+        if hasattr(self.lbl_azimuth, "setToolTip"):
+            rot_el = (snap.total_revs * 360.0) % 360.0
+            az_tip = f"Elapsed rotation: {rot_el:.1f}° ({snap.total_revs:.2f} revs) | Blade 1 start θ₀: {th0_cur:.1f}° | Physical Blade 1 θ: {snap.current_azimuth:.1f}°"
+            if getattr(self, "_lm_last_az_tip", None) != az_tip:
+                self._lm_last_az_tip = az_tip
+                self.lbl_azimuth.setToolTip(az_tip)
         cfg(self.lbl_speed, text=f"Speed: {snap.steps_per_sec:.1f} steps/s")
         if snap.eta_seconds is not None and snap.eta_seconds >= 0:
             eta_m = int(snap.eta_seconds // 60)

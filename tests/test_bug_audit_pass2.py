@@ -354,3 +354,39 @@ def test_app_export_json_and_forwarder():
     fwd_txt = open(os.path.join(root_dir, "vawt_analyzer.py"), "r", encoding="utf-8").read()
     assert "vawt_post.ui.app" not in fwd_txt
     assert "from vawt_post.cli import main" in fwd_txt
+
+
+def test_azimuth_cas_snapshot_backprojection_and_verified_mesh(tmp_path):
+    """Half-rev `.cas.h5` autosaves must back-project to t=0 and verify entered theta0 even under weak 1P."""
+    from vawt_post.engine.azimuth_detect import detect_start_azimuth
+
+    omega = 30.0
+    Trev = 2.0 * math.pi / omega
+    steps = np.arange(0, 721, dtype=np.int64)
+    t = steps * (Trev / 360.0)  # 0.0 to 2.0 revs; step 540 is exactly 1.5 revs (+180 deg)
+    # Weak 1P torque signal (like deep stall at low TSR) so Tier 3 does not fire
+    m_b1 = 0.05 * np.sin(3.0 * omega * t)
+
+    # True t=0 angle is 331.6 deg; at step 540 (1.5 revs), Blade 1 sits at 151.6 deg CCW from top (+y)
+    th_151_rad = math.radians(151.6)
+    cx = -0.35 * math.sin(th_151_rad)
+    cy = 0.35 * math.cos(th_151_rad)
+    cas_stub = {
+        "file_path": str(tmp_path / "FFF-3-3-00540.cas.h5"),
+        "blade_centroids": [(cx, cy)],
+        "blade_zones": ["blade1"],
+    }
+
+    # 1. With theta0=331.6 entered: back-projected 151.6 - 180 = 331.6 => verified, NO false 180-deg warning
+    p_aligned = Params(U=7.0, omega=omega, R=0.35, n_blades=3, rotation_dir="ccw", theta0=331.6)
+    res_ok = detect_start_azimuth(p_aligned, t=t, step=steps, m_b1=m_b1, cas_info=cas_stub)
+    assert res_ok.needs_correction is False
+    assert res_ok.method == "mesh_geometry_verified"
+    assert res_ok.signals["mesh_angle_deg"] == pytest.approx(331.6, abs=0.2)
+
+    # 2. With theta0=0.0 entered: back-projected angle is 331.6 (NOT 151.6!)
+    p_zero = Params(U=7.0, omega=omega, R=0.35, n_blades=3, rotation_dir="ccw", theta0=0.0)
+    res_off = detect_start_azimuth(p_zero, t=t, step=steps, m_b1=m_b1, cas_info=cas_stub)
+    assert res_off.needs_correction is True
+    assert res_off.recommended_theta0_deg == pytest.approx(331.6, abs=0.2)
+

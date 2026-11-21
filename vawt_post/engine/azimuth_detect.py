@@ -15,6 +15,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 import math
 import os
+import re
 from typing import Any, Dict, Optional
 
 import numpy as np
@@ -144,6 +145,65 @@ def _extract_cas_blade1_angle(
     else:
         ang = math.degrees(math.atan2(-dx, dy))
     return wrap_deg_360(ang)
+
+
+def _resolve_cas_flow_time(
+    cas_path: Optional[str],
+    step_arr: Optional[np.ndarray],
+    t_arr: Optional[np.ndarray],
+) -> Optional[float]:
+    """Determine the simulation flow-time at which a `.cas.h5` snapshot was saved.
+
+    Fluent sliding-mesh autosaves (e.g. `FFF-3-3-05400.cas.h5`) store the rotated mesh
+    at the autosave time `t_cas`. Back-projecting by `omega * t_cas` recovers the true
+    `t = 0` start azimuth even when Fluent autosaves at half-revolutions or arbitrary steps.
+    """
+    if not cas_path:
+        return None
+    base = os.path.basename(str(cas_path)).lower()
+    if "setup" in base:
+        return 0.0
+
+    # 1. Exact flow-time from sibling `.dat.h5` (`settings/Data Variables`)
+    if base.endswith(".cas.h5"):
+        dat_path = re.sub(r"\.cas\.h5$", ".dat.h5", str(cas_path), flags=re.IGNORECASE)
+        if os.path.isfile(dat_path):
+            try:
+                import h5py  # type: ignore[import-untyped]
+                with h5py.File(dat_path, "r") as df:
+                    settings_grp: Any = df.get("settings")
+                    if isinstance(settings_grp, h5py.Group) and "Data Variables" in settings_grp:
+                        dvar: Any = settings_grp["Data Variables"]
+                        raw = dvar[()]
+                        if isinstance(raw, np.ndarray) and raw.size > 0:
+                            raw = raw.flat[0]
+                        txt = raw.decode("utf-8", errors="ignore") if isinstance(raw, (bytes, bytearray)) else str(raw)
+                        m_ft = re.search(
+                            r"\(flow-time\s+([-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?)\)",
+                            txt,
+                        )
+                        if m_ft:
+                            ft_val = float(m_ft.group(1))
+                            if math.isfinite(ft_val) and ft_val >= 0.0:
+                                return ft_val
+            except Exception:
+                pass
+
+    # 2. Fallback: map trailing step index in `.cas.h5` filename onto monitor (step, t)
+    m_st = re.search(r"[-_](\d+)\.cas\.h5$", base)
+    if (
+        m_st
+        and step_arr is not None
+        and t_arr is not None
+        and len(step_arr) == len(t_arr)
+        and len(step_arr) >= 2
+    ):
+        st_cas = int(m_st.group(1))
+        if int(step_arr[0]) <= st_cas <= int(step_arr[-1]):
+            ft_interp = float(np.interp(float(st_cas), step_arr.astype(float), t_arr))
+            if math.isfinite(ft_interp) and ft_interp >= 0.0:
+                return ft_interp
+    return None
 
 
 def _bin_1p_phase(
@@ -304,8 +364,19 @@ def detect_start_azimuth(
             import glob
             from vawt_post.engine.hdf5_case import inspect_hdf5_case
 
-            cas_files = sorted(glob.glob(os.path.join(folder, "*.cas.h5")), key=os.path.getmtime, reverse=True)
-            for cf in cas_files:
+            raw_cas = glob.glob(os.path.join(glob.escape(folder), "*.cas.h5"))
+            # Prefer actual run autosave .cas.h5 snapshots over stale Setup-Output.cas.h5
+            run_cas = sorted(
+                [c for c in raw_cas if "setup" not in os.path.basename(c).lower()],
+                key=os.path.getmtime,
+                reverse=True,
+            )
+            setup_cas = sorted(
+                [c for c in raw_cas if "setup" in os.path.basename(c).lower()],
+                key=os.path.getmtime,
+                reverse=True,
+            )
+            for cf in run_cas + setup_cas:
                 ci = inspect_hdf5_case(cf)
                 if ci.is_valid and ci.blade_centroids:
                     cas_info = ci
@@ -313,12 +384,29 @@ def detect_start_azimuth(
         except Exception:
             pass
 
-    mesh_angle = _extract_cas_blade1_angle(cas_info, rot_dir)
+    mesh_angle_raw = _extract_cas_blade1_angle(cas_info, rot_dir)
+    cas_path = (
+        cas_info.get("file_path")
+        if isinstance(cas_info, dict)
+        else getattr(cas_info, "file_path", None)
+    )
+    t_cas = _resolve_cas_flow_time(cas_path, step_arr, t_arr) if mesh_angle_raw is not None else None
+    mesh_angle: Optional[float] = None
     mesh_vs_t0: Optional[float] = None
     mesh_vs_tend: Optional[float] = None
-    if mesh_angle is not None:
+    if mesh_angle_raw is not None:
+        if t_cas is not None and omega > 0:
+            mesh_angle = wrap_deg_360(mesh_angle_raw - math.degrees(omega * t_cas))
+            signals["mesh_cas_flow_time_s"] = round(t_cas, 6)
+            signals["mesh_angle_raw_deg"] = round(mesh_angle_raw, 2)
+        else:
+            mesh_angle = mesh_angle_raw
         signals["mesh_angle_deg"] = round(mesh_angle, 2)
-        if t0 is not None and t_end is not None and omega > 0:
+        if t_cas is not None:
+            # mesh_angle is already back-projected to exact t = 0
+            mesh_vs_t0 = wrap_deg_signed(mesh_angle - az_base)
+            mesh_vs_tend = None
+        elif t0 is not None and t_end is not None and omega > 0:
             az_t0 = wrap_deg_360(az_base + math.degrees(omega * t0))
             az_tend = wrap_deg_360(az_base + math.degrees(omega * t_end))
             mesh_vs_t0 = wrap_deg_signed(mesh_angle - az_t0)
@@ -497,34 +585,50 @@ def detect_start_azimuth(
             signals=signals,
         )
 
-    # Tier 2 mesh geometry check when flow_time started near 0 and .cas.h5 wasn't simply saved at run end
-    if (
-        mesh_angle is not None
-        and mesh_vs_t0 is not None
-        and abs(mesh_vs_t0) > tolerance_deg
-        and (mesh_vs_tend is None or abs(mesh_vs_tend) > 15.0)
-    ):
-        rec_mesh = wrap_deg_360(mesh_angle - compute_az_base_without_theta0(p))
-        if abs(wrap_deg_signed(rec_mesh)) <= 2.0:
-            rec_mesh = 0.0
-        return StartAzimuthResult(
-            started_at_zero=False,
-            is_mid_spin=True,
-            needs_correction=True,
-            mid_spin_compensated_by_flow_time=False,
-            entered_theta0_deg=round(entered_theta0, 2),
-            recommended_theta0_deg=round(rec_mesh, 1),
-            flow_start_angle_deg=round(flow_start_deg, 1) if flow_start_deg is not None else None,
-            shift_error_deg=round(mesh_vs_t0, 1),
-            method="mesh_geometry",
-            confidence="medium",
-            summary=f"Mesh geometry indicates Blade 1 at {mesh_angle:.1f} deg (vs {entered_theta0:.1f} deg)",
-            detail=(
-                f"Blade 1 mesh nodes in .cas.h5 sit at {mesh_angle:.1f} deg from into-wind 0 deg "
-                f"while monitor starts at t0~0s. Set theta0={rec_mesh:.1f} deg if mesh began rotated."
-            ),
-            signals=signals,
-        )
+    # Tier 2 mesh geometry check (mismatch OR verified alignment when Tier 3 1P harmonic is weak, e.g. deep stall)
+    if mesh_angle is not None and mesh_vs_t0 is not None:
+        if abs(mesh_vs_t0) > tolerance_deg and (t_cas is not None or mesh_vs_tend is None or abs(mesh_vs_tend) > 15.0):
+            rec_mesh = wrap_deg_360(mesh_angle - compute_az_base_without_theta0(p))
+            if abs(wrap_deg_signed(rec_mesh)) <= 2.0:
+                rec_mesh = 0.0
+            return StartAzimuthResult(
+                started_at_zero=False,
+                is_mid_spin=True,
+                needs_correction=True,
+                mid_spin_compensated_by_flow_time=False,
+                entered_theta0_deg=round(entered_theta0, 2),
+                recommended_theta0_deg=round(rec_mesh, 1),
+                flow_start_angle_deg=round(flow_start_deg, 1) if flow_start_deg is not None else None,
+                shift_error_deg=round(mesh_vs_t0, 1),
+                method="mesh_geometry",
+                confidence="high" if t_cas is not None else "medium",
+                summary=f"Mesh geometry indicates Blade 1 at {mesh_angle:.1f} deg at t=0 (vs {entered_theta0:.1f} deg)",
+                detail=(
+                    f"Blade 1 mesh nodes in .cas.h5 sit at {mesh_angle:.1f} deg from into-wind 0 deg at t=0 "
+                    f"while monitor starts at t0~0s. Set theta0={rec_mesh:.1f} deg if mesh began rotated."
+                ),
+                signals=signals,
+            )
+        if abs(mesh_vs_t0) <= tolerance_deg:
+            is_zero = abs(wrap_deg_signed(entered_theta0)) <= 2.0
+            return StartAzimuthResult(
+                started_at_zero=is_zero,
+                is_mid_spin=not is_zero,
+                needs_correction=False,
+                mid_spin_compensated_by_flow_time=False,
+                entered_theta0_deg=round(entered_theta0, 2),
+                recommended_theta0_deg=round(entered_theta0, 1),
+                flow_start_angle_deg=round(flow_start_deg, 1) if flow_start_deg is not None else None,
+                shift_error_deg=round(mesh_vs_t0, 1),
+                method="mesh_geometry_verified",
+                confidence="high" if t_cas is not None else "medium",
+                summary=f"Start azimuth θ0={entered_theta0:.1f} deg verified by .cas.h5 mesh ({mesh_angle:.1f} deg at t=0)",
+                detail=(
+                    f"Blade 1 mesh geometry back-projected to t=0 ({mesh_angle:.1f} deg) matches entered "
+                    f"theta0={entered_theta0:.1f} deg within {abs(mesh_vs_t0):.1f} deg."
+                ),
+                signals=signals,
+            )
 
     # Check if total-moment-only data spans >= 1 rev without flow_mid_run (modulo symmetry note)
     if m_b1 is None and m_total is not None and omega > 0 and Trev > 0 and t_span >= 0.95 * Trev:
@@ -545,6 +649,26 @@ def detect_start_azimuth(
             detail=(
                 f"Total moment alone is {sym_deg:.0f} deg periodic across {nb} blades; add Blade 1 moment monitor "
                 "or .cas.h5 to distinguish individual blade start azimuth."
+            ),
+            signals=signals,
+        )
+
+    if omega > 0 and Trev > 0 and t_span >= 0.95 * Trev:
+        return StartAzimuthResult(
+            started_at_zero=None,
+            is_mid_spin=abs(wrap_deg_signed(entered_theta0)) > 2.0,
+            needs_correction=False,
+            mid_spin_compensated_by_flow_time=False,
+            entered_theta0_deg=round(entered_theta0, 2),
+            recommended_theta0_deg=None,
+            flow_start_angle_deg=round(flow_start_deg, 1) if flow_start_deg is not None else None,
+            shift_error_deg=None,
+            method="weak_1p_harmonic",
+            confidence="low",
+            summary=f"Weak 1P torque harmonic (deep stall / low TSR) — using entered θ0={entered_theta0:.1f} deg",
+            detail=(
+                f"Recorded {t_span / Trev:.2f} revolutions, but Blade 1 1P harmonic amplitude is weak (typical of low-TSR deep stall); "
+                f"provide a .cas.h5 file to verify start azimuth geometrically."
             ),
             signals=signals,
         )
