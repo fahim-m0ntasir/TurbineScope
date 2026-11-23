@@ -542,6 +542,8 @@ class LiveMonitorEngine:
         self.completed_revs_count = 0
         self.last_rev_end_time = 0.0
         self.rev_history.clear()
+        if hasattr(self, "_rev_cm_curves"):
+            self._rev_cm_curves.clear()
         self.stable_reached_notified = False
         self.heat_map = None
         self.spectrum = {}
@@ -698,6 +700,8 @@ class LiveMonitorEngine:
             self.Ct = None
             self.Cy = None
             self.rev_history.clear()
+            if hasattr(self, "_rev_cm_curves"):
+                self._rev_cm_curves.clear()
             self.completed_revs_count = 0
             self.last_rev_end_time = 0.0
             self.last_step_processed = -1
@@ -834,6 +838,8 @@ class LiveMonitorEngine:
                 self.last_step_processed = -1
                 self.completed_revs_count = 0
                 self.rev_history.clear()
+                if hasattr(self, "_rev_cm_curves"):
+                    self._rev_cm_curves.clear()
                 self.stable_reached_notified = False
                 self._last_aitken_alert_rev = -1
                 self._az_checked_rev = -1
@@ -1044,6 +1050,8 @@ class LiveMonitorEngine:
         if force_reproc or (len(self.steps) > 0 and (len(common_arr) < len(self.steps) or int(common_arr[0]) > int(self.steps[0]))):
             self.completed_revs_count = 0
             self.rev_history.clear()
+            if hasattr(self, "_rev_cm_curves"):
+                self._rev_cm_curves.clear()
             self.stable_reached_notified = False
             self._last_aitken_alert_rev = -1
             self.blade_torques = {}
@@ -1135,6 +1143,13 @@ class LiveMonitorEngine:
         n_full_revs = int(math.floor(t_span / Trev + 1e-9))
 
         if n_full_revs > self.completed_revs_count:
+            if not hasattr(self, "_rev_cm_curves"):
+                self._rev_cm_curves: List[np.ndarray] = []
+            tol_rel = (self.p.stable_tol or 5.0) / 100.0
+            tol_abs = float(getattr(self.p, "stable_tol_abs", 0.001) or 0.001)
+            tol_periodicity = float(getattr(self.p, "periodicity_tol", 0.01) or 0.01)
+            _drift_tol_raw = getattr(self.p, "drift_tol", None)
+            tol_drift = float(_drift_tol_raw) if _drift_tol_raw is not None else (2.0 * tol_rel)
             # New revolution(s) completed!
             for k in range(self.completed_revs_count + 1, n_full_revs + 1):
                 t_a = self.times[0] + (k - 1) * Trev
@@ -1142,6 +1157,8 @@ class LiveMonitorEngine:
                 cp_k = window_mean(self.times, self.Cp, t_a, t_b)
                 cm_k = window_mean(self.times, self.Cm, t_a, t_b)
                 ct_k = window_mean(self.times, self.Ct, t_a, t_b) if self.Ct is not None else None
+                u_t = np.linspace(t_a, t_b, 360, endpoint=False)
+                cm_curve = np.interp(u_t, self.times, self.Cm)
                 rev_entry: Dict[str, Any] = {
                     "k": k,
                     "t_start": t_a,
@@ -1150,15 +1167,44 @@ class LiveMonitorEngine:
                     "cm": cm_k,
                     "ct": ct_k,
                     "dcp": None,
+                    "dcp_abs": None,
+                    "periodicity_metric": 0.0,
+                    "is_stable_step": True,
                     "stable": False,
                 }
                 if len(self.rev_history) > 0:
                     cp_prev = self.rev_history[-1]["cp"]
-                    dcp = (cp_k - cp_prev) / cp_prev if abs(cp_prev) > 1e-9 else 0.0
+                    dcp = (cp_k - cp_prev) / cp_prev if abs(cp_prev) > 1e-12 else 0.0
+                    dcp_abs = abs(cp_k - cp_prev)
                     rev_entry["dcp"] = dcp
-                    tol_rel = (self.p.stable_tol or 5.0) / 100.0
-                    rev_entry["stable"] = abs(dcp) < tol_rel
+                    rev_entry["dcp_abs"] = dcp_abs
+                    if len(self._rev_cm_curves) > 0:
+                        cm_diff = cm_curve - self._rev_cm_curves[-1]
+                        rms_diff = float(np.sqrt(np.mean(cm_diff ** 2)))
+                        ptp = float(np.ptp(cm_curve))
+                        cm_mean_abs = float(abs(np.mean(cm_curve)))
+                        per_metric = 0.0 if (ptp <= 1e-6 or ptp < 0.05 * cm_mean_abs) else (rms_diff / ptp)
+                    else:
+                        per_metric = 0.0
+                    rev_entry["periodicity_metric"] = per_metric
+                    cond1 = (abs(dcp) < tol_rel) or (dcp_abs < tol_abs)
+                    cond2 = per_metric < tol_periodicity
+                    rev_entry["is_stable_step"] = bool(cond1 and cond2)
+                    rev_entry["stable"] = bool(cond1 and cond2)
+                    if cond1 and not cond2:
+                        c1_desc = (
+                            f"mean |ΔCp| = {abs(dcp) * 100:.2f}% (< {tol_rel * 100:g}%)"
+                            if abs(dcp) < tol_rel
+                            else f"mean |ΔCp| = {dcp_abs:.4f} (< {tol_abs:g} abs)"
+                        )
+                        self.add_alert(
+                            "INFO",
+                            f"Rev {k}: {c1_desc}, "
+                            f"but waveform RMS periodicity = {per_metric * 100:.2f}% > {tol_periodicity * 100:g}% threshold (deep stall / vortex jitter).",
+                            key=f"periodicity_hold_{k}",
+                        )
 
+                self._rev_cm_curves.append(cm_curve)
                 self.rev_history.append(rev_entry)
                 self.add_alert(
                     "INFO",
@@ -1167,19 +1213,25 @@ class LiveMonitorEngine:
 
             self.completed_revs_count = n_full_revs
 
-            # Check if stable reached
+            # Check if stable reached (matching analysis.py multi-criteria plateau & 3-rev drift logic)
             if len(self.rev_history) >= 2:
                 try:
                     n_req = self.p.n_stable or 2
                 except (ValueError, TypeError):
                     n_req = 2
-                trailing_stable = 0
-                for r in reversed(self.rev_history):
-                    if r["stable"]:
-                        trailing_stable += 1
+                stable_steps = 0
+                for idx_r in range(len(self.rev_history) - 1, 0, -1):
+                    if self.rev_history[idx_r].get("is_stable_step", self.rev_history[idx_r].get("stable", False)):
+                        stable_steps += 1
                     else:
                         break
-                if trailing_stable >= n_req and not self.stable_reached_notified:
+                trailing_stable = (stable_steps + 1) if stable_steps > 0 else 0
+                drift_ok = True
+                if len(self.rev_history) >= 3:
+                    cp_l3 = abs(self.rev_history[-1]["cp"] - self.rev_history[-3]["cp"]) / max(abs(self.rev_history[-3]["cp"]), 1e-12)
+                    if cp_l3 >= tol_drift:
+                        drift_ok = False
+                if trailing_stable >= n_req and drift_ok and not self.stable_reached_notified:
                     self.stable_reached_notified = True
                     self.add_alert("SUCCESS", f"Convergence reached: trailing {trailing_stable} revolutions satisfied stability tolerance!", key="conv_stable")
 
@@ -1351,6 +1403,8 @@ class LiveMonitorEngine:
         self.completed_revs_count = 0
         self.last_rev_end_time = 0.0
         self.rev_history.clear()
+        if hasattr(self, "_rev_cm_curves"):
+            self._rev_cm_curves.clear()
         self.stable_reached_notified = False
         self.Ct = None
         self.Cy = None
@@ -1672,12 +1726,23 @@ class LiveMonitorEngine:
         # KPIs (windowed over latest revolution when >=1 rev is complete to exclude CFD startup impulse)
         running_cp = float(self.rev_history[-1]["cp"]) if self.rev_history else (float(np.mean(self.Cp)) if len(self.Cp) else 0.0)
         dcp_prev = float(self.rev_history[-1]["dcp"]) if (self.rev_history and self.rev_history[-1]["dcp"] is not None) else 0.0
-        stable_n = 0
-        for r in reversed(self.rev_history):
-            if r["stable"]:
-                stable_n += 1
-            else:
-                break
+        if len(self.rev_history) <= 1:
+            stable_n = 0
+        else:
+            stable_steps = 0
+            for idx_r in range(len(self.rev_history) - 1, 0, -1):
+                if self.rev_history[idx_r].get("is_stable_step", self.rev_history[idx_r].get("stable", False)):
+                    stable_steps += 1
+                else:
+                    break
+            stable_n = (stable_steps + 1) if stable_steps > 0 else 0
+            tol_rel_k = (self.p.stable_tol or 5.0) / 100.0
+            _drift_tol_k_raw = getattr(self.p, "drift_tol", None)
+            tol_drift_k = float(_drift_tol_k_raw) if _drift_tol_k_raw is not None else (2.0 * tol_rel_k)
+            if len(self.rev_history) >= 3:
+                cp_l3 = abs(self.rev_history[-1]["cp"] - self.rev_history[-3]["cp"]) / max(abs(self.rev_history[-3]["cp"]), 1e-12)
+                if cp_l3 >= tol_drift_k:
+                    stable_n = 0
 
         win_kpi = (self.times >= max(self.times[0], self.times[-1] - Trev)) if (len(self.times) > 1 and self.completed_revs_count >= 1) else slice(None)
         mrot_kpi = self.Mrot[win_kpi] if len(self.Mrot) else self.Mrot

@@ -919,6 +919,109 @@ def _set_pos_float(detected: Dict[str, Any], key: str, raw: Any) -> bool:
     return False
 
 
+def _apply_stitched_sidecar_fallback(
+    detected: Dict[str, Any],
+    folder: str,
+    sources: List[str],
+) -> None:
+    """Backfill case parameters for stitched output folders via `_stitched_case_params.json`
+    or `_continuity_report.txt` / sibling `Fluent` folder when `.cas.h5` is absent."""
+    import json as _json
+
+    sidecar_path = os.path.join(folder, "_stitched_case_params.json")
+    if os.path.isfile(sidecar_path):
+        try:
+            with open(sidecar_path, "r", encoding="utf-8") as fh:
+                sc = _json.load(fh)
+            if isinstance(sc, dict):
+                used = False
+                for fk in ("omega", "U", "tsr", "R", "chord", "rho", "mu", "dt"):
+                    if _set_pos_float(detected, fk, sc.get(fk)):
+                        used = True
+                if "n_blades" not in detected and sc.get("n_blades") is not None:
+                    nb_v = int(sc["n_blades"])
+                    if 1 <= nb_v <= 8:
+                        detected["n_blades"] = nb_v
+                        used = True
+                if "rotation_dir" not in detected and sc.get("rotation_dir") in ("ccw", "cw"):
+                    detected["rotation_dir"] = sc["rotation_dir"]
+                    used = True
+                if "theta0" not in detected and sc.get("theta0") is not None:
+                    try:
+                        th_v = float(sc["theta0"])
+                        if math.isfinite(th_v):
+                            detected["theta0"] = th_v
+                            used = True
+                    except (TypeError, ValueError):
+                        pass
+                for sk in ("turb_model", "space", "time_formulation"):
+                    if sk not in detected and sc.get(sk):
+                        detected[sk] = str(sc[sk])
+                        used = True
+                for ik in ("cells", "nodes", "iterations"):
+                    if ik not in detected and sc.get(ik) is not None:
+                        try:
+                            iv = int(sc[ik])
+                            if iv > 0:
+                                detected[ik] = iv
+                                used = True
+                        except (TypeError, ValueError):
+                            pass
+                if used:
+                    sources.append("_stitched_case_params.json")
+        except Exception:
+            pass
+
+    # Fallback for already-exported stitched folders that only have `_continuity_report.txt`
+    if "omega" in detected and "U" in detected:
+        return
+    rep_path = os.path.join(folder, "_continuity_report.txt")
+    if not os.path.isfile(rep_path):
+        return
+    cand_dirs: List[str] = []
+    sibling_fluent = os.path.join(os.path.dirname(os.path.abspath(folder)), "Fluent")
+    if os.path.isdir(sibling_fluent):
+        cand_dirs.append(sibling_fluent)
+    try:
+        with open(rep_path, "r", encoding="utf-8", errors="ignore") as rf:
+            for line in rf:
+                if line.startswith("Prior Source:"):
+                    ps = line.split(":", 1)[1].strip()
+                    if ps and os.path.isdir(ps) and ps not in cand_dirs:
+                        cand_dirs.append(ps)
+                    break
+    except Exception:
+        pass
+    for cd in cand_dirs:
+        if os.path.normcase(os.path.abspath(cd)) == os.path.normcase(os.path.abspath(folder)):
+            continue
+        try:
+            sub_det = detect_folder_simulation_parameters(cd)
+            used_sub = False
+            for fk in ("omega", "U", "tsr", "R", "chord", "rho", "mu", "dt"):
+                if _set_pos_float(detected, fk, sub_det.get(fk)):
+                    used_sub = True
+            if "n_blades" not in detected and sub_det.get("n_blades") is not None:
+                detected["n_blades"] = int(sub_det["n_blades"])
+                used_sub = True
+            if "rotation_dir" not in detected and sub_det.get("rotation_dir") in ("ccw", "cw"):
+                detected["rotation_dir"] = sub_det["rotation_dir"]
+                used_sub = True
+            for sk in ("turb_model", "space", "time_formulation"):
+                if sk not in detected and sub_det.get(sk):
+                    detected[sk] = str(sub_det[sk])
+                    used_sub = True
+            for ik in ("cells", "nodes", "iterations"):
+                if ik not in detected and sub_det.get(ik) is not None:
+                    detected[ik] = int(sub_det[ik])
+                    used_sub = True
+            if used_sub:
+                sources.append(f"stitched_parent:{os.path.basename(cd)}")
+                break
+        except Exception:
+            pass
+
+
 def detect_folder_simulation_parameters(
     folder: str,
     hint_params: Optional[Dict[str, Any]] = None,
@@ -1193,6 +1296,9 @@ def detect_folder_simulation_parameters(
                 sources.append(os.path.basename(jf))
     except Exception:
         pass
+
+    # 4b. Stitched folder sidecar (`_stitched_case_params.json`) or continuity-report parent fallback
+    _apply_stitched_sidecar_fallback(detected, folder, sources)
 
     # 5. Monitor files for dt (tail rows reflect the active/latest stage) and blade count
     try:

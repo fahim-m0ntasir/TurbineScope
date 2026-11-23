@@ -521,6 +521,8 @@ def analyze(
         b = a + Trev
         m_win = (t >= a) & (t <= b)
         cm_curve, _ = bin_azimuth(th1[m_win], Cm[m_win], bw)
+        u_t_per = np.linspace(a, b, 360, endpoint=False)
+        cm_per_curve = np.interp(u_t_per, t, Cm)
         ct_w = window_mean(t, Ct, a, b) if Ct is not None else None
         cy_w = window_mean(t, Cy, a, b) if Cy is not None else None
         ct_sh_w = window_mean(t, Ct_shaft, a, b) if Ct_shaft is not None else None
@@ -545,6 +547,7 @@ def analyze(
             "cm_min": float(Cm[m_win].min()) if m_win.any() else float("nan"),
             "peak_torque": float(Mrot[m_win].max()) if m_win.any() else float("nan"),
             "cm_curve": cm_curve,
+            "_cm_per_curve": cm_per_curve,
         }
         if have_blades:
             bm = [window_mean(t, x, a, b) for x in Mb]
@@ -590,11 +593,15 @@ def analyze(
         r["d_peak_torque"] = (r["peak_torque"] - r_prev["peak_torque"]) / r_prev["peak_torque"] if abs(r_prev["peak_torque"]) > 1e-12 else None
         r["dct"] = (r["ct"] - r_prev["ct"]) / r_prev["ct"] if (r["ct"] is not None and r_prev["ct"] is not None and abs(r_prev["ct"]) > 1e-12) else None
 
-        # Waveform periodicity metric: RMS diff / peak-to-peak
-        cm_diff = r["cm_curve"] - r_prev["cm_curve"]
+        # Waveform periodicity metric: RMS diff / peak-to-peak on uniform 360-pt phase grid
+        # (avoids bin-boundary quantization jitter at 1°/step and skips flat DC-only signals with <5% ripple)
+        c_curr = r["_cm_per_curve"]
+        c_prev = r_prev["_cm_per_curve"]
+        cm_diff = c_curr - c_prev
         rms_diff = float(np.sqrt(np.mean(cm_diff ** 2)))
-        ptp = float(np.ptp(r["cm_curve"]))
-        r["periodicity_metric"] = rms_diff / max(ptp, 1e-6)
+        ptp = float(np.ptp(c_curr))
+        cm_mean_abs = float(abs(np.mean(c_curr)))
+        r["periodicity_metric"] = 0.0 if (ptp <= 1e-6 or ptp < 0.05 * cm_mean_abs) else (rms_diff / ptp)
 
         # 3-revolution drift
         if i >= 2:
@@ -652,9 +659,34 @@ def analyze(
 
         is_stable = (stable_n >= (ns if p.n_stable > 0 else 2)) and drift_ok
         if not is_stable:
+            reason_note = ""
+            if revs and revs[-1].get("dcp") is not None:
+                last_r = revs[-1]
+                last_dcp = abs(float(last_r["dcp"]))
+                last_dabs = float(last_r.get("dcp_abs") or 0.0)
+                last_per = float(last_r.get("periodicity_metric") or 0.0)
+                last_c1 = (last_dcp < tol_rel) or (last_dabs < tol_abs)
+                last_c2 = last_per < tol_periodicity
+                if last_c1 and not last_c2:
+                    c1_desc = (
+                        f"last-rev mean |ΔCp| ({last_dcp * 100:.2f}%) met the ±{p.stable_tol:g}% tolerance"
+                        if last_dcp < tol_rel
+                        else f"last-rev mean |ΔCp| ({last_dabs:.4f}) met the ±{tol_abs:g} absolute tolerance"
+                    )
+                    reason_note = (
+                        f" Note: {c1_desc}, "
+                        f"but cycle-to-cycle waveform RMS periodicity ({last_per * 100:.2f}%) exceeded the "
+                        f"{tol_periodicity * 100:g}% threshold (typical of low-TSR vortex shedding / deep dynamic stall)."
+                    )
+                elif not drift_ok and stable_n >= (ns if p.n_stable > 0 else 2) and drift_last_3 is not None:
+                    reason_note = (
+                        f" Note: trailing revolutions met step tolerance, but 3-rev drift ({drift_last_3 * 100:.2f}%) "
+                        f"exceeded {tol_drift * 100:.2f}%."
+                    )
             warnings.append(
                 f"Cp is NOT yet stable: only {stable_n} trailing revolution(s) satisfy stability criteria "
                 f"(user requested {ns}). The last {ns} revolutions are reported anyway; run the CFD simulation longer for full convergence."
+                f"{reason_note}"
             )
         sel = revs[-ns:]
 

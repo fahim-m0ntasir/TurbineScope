@@ -390,3 +390,98 @@ def test_azimuth_cas_snapshot_backprojection_and_verified_mesh(tmp_path):
     assert res_off.needs_correction is True
     assert res_off.recommended_theta0_deg == pytest.approx(331.6, abs=0.2)
 
+
+def test_live_monitor_and_analysis_stability_parity(tmp_path):
+    """LiveMonitorEngine and offline analyze() must agree on periodicity-gated stability."""
+    from vawt_post.engine.live_monitor import LiveMonitorEngine
+
+    omega = 40.0
+    Trev = 2.0 * math.pi / omega
+    steps_per_rev = 360
+    n_revs = 5
+    steps = np.arange(0, n_revs * steps_per_rev + 1, dtype=np.int64)
+    t = steps * (Trev / steps_per_rev)
+    theta = omega * t
+
+    # Case A: Same mean Cp on all revs, but alternating zero-mean 1P/2P jitter between revs (periodicity > 1%)
+    rev_idx = np.floor(t / Trev).astype(int)
+    sign_alt = np.where((rev_idx % 2) == 0, 1.0, -1.0)
+    m_jitter = 0.8 + 0.30 * np.sin(3.0 * theta) + 0.06 * sign_alt * np.cos(theta)
+    f_jitter = str(tmp_path / "moment_jitter.out")
+    write_fluent_report_file(f_jitter, steps, m_jitter, t, column_name="moment-total")
+
+    p = Params(
+        U=7.0, omega=omega, R=0.35, chord=0.04, n_blades=3,
+        rho=1.225, mu=1.7894e-5, stable_tol=0.5, periodicity_tol=0.01, n_stable=2,
+    )
+    in_jitter = InputFiles(total=f_jitter)
+    res_j = analyze(p, in_jitter)
+    lm_j = LiveMonitorEngine(p, in_jitter)
+    lm_j.tick()
+    snap_j = lm_j.get_snapshot()
+
+    assert res_j["res"]["stable_n"] == 0
+    assert snap_j.kpi["stable_n"] == 0
+    assert lm_j.stable_reached_notified is False
+    assert any("waveform RMS periodicity" in w for w in res_j["warnings"])
+    assert any("waveform RMS periodicity" in str(a.get("message", "")) for a in lm_j.alerts)
+
+    # Case B: Clean periodic waveform on all revs -> both agree on convergence
+    m_clean = 0.8 + 0.30 * np.sin(3.0 * theta)
+    f_clean = str(tmp_path / "moment_clean.out")
+    write_fluent_report_file(f_clean, steps, m_clean, t, column_name="moment-total")
+    in_clean = InputFiles(total=f_clean)
+    res_c = analyze(p, in_clean)
+    lm_c = LiveMonitorEngine(p, in_clean)
+    lm_c.tick()
+    snap_c = lm_c.get_snapshot()
+
+    assert res_c["res"]["stable_n"] >= 2
+    assert snap_c.kpi["stable_n"] == res_c["res"]["stable_n"]
+    assert lm_c.stable_reached_notified is True
+
+
+def test_stitched_sidecar_and_continuity_report_autodetect(tmp_path):
+    """Stitched monitor exports must preserve case params via sidecar JSON and fallback cleanly."""
+    from vawt_post.engine.continuity import export_stitched_report_files
+    from vawt_post.engine.parser import detect_folder_simulation_parameters
+
+    prior_dir = tmp_path / "prior_fluent"
+    curr_dir = tmp_path / "curr_fluent"
+    out_dir = tmp_path / "stitched_out"
+    prior_dir.mkdir()
+    curr_dir.mkdir()
+
+    omega = 100.0
+    dt = (2.0 * math.pi / omega) / 360.0
+    s1 = np.arange(0, 100, dtype=np.int64)
+    s2 = np.arange(90, 200, dtype=np.int64)
+    f1 = str(prior_dir / "moment-rfile.out")
+    f2 = str(curr_dir / "moment-rfile.out")
+    write_fluent_report_file(f1, s1, np.full_like(s1, 0.5, dtype=float), s1 * dt, column_name="moment")
+    write_fluent_report_file(f2, s2, np.full_like(s2, 0.5, dtype=float), s2 * dt, column_name="moment")
+
+    p = Params(U=7.0, omega=omega, R=0.35, chord=0.04, n_blades=3, rho=1.225, mu=1.7894e-5)
+    infiles = InputFiles(total=f2, prior_source=str(prior_dir))
+    exp = export_stitched_report_files(infiles, str(out_dir), p=p)
+    sidecar = exp.get("sidecar_path")
+    assert sidecar and os.path.isfile(sidecar)
+
+    # 1. Auto-detect directly from _stitched_case_params.json sidecar
+    det1 = detect_folder_simulation_parameters(str(out_dir))
+    assert det1["omega"] == pytest.approx(100.0)
+    assert det1["U"] == pytest.approx(7.0)
+    assert det1["R"] == pytest.approx(0.35)
+    assert det1["tsr"] == pytest.approx(5.0)
+
+    # 2. Remove sidecar and verify _continuity_report.txt -> Prior Source fallback
+    os.remove(sidecar)
+    # Place a sidecar in prior_dir (simulating prior Fluent folder metadata)
+    with open(prior_dir / "_stitched_case_params.json", "w", encoding="utf-8") as fh:
+        json.dump({"omega": 100.0, "U": 7.0, "R": 0.35, "n_blades": 3, "rho": 1.225, "mu": 1.7894e-5}, fh)
+    det2 = detect_folder_simulation_parameters(str(out_dir))
+    assert det2["omega"] == pytest.approx(100.0)
+    assert det2["U"] == pytest.approx(7.0)
+    assert det2["R"] == pytest.approx(0.35)
+
+

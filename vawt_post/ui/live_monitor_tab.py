@@ -3062,17 +3062,33 @@ class LiveMonitorFrame(ctk.CTkFrame):
             self._update_telemetry(snap)
             self._render_graphs(snap, force=True)
         elif self.latest_snapshot:
-            # Re-evaluate stability on existing snapshot rev_history with new tolerance
+            # Re-evaluate stability on existing snapshot rev_history with new tolerance (matching analysis.py)
             tol_rel = (new_p.stable_tol or 5.0) / 100.0
-            for r in self.latest_snapshot.rev_history:
+            tol_abs = float(getattr(new_p, "stable_tol_abs", 0.001) or 0.001)
+            tol_per = float(getattr(new_p, "periodicity_tol", 0.01) or 0.01)
+            _drift_tol_ui = getattr(new_p, "drift_tol", None)
+            tol_drift = float(_drift_tol_ui) if _drift_tol_ui is not None else (2.0 * tol_rel)
+            revs_h = self.latest_snapshot.rev_history
+            for r in revs_h:
                 if r.get("dcp") is not None:
-                    r["stable"] = abs(r["dcp"]) < tol_rel
-            stable_n = 0
-            for r in reversed(self.latest_snapshot.rev_history):
-                if r.get("stable"):
-                    stable_n += 1
+                    dcp_a = r.get("dcp_abs")
+                    cond1 = (abs(float(r["dcp"])) < tol_rel) or (dcp_a is not None and float(dcp_a) < tol_abs)
+                    per_m = r.get("periodicity_metric")
+                    cond2 = True if per_m is None else (float(per_m) < tol_per)
+                    ok_step = bool(cond1 and cond2)
+                    r["is_stable_step"] = ok_step
+                    r["stable"] = ok_step
+            stable_steps = 0
+            for idx_r in range(len(revs_h) - 1, 0, -1):
+                if revs_h[idx_r].get("is_stable_step", revs_h[idx_r].get("stable", False)):
+                    stable_steps += 1
                 else:
                     break
+            stable_n = (stable_steps + 1) if stable_steps > 0 else 0
+            if len(revs_h) >= 3:
+                cp_l3 = abs(revs_h[-1]["cp"] - revs_h[-3]["cp"]) / max(abs(revs_h[-3]["cp"]), 1e-12)
+                if cp_l3 >= tol_drift:
+                    stable_n = 0
             if self.latest_snapshot.kpi is not None:
                 self.latest_snapshot.kpi["stable_n"] = stable_n
             self._update_telemetry(self.latest_snapshot)

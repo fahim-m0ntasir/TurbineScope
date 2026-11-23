@@ -1115,8 +1115,84 @@ def export_stitched_report_files(
         for role, wp in written.items():
             rf.write(f"  - {role}: {wp} ({len(merged[role]['step'])} rows)\n")
 
+    # Write case-parameter sidecar so Auto-Detect on the stitched folder preserves omega/U/R/etc.
+    sidecar_path = os.path.join(out_dir, "_stitched_case_params.json")
+    try:
+        import json as _json
+        from vawt_post.engine.parser import detect_folder_simulation_parameters
+
+        sidecar: Dict[str, Any] = {}
+        # 1. Prefer authoritative Fluent case parameters from current or prior folder (.cas.h5 / report.xml)
+        src_dirs: List[str] = []
+        for pth in role_paths.values():
+            if pth and os.path.isfile(pth):
+                d_cur = os.path.dirname(os.path.abspath(pth))
+                if d_cur not in src_dirs:
+                    src_dirs.append(d_cur)
+                break
+        if f.prior_source and os.path.isdir(f.prior_source):
+            d_pri = os.path.abspath(f.prior_source)
+            if d_pri not in src_dirs:
+                src_dirs.append(d_pri)
+        for sd in src_dirs:
+            det_sd = detect_folder_simulation_parameters(sd)
+            for k_copy in (
+                "omega", "U", "tsr", "R", "chord", "n_blades", "rho", "mu", "dt",
+                "rotation_dir", "theta0", "turb_model", "cells", "nodes",
+                "iterations", "space", "time_formulation",
+            ):
+                if det_sd.get(k_copy) is not None and k_copy not in sidecar:
+                    sidecar[k_copy] = det_sd[k_copy]
+
+        # 2. Backfill any remaining fields from active Params `p`
+        if p is not None:
+            for k_p, v_p in (
+                ("U", p.U),
+                ("R", p.R),
+                ("chord", p.chord),
+                ("n_blades", p.n_blades),
+                ("rho", p.rho),
+                ("mu", p.mu),
+                ("dt", p.dt),
+                ("rotation_dir", getattr(p, "rotation_dir", None)),
+                ("theta0", getattr(p, "theta0", None)),
+            ):
+                if v_p is not None and k_p not in sidecar:
+                    sidecar[k_p] = v_p
+            if "omega" not in sidecar:
+                try:
+                    om_v = p.omega_val()
+                    if math.isfinite(om_v) and om_v > 0:
+                        sidecar["omega"] = float(om_v)
+                except Exception:
+                    pass
+            if "tsr" not in sidecar:
+                try:
+                    tsr_v = p.tsr_val()
+                    if math.isfinite(tsr_v) and tsr_v > 0:
+                        sidecar["tsr"] = float(tsr_v)
+                except Exception:
+                    pass
+            meta = getattr(p, "metadata", None)
+            if meta is not None:
+                if "cells" not in sidecar and getattr(meta, "mesh_cells", None):
+                    sidecar["cells"] = int(meta.mesh_cells)
+                if "turb_model" not in sidecar and getattr(meta, "turb_model", None):
+                    sidecar["turb_model"] = str(meta.turb_model)
+
+        if src_dirs:
+            sidecar["source_folder"] = src_dirs[0]
+        if f.prior_source:
+            sidecar["prior_source"] = str(f.prior_source)
+
+        with open(sidecar_path, "w", encoding="utf-8") as sf:
+            _json.dump(sidecar, sf, indent=2)
+    except Exception:
+        sidecar_path = None
+
     return {
         "written_files": written,
         "report_path": report_path,
+        "sidecar_path": sidecar_path,
         "summary": summary,
     }
